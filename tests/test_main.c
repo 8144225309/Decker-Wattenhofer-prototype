@@ -54,6 +54,13 @@ extern int test_musig_sign_verify(void);
 extern int test_musig_wrong_message(void);
 extern int test_musig_taproot_sign(void);
 
+extern int test_musig_split_round_basic(void);
+extern int test_musig_split_round_taproot(void);
+extern int test_musig_nonce_pool(void);
+extern int test_musig_partial_sig_verify(void);
+extern int test_musig_serialization(void);
+extern int test_musig_split_round_5of5(void);
+
 extern int test_tx_buf_primitives(void);
 extern int test_build_p2tr_script_pubkey(void);
 extern int test_build_unsigned_tx(void);
@@ -93,6 +100,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_musig_sign_verify);
     RUN_TEST(test_musig_wrong_message);
     RUN_TEST(test_musig_taproot_sign);
+
+    printf("\n=== MuSig2 Split-Round ===\n");
+    RUN_TEST(test_musig_split_round_basic);
+    RUN_TEST(test_musig_split_round_taproot);
+    RUN_TEST(test_musig_nonce_pool);
+    RUN_TEST(test_musig_partial_sig_verify);
+    RUN_TEST(test_musig_serialization);
+    RUN_TEST(test_musig_split_round_5of5);
 
     printf("\n=== Transaction Builder ===\n");
     RUN_TEST(test_tx_buf_primitives);
