@@ -132,6 +132,14 @@ int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
                            uint64_t l_stock_amount,
                            uint32_t epoch);
 
+/* Cooperative close: single tx bypassing the entire tree */
+int factory_build_cooperative_close(
+    factory_t *f,
+    tx_buf_t *close_tx_out,
+    unsigned char *txid_out32,   /* can be NULL */
+    const tx_output_t *outputs,
+    size_t n_outputs);
+
 /* Split-round signing API (multi-party orchestration) */
 
 /* Find signer_slot for participant_idx in a node. Returns slot index or -1. */

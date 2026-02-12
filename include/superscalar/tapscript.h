@@ -91,4 +91,53 @@ int finalize_script_path_tx(
     const unsigned char *control_block, size_t control_block_len
 );
 
+/* --- HTLC script builders --- */
+
+/* Offered HTLC success leaf (remote claims with preimage, no CSV):
+   OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUALVERIFY <remote_key> OP_CHECKSIG */
+void tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
+    const unsigned char *payment_hash32,
+    const secp256k1_xonly_pubkey *remote_htlcpubkey,
+    const secp256k1_context *ctx);
+
+/* Offered HTLC timeout leaf (local reclaims after CLTV + CSV):
+   <cltv> OP_CLTV OP_DROP <csv> OP_CSV OP_DROP <local_key> OP_CHECKSIG */
+void tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
+    uint32_t cltv_expiry, uint32_t to_self_delay,
+    const secp256k1_xonly_pubkey *local_htlcpubkey,
+    const secp256k1_context *ctx);
+
+/* Received HTLC success leaf (local claims with preimage + CSV):
+   OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUALVERIFY <csv> OP_CSV OP_DROP <local_key> OP_CHECKSIG */
+void tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
+    const unsigned char *payment_hash32, uint32_t to_self_delay,
+    const secp256k1_xonly_pubkey *local_htlcpubkey,
+    const secp256k1_context *ctx);
+
+/* Received HTLC timeout leaf (remote reclaims after CLTV, no CSV):
+   <cltv> OP_CLTV OP_DROP <remote_key> OP_CHECKSIG */
+void tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
+    uint32_t cltv_expiry,
+    const secp256k1_xonly_pubkey *remote_htlcpubkey,
+    const secp256k1_context *ctx);
+
+/* Build control block for script-path spend of a 2-leaf tree.
+   out must be >= 65 bytes. Result: [leaf_version|parity] || internal_key(32) || sibling_hash(32) */
+int tapscript_build_control_block_2leaf(
+    unsigned char *out, size_t *out_len,
+    int output_parity,
+    const secp256k1_xonly_pubkey *internal_key,
+    const tapscript_leaf_t *sibling_leaf,
+    const secp256k1_context *ctx);
+
+/* Finalize tx with script-path witness including preimage:
+   [sig, preimage, script, control_block] (4 witness items) */
+int finalize_script_path_tx_preimage(
+    tx_buf_t *out,
+    const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+    const unsigned char *sig64,
+    const unsigned char *preimage, size_t preimage_len,
+    const unsigned char *script, size_t script_len,
+    const unsigned char *control_block, size_t control_block_len);
+
 #endif /* SUPERSCALAR_TAPSCRIPT_H */

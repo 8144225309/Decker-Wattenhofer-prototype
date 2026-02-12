@@ -10,6 +10,20 @@
 #include <secp256k1_extrakeys.h>
 
 #define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
+#define MAX_HTLCS 16
+
+typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
+typedef enum { HTLC_STATE_ACTIVE, HTLC_STATE_FULFILLED, HTLC_STATE_FAILED } htlc_state_t;
+
+typedef struct {
+    htlc_direction_t direction;
+    htlc_state_t state;
+    uint64_t amount_sats;
+    unsigned char payment_hash[32];
+    unsigned char payment_preimage[32];  /* filled on fulfill */
+    uint32_t cltv_expiry;
+    uint64_t id;
+} htlc_t;
 
 typedef struct {
     secp256k1_context *ctx;
@@ -35,11 +49,14 @@ typedef struct {
     unsigned char local_delayed_payment_basepoint_secret[32];
     secp256k1_pubkey local_revocation_basepoint;
     unsigned char local_revocation_basepoint_secret[32];
+    secp256k1_pubkey local_htlc_basepoint;
+    unsigned char local_htlc_basepoint_secret[32];
 
     /* Remote basepoints (public only) */
     secp256k1_pubkey remote_payment_basepoint;
     secp256k1_pubkey remote_delayed_payment_basepoint;
     secp256k1_pubkey remote_revocation_basepoint;
+    secp256k1_pubkey remote_htlc_basepoint;
 
     /* Per-commitment state */
     unsigned char shachain_seed[32];
@@ -49,6 +66,11 @@ typedef struct {
     /* Balance (satoshis) */
     uint64_t local_amount;
     uint64_t remote_amount;
+
+    /* HTLCs */
+    htlc_t htlcs[MAX_HTLCS];
+    size_t n_htlcs;
+    uint64_t next_htlc_id;
 
     /* Config */
     uint32_t to_self_delay;
@@ -138,6 +160,16 @@ int channel_build_penalty_tx(const channel_t *ch,
                                size_t to_local_spk_len,
                                uint64_t old_commitment_num);
 
+/* --- Cooperative close --- */
+
+int channel_build_cooperative_close_tx(
+    const channel_t *ch,
+    tx_buf_t *close_tx_out,
+    unsigned char *txid_out32,   /* can be NULL */
+    const secp256k1_keypair *remote_keypair,
+    const tx_output_t *outputs,
+    size_t n_outputs);
+
 /* --- Channel update --- */
 
 int channel_update(channel_t *ch, int64_t delta_sats);
@@ -148,5 +180,41 @@ void channel_update_funding(channel_t *ch,
                               uint64_t new_funding_amount,
                               const unsigned char *new_funding_spk,
                               size_t new_funding_spk_len);
+
+/* --- HTLC basepoints --- */
+
+void channel_set_local_htlc_basepoint(channel_t *ch,
+                                        const unsigned char *htlc_secret32);
+
+void channel_set_remote_htlc_basepoint(channel_t *ch,
+                                         const secp256k1_pubkey *htlc_basepoint);
+
+/* --- HTLC operations --- */
+
+int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
+                      uint64_t amount_sats, const unsigned char *payment_hash32,
+                      uint32_t cltv_expiry, uint64_t *htlc_id_out);
+
+int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
+                           const unsigned char *preimage32);
+
+int channel_fail_htlc(channel_t *ch, uint64_t htlc_id);
+
+/* --- HTLC resolution transactions --- */
+
+int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t htlc_vout,
+    uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
+    size_t htlc_index);
+
+int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
+    const unsigned char *commitment_txid, uint32_t htlc_vout,
+    uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
+    size_t htlc_index);
+
+int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
+    const unsigned char *commitment_txid, uint32_t htlc_vout,
+    uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
+    uint64_t old_commitment_num, size_t htlc_index);
 
 #endif /* SUPERSCALAR_CHANNEL_H */

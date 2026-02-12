@@ -370,3 +370,157 @@ int finalize_script_path_tx(
     tx_buf_write_bytes(out, unsigned_tx + unsigned_tx_len - 4, 4);
     return 1;
 }
+
+/* --- HTLC script builders --- */
+
+void tapscript_build_htlc_offered_success(tapscript_leaf_t *leaf,
+    const unsigned char *payment_hash32,
+    const secp256k1_xonly_pubkey *remote_htlcpubkey,
+    const secp256k1_context *ctx)
+{
+    size_t pos = 0;
+
+    /* OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUALVERIFY <remote_key> OP_CHECKSIG */
+    leaf->script[pos++] = 0x82;  /* OP_SIZE */
+    leaf->script[pos++] = 0x01;  /* OP_PUSHBYTES_1 */
+    leaf->script[pos++] = 0x20;  /* 32 */
+    leaf->script[pos++] = 0x88;  /* OP_EQUALVERIFY */
+    leaf->script[pos++] = 0xa8;  /* OP_SHA256 */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    memcpy(leaf->script + pos, payment_hash32, 32);
+    pos += 32;
+    leaf->script[pos++] = 0x88;  /* OP_EQUALVERIFY */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, remote_htlcpubkey);
+    pos += 32;
+    leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
+
+    leaf->script_len = pos;
+    tapscript_compute_leaf_hash(leaf);
+}
+
+void tapscript_build_htlc_offered_timeout(tapscript_leaf_t *leaf,
+    uint32_t cltv_expiry, uint32_t to_self_delay,
+    const secp256k1_xonly_pubkey *local_htlcpubkey,
+    const secp256k1_context *ctx)
+{
+    size_t pos = 0;
+
+    /* <cltv> OP_CLTV OP_DROP <csv> OP_CSV OP_DROP <local_key> OP_CHECKSIG */
+    pos += encode_scriptnum(leaf->script + pos, cltv_expiry);
+    leaf->script[pos++] = 0xb1;  /* OP_CHECKLOCKTIMEVERIFY */
+    leaf->script[pos++] = 0x75;  /* OP_DROP */
+    pos += encode_scriptnum(leaf->script + pos, to_self_delay);
+    leaf->script[pos++] = 0xb2;  /* OP_CHECKSEQUENCEVERIFY */
+    leaf->script[pos++] = 0x75;  /* OP_DROP */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, local_htlcpubkey);
+    pos += 32;
+    leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
+
+    leaf->script_len = pos;
+    tapscript_compute_leaf_hash(leaf);
+}
+
+void tapscript_build_htlc_received_success(tapscript_leaf_t *leaf,
+    const unsigned char *payment_hash32, uint32_t to_self_delay,
+    const secp256k1_xonly_pubkey *local_htlcpubkey,
+    const secp256k1_context *ctx)
+{
+    size_t pos = 0;
+
+    /* OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash> OP_EQUALVERIFY <csv> OP_CSV OP_DROP <local_key> OP_CHECKSIG */
+    leaf->script[pos++] = 0x82;  /* OP_SIZE */
+    leaf->script[pos++] = 0x01;  /* OP_PUSHBYTES_1 */
+    leaf->script[pos++] = 0x20;  /* 32 */
+    leaf->script[pos++] = 0x88;  /* OP_EQUALVERIFY */
+    leaf->script[pos++] = 0xa8;  /* OP_SHA256 */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    memcpy(leaf->script + pos, payment_hash32, 32);
+    pos += 32;
+    leaf->script[pos++] = 0x88;  /* OP_EQUALVERIFY */
+    pos += encode_scriptnum(leaf->script + pos, to_self_delay);
+    leaf->script[pos++] = 0xb2;  /* OP_CHECKSEQUENCEVERIFY */
+    leaf->script[pos++] = 0x75;  /* OP_DROP */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, local_htlcpubkey);
+    pos += 32;
+    leaf->script[pos++] = 0xac;  /* OP_CHECKSIG */
+
+    leaf->script_len = pos;
+    tapscript_compute_leaf_hash(leaf);
+}
+
+void tapscript_build_htlc_received_timeout(tapscript_leaf_t *leaf,
+    uint32_t cltv_expiry,
+    const secp256k1_xonly_pubkey *remote_htlcpubkey,
+    const secp256k1_context *ctx)
+{
+    /* Identical structure to cltv_timeout: <cltv> OP_CLTV OP_DROP <key> OP_CHECKSIG */
+    tapscript_build_cltv_timeout(leaf, cltv_expiry, remote_htlcpubkey, ctx);
+}
+
+/* --- 2-leaf control block --- */
+
+int tapscript_build_control_block_2leaf(
+    unsigned char *out, size_t *out_len,
+    int output_parity,
+    const secp256k1_xonly_pubkey *internal_key,
+    const tapscript_leaf_t *sibling_leaf,
+    const secp256k1_context *ctx)
+{
+    /* 2-leaf tree: control block = [leaf_version | parity_bit] || internal_key(32) || sibling_leaf_hash(32) */
+    /* Total: 65 bytes */
+    out[0] = TAPSCRIPT_LEAF_VERSION | (output_parity & 1);
+
+    if (!secp256k1_xonly_pubkey_serialize(ctx, out + 1, internal_key))
+        return 0;
+
+    memcpy(out + 33, sibling_leaf->leaf_hash, 32);
+
+    *out_len = 65;
+    return 1;
+}
+
+/* --- Preimage witness finalizer --- */
+
+int finalize_script_path_tx_preimage(
+    tx_buf_t *out,
+    const unsigned char *unsigned_tx, size_t unsigned_tx_len,
+    const unsigned char *sig64,
+    const unsigned char *preimage, size_t preimage_len,
+    const unsigned char *script, size_t script_len,
+    const unsigned char *control_block, size_t control_block_len)
+{
+    tx_buf_reset(out);
+
+    tx_buf_write_bytes(out, unsigned_tx, 4);   /* nVersion */
+    tx_buf_write_u8(out, 0x00);                /* segwit marker */
+    tx_buf_write_u8(out, 0x01);                /* segwit flag */
+
+    /* inputs + outputs (between nVersion and nLockTime) */
+    tx_buf_write_bytes(out, unsigned_tx + 4, unsigned_tx_len - 8);
+
+    /* witness: 4 items: [sig(64), preimage(32), script(var), control_block(65)] */
+    tx_buf_write_varint(out, 4);
+
+    /* Item 1: signature */
+    tx_buf_write_varint(out, 64);
+    tx_buf_write_bytes(out, sig64, 64);
+
+    /* Item 2: preimage */
+    tx_buf_write_varint(out, preimage_len);
+    tx_buf_write_bytes(out, preimage, preimage_len);
+
+    /* Item 3: script */
+    tx_buf_write_varint(out, script_len);
+    tx_buf_write_bytes(out, script, script_len);
+
+    /* Item 4: control block */
+    tx_buf_write_varint(out, control_block_len);
+    tx_buf_write_bytes(out, control_block, control_block_len);
+
+    /* nLockTime */
+    tx_buf_write_bytes(out, unsigned_tx + unsigned_tx_len - 4, 4);
+    return 1;
+}

@@ -723,6 +723,60 @@ int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
     return 1;
 }
 
+int factory_build_cooperative_close(
+    factory_t *f,
+    tx_buf_t *close_tx_out,
+    unsigned char *txid_out32,
+    const tx_output_t *outputs,
+    size_t n_outputs)
+{
+    /* 1. Build unsigned tx spending the funding UTXO */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char display_txid[32];
+
+    if (!build_unsigned_tx(&unsigned_tx, txid_out32 ? display_txid : NULL,
+                            f->funding_txid, f->funding_vout,
+                            0xFFFFFFFEu,
+                            outputs, n_outputs)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    if (txid_out32) {
+        memcpy(txid_out32, display_txid, 32);
+        reverse_bytes(txid_out32, 32);  /* display -> internal */
+    }
+
+    /* 2. Compute BIP-341 key-path sighash */
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                  0, f->funding_spk, f->funding_spk_len,
+                                  f->funding_amount_sats, 0xFFFFFFFEu)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 3. Sign with N-of-N MuSig (key-path, same aggregate key as kickoff_root) */
+    musig_keyagg_t keyagg_copy = f->nodes[0].keyagg;
+    unsigned char sig64[64];
+    if (!musig_sign_taproot(f->ctx, sig64, sighash, f->keypairs,
+                             f->n_participants, &keyagg_copy, NULL)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 4. Finalize */
+    if (!finalize_signed_tx(close_tx_out, unsigned_tx.data, unsigned_tx.len,
+                              sig64)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    tx_buf_free(&unsigned_tx);
+    return 1;
+}
+
 void factory_free(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         tx_buf_free(&f->nodes[i].unsigned_tx);

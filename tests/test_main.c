@@ -106,6 +106,24 @@ extern int test_channel_revocation(void);
 extern int test_channel_penalty_tx(void);
 extern int test_regtest_channel_unilateral(void);
 
+extern int test_htlc_offered_scripts(void);
+extern int test_htlc_received_scripts(void);
+extern int test_htlc_control_block_2leaf(void);
+extern int test_htlc_add_fulfill(void);
+extern int test_htlc_add_fail(void);
+extern int test_htlc_commitment_tx(void);
+extern int test_htlc_success_spend(void);
+extern int test_htlc_timeout_spend(void);
+extern int test_htlc_penalty(void);
+extern int test_regtest_htlc_success(void);
+extern int test_regtest_htlc_timeout(void);
+
+extern int test_factory_cooperative_close(void);
+extern int test_factory_cooperative_close_balances(void);
+extern int test_channel_cooperative_close(void);
+extern int test_regtest_factory_coop_close(void);
+extern int test_regtest_channel_coop_close(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -174,6 +192,22 @@ static void run_unit_tests(void) {
     RUN_TEST(test_channel_update);
     RUN_TEST(test_channel_revocation);
     RUN_TEST(test_channel_penalty_tx);
+
+    printf("\n=== HTLC (Phase 6) ===\n");
+    RUN_TEST(test_htlc_offered_scripts);
+    RUN_TEST(test_htlc_received_scripts);
+    RUN_TEST(test_htlc_control_block_2leaf);
+    RUN_TEST(test_htlc_add_fulfill);
+    RUN_TEST(test_htlc_add_fail);
+    RUN_TEST(test_htlc_commitment_tx);
+    RUN_TEST(test_htlc_success_spend);
+    RUN_TEST(test_htlc_timeout_spend);
+    RUN_TEST(test_htlc_penalty);
+
+    printf("\n=== Cooperative Close (Phase 7) ===\n");
+    RUN_TEST(test_factory_cooperative_close);
+    RUN_TEST(test_factory_cooperative_close_balances);
+    RUN_TEST(test_channel_cooperative_close);
 }
 
 static void run_regtest_tests(void) {
@@ -187,6 +221,10 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_timeout_spend);
     RUN_TEST(test_regtest_burn_tx);
     RUN_TEST(test_regtest_channel_unilateral);
+    RUN_TEST(test_regtest_htlc_success);
+    RUN_TEST(test_regtest_htlc_timeout);
+    RUN_TEST(test_regtest_factory_coop_close);
+    RUN_TEST(test_regtest_channel_coop_close);
 }
 
 int main(int argc, char *argv[]) {
@@ -201,7 +239,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-5)\n");
+    printf("SuperScalar Test Suite (Phase 1-7)\n");
     printf("==================================\n");
 
     if (run_unit) run_unit_tests();

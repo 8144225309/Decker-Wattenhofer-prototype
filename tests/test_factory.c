@@ -1327,3 +1327,331 @@ int test_regtest_burn_tx(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Phase 7: Cooperative Close Tests ---- */
+
+/* Test: factory cooperative close produces valid signed tx */
+int test_factory_cooperative_close(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Compute 5 settlement outputs: one per participant */
+    uint64_t fee = 500;
+    uint64_t total_out = 100000 - fee;
+    uint64_t per_output = total_out / 5;
+    uint64_t remainder = total_out - per_output * 5;
+
+    tx_output_t outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[i]);
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &pk);
+
+        /* Key-path-only tweak for settlement output */
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_full;
+        secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full, &xonly, tweak);
+        secp256k1_xonly_pubkey tweaked;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &tweaked_full);
+
+        build_p2tr_script_pubkey(outputs[i].script_pubkey, &tweaked);
+        outputs[i].script_pubkey_len = 34;
+        outputs[i].amount_sats = per_output + (i == 4 ? remainder : 0);
+    }
+
+    /* Build cooperative close */
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    unsigned char close_txid[32];
+    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, close_txid,
+                                                  outputs, 5),
+                "build cooperative close");
+
+    /* Verify: non-empty signed tx */
+    TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
+
+    /* Verify: txid differs from kickoff_root's txid */
+    TEST_ASSERT(memcmp(close_txid, f.nodes[0].txid, 32) != 0,
+                "close txid differs from kickoff_root");
+
+    /* Verify signature: extract sig and check against funding output key */
+    /* The close tx is a key-path spend of the funding output.
+       Rebuild unsigned tx to extract sighash. */
+    tx_buf_t close_unsigned;
+    tx_buf_init(&close_unsigned, 256);
+    build_unsigned_tx(&close_unsigned, NULL, f.funding_txid, f.funding_vout,
+                       0xFFFFFFFEu, outputs, 5);
+
+    unsigned char sighash[32];
+    TEST_ASSERT(compute_taproot_sighash(sighash,
+                    close_unsigned.data, close_unsigned.len,
+                    0, f.funding_spk, f.funding_spk_len,
+                    f.funding_amount_sats, 0xFFFFFFFEu),
+                "compute sighash");
+
+    /* Extract sig from witness */
+    size_t witness_offset = close_unsigned.len - 2;
+    unsigned char sig[64];
+    memcpy(sig, close_tx.data + witness_offset + 2, 64);
+
+    int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32,
+                                              &fund_tweaked);
+    TEST_ASSERT(valid, "cooperative close sig valid");
+
+    tx_buf_free(&close_tx);
+    tx_buf_free(&close_unsigned);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: cooperative close with unequal balances */
+int test_factory_cooperative_close_balances(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Simulate shifted balances: LSP gets 50000, clients get varying amounts */
+    uint64_t fee = 500;
+    uint64_t balances[5] = { 50000, 15000, 10000, 12000, 12500 };
+    /* Verify amounts sum to funding - fee */
+    uint64_t sum = 0;
+    for (int i = 0; i < 5; i++) sum += balances[i];
+    TEST_ASSERT_EQ(sum, 100000 - fee, "balances sum to funding - fee");
+
+    tx_output_t outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[i]);
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &pk);
+
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tweaked_full;
+        secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full, &xonly, tweak);
+        secp256k1_xonly_pubkey tweaked;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &tweaked_full);
+
+        build_p2tr_script_pubkey(outputs[i].script_pubkey, &tweaked);
+        outputs[i].script_pubkey_len = 34;
+        outputs[i].amount_sats = balances[i];
+    }
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+                                                  outputs, 5),
+                "build cooperative close (unequal)");
+
+    TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
+
+    /* Verify the outputs are encoded correctly by checking the tx
+       contains the expected amounts in little-endian */
+    for (int i = 0; i < 5; i++) {
+        unsigned char le_amount[8];
+        for (int j = 0; j < 8; j++)
+            le_amount[j] = (unsigned char)((balances[i] >> (j * 8)) & 0xFF);
+
+        int found = 0;
+        for (size_t off = 0; off + 8 <= close_tx.len; off++) {
+            if (memcmp(close_tx.data + off, le_amount, 8) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "output %d amount %lu found in tx", i,
+                 (unsigned long)balances[i]);
+        TEST_ASSERT(found, msg);
+    }
+
+    tx_buf_free(&close_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Regtest: factory cooperative close bypasses tree and confirms on-chain */
+int test_regtest_factory_coop_close(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_coop_f");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    /* Derive bech32m address */
+    unsigned char tweaked_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked);
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char factory_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "addr quote");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "addr end quote");
+        size_t len = (size_t)(end - start);
+        memcpy(factory_addr, start, len);
+        factory_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    /* Fund factory */
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                    &found_vout, &fund_amount),
+                "find factory vout");
+    printf("  Factory funded: %s vout=%d amount=%lu sats\n",
+           funding_txid_hex, found_vout, (unsigned long)fund_amount);
+
+    /* Init factory, build tree (but don't broadcast tree!) */
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Build cooperative close: 1 output going to mine_addr equivalent */
+    uint64_t close_fee = 500;
+    tx_output_t close_output;
+    close_output.amount_sats = fund_amount - close_fee;
+
+    /* Use LSP key as destination (simple P2TR) */
+    secp256k1_pubkey lsp_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    secp256k1_xonly_pubkey lsp_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_xonly, NULL, &lsp_pk);
+
+    unsigned char lsp_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, lsp_ser, &lsp_xonly);
+    unsigned char lsp_tweak[32];
+    sha256_tagged("TapTweak", lsp_ser, 32, lsp_tweak);
+    secp256k1_pubkey lsp_tweaked_full;
+    secp256k1_xonly_pubkey_tweak_add(ctx, &lsp_tweaked_full, &lsp_xonly, lsp_tweak);
+    secp256k1_xonly_pubkey lsp_tweaked;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &lsp_tweaked, NULL, &lsp_tweaked_full);
+
+    build_p2tr_script_pubkey(close_output.script_pubkey, &lsp_tweaked);
+    close_output.script_pubkey_len = 34;
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+                                                  &close_output, 1),
+                "build cooperative close");
+
+    /* Broadcast (single tx, not the tree!) */
+    char *close_hex = (char *)malloc(close_tx.len * 2 + 1);
+    hex_encode(close_tx.data, close_tx.len, close_hex);
+
+    char close_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, close_hex, close_txid_hex);
+    if (!sent) {
+        printf("  FAIL: cooperative close broadcast failed\n");
+        printf("  Close tx hex (%zu bytes): %s\n", close_tx.len, close_hex);
+    }
+    free(close_hex);
+    TEST_ASSERT(sent, "broadcast cooperative close");
+    printf("  Cooperative close broadcast: %s\n", close_txid_hex);
+
+    /* Mine and verify */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, close_txid_hex);
+    printf("  Cooperative close confirmations: %d\n", conf);
+    TEST_ASSERT(conf > 0, "cooperative close confirmed");
+
+    printf("  Factory cooperative close confirmed! Single tx bypassed entire tree.\n");
+
+    tx_buf_free(&close_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
