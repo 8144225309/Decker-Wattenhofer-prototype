@@ -5,6 +5,7 @@
 #include "dw_state.h"
 #include "musig.h"
 #include "tx_builder.h"
+#include "tapscript.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
@@ -52,6 +53,12 @@ typedef struct {
 
     /* Input amount from parent output */
     uint64_t input_amount;
+
+    /* Timeout script path (state outputs feeding kickoff nodes) */
+    int has_taptree;
+    tapscript_leaf_t timeout_leaf;
+    unsigned char merkle_root[32];
+    int output_parity;        /* parity of tweaked output key */
 } factory_node_t;
 
 typedef struct {
@@ -80,6 +87,9 @@ typedef struct {
 
     /* Fee per transaction */
     uint64_t fee_per_tx;
+
+    /* CLTV timeout (absolute block height) */
+    uint32_t cltv_timeout;
 } factory_t;
 
 void factory_init(factory_t *f, secp256k1_context *ctx,

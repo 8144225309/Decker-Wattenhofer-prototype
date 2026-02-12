@@ -70,6 +70,13 @@ extern int test_factory_sign_all(void);
 extern int test_factory_advance(void);
 extern int test_regtest_factory_tree(void);
 
+extern int test_tapscript_leaf_hash(void);
+extern int test_tapscript_tweak_with_tree(void);
+extern int test_tapscript_control_block(void);
+extern int test_tapscript_sighash(void);
+extern int test_factory_tree_with_timeout(void);
+extern int test_regtest_timeout_spend(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -98,6 +105,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_build_tree);
     RUN_TEST(test_factory_sign_all);
     RUN_TEST(test_factory_advance);
+
+    printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
+    RUN_TEST(test_tapscript_leaf_hash);
+    RUN_TEST(test_tapscript_tweak_with_tree);
+    RUN_TEST(test_tapscript_control_block);
+    RUN_TEST(test_tapscript_sighash);
+    RUN_TEST(test_factory_tree_with_timeout);
 }
 
 static void run_regtest_tests(void) {
@@ -108,6 +122,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_musig_onchain);
     RUN_TEST(test_regtest_nsequence_edge);
     RUN_TEST(test_regtest_factory_tree);
+    RUN_TEST(test_regtest_timeout_spend);
 }
 
 int main(int argc, char *argv[]) {
@@ -122,8 +137,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Phase 1 Test Suite\n");
-    printf("==============================\n");
+    printf("SuperScalar Test Suite (Phase 1 + Phase 2)\n");
+    printf("==========================================\n");
 
     if (run_unit) run_unit_tests();
     if (run_regtest) run_regtest_tests();

@@ -60,12 +60,13 @@ void build_p2tr_script_pubkey(unsigned char *out34, const secp256k1_xonly_pubkey
     secp256k1_xonly_pubkey_serialize(secp256k1_context_static, out34 + 2, key);
 }
 
-int build_unsigned_tx(
+int build_unsigned_tx_with_locktime(
     tx_buf_t *out,
     unsigned char *txid_out32,
     const unsigned char *funding_txid,
     uint32_t funding_vout,
     uint32_t nsequence,
+    uint32_t nlocktime,
     const tx_output_t *outputs,
     size_t n_outputs
 ) {
@@ -85,7 +86,7 @@ int build_unsigned_tx(
         tx_buf_write_bytes(out, outputs[i].script_pubkey, outputs[i].script_pubkey_len);
     }
 
-    tx_buf_write_u32_le(out, 0);           /* nLockTime */
+    tx_buf_write_u32_le(out, nlocktime);
 
     if (txid_out32) {
         sha256_double(out->data, out->len, txid_out32);
@@ -93,6 +94,19 @@ int build_unsigned_tx(
     }
 
     return 1;
+}
+
+int build_unsigned_tx(
+    tx_buf_t *out,
+    unsigned char *txid_out32,
+    const unsigned char *funding_txid,
+    uint32_t funding_vout,
+    uint32_t nsequence,
+    const tx_output_t *outputs,
+    size_t n_outputs
+) {
+    return build_unsigned_tx_with_locktime(out, txid_out32, funding_txid, funding_vout,
+                                            nsequence, 0, outputs, n_outputs);
 }
 
 static void write_u32_le(unsigned char *buf, uint32_t val) {

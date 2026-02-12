@@ -21,6 +21,18 @@ typedef struct {
     size_t script_pubkey_len;
 } tx_output_t;
 
+/* Build unsigned single-input tx with custom nLockTime. */
+int build_unsigned_tx_with_locktime(
+    tx_buf_t *out,
+    unsigned char *txid_out32,     /* can be NULL */
+    const unsigned char *funding_txid,
+    uint32_t funding_vout,
+    uint32_t nsequence,
+    uint32_t nlocktime,
+    const tx_output_t *outputs,
+    size_t n_outputs
+);
+
 /* Build unsigned single-input tx (nVersion=2, nLockTime=0). */
 int build_unsigned_tx(
     tx_buf_t *out,
