@@ -16,11 +16,23 @@ typedef struct {
     unsigned char leaf_hash[32];
 } tapscript_leaf_t;
 
+/* Build hashlock script: OP_SIZE <0x20> OP_EQUALVERIFY OP_SHA256 <hash32> OP_EQUAL */
+void tapscript_build_hashlock(tapscript_leaf_t *leaf,
+                               const unsigned char *hash32);
+
 /* Build CLTV timeout script: <locktime> OP_CLTV OP_DROP <L_pubkey> OP_CHECKSIG */
 void tapscript_build_cltv_timeout(
     tapscript_leaf_t *leaf,
     uint32_t locktime,
     const secp256k1_xonly_pubkey *lsp_pubkey,
+    const secp256k1_context *ctx
+);
+
+/* Build CSV delay script: <delay> OP_CSV OP_DROP <pubkey> OP_CHECKSIG */
+void tapscript_build_csv_delay(
+    tapscript_leaf_t *leaf,
+    uint32_t delay,
+    const secp256k1_xonly_pubkey *pubkey,
     const secp256k1_context *ctx
 );
 

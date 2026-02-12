@@ -75,6 +75,9 @@ extern int test_regtest_nsequence_edge(void);
 extern int test_factory_build_tree(void);
 extern int test_factory_sign_all(void);
 extern int test_factory_advance(void);
+extern int test_factory_sign_split_round_step_by_step(void);
+extern int test_factory_split_round_with_pool(void);
+extern int test_factory_advance_split_round(void);
 extern int test_regtest_factory_tree(void);
 
 extern int test_tapscript_leaf_hash(void);
@@ -83,6 +86,25 @@ extern int test_tapscript_control_block(void);
 extern int test_tapscript_sighash(void);
 extern int test_factory_tree_with_timeout(void);
 extern int test_regtest_timeout_spend(void);
+
+extern int test_shachain_generation(void);
+extern int test_shachain_derivation_property(void);
+extern int test_shachain_insert_derive(void);
+extern int test_shachain_compact_storage(void);
+extern int test_shachain_reject_bad_insert(void);
+
+extern int test_factory_l_stock_with_burn_path(void);
+extern int test_factory_burn_tx_construction(void);
+extern int test_factory_advance_with_shachain(void);
+extern int test_regtest_burn_tx(void);
+
+extern int test_channel_key_derivation(void);
+extern int test_channel_commitment_tx(void);
+extern int test_channel_sign_commitment(void);
+extern int test_channel_update(void);
+extern int test_channel_revocation(void);
+extern int test_channel_penalty_tx(void);
+extern int test_regtest_channel_unilateral(void);
 
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
@@ -121,12 +143,37 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_sign_all);
     RUN_TEST(test_factory_advance);
 
+    printf("\n=== Factory Split-Round ===\n");
+    RUN_TEST(test_factory_sign_split_round_step_by_step);
+    RUN_TEST(test_factory_split_round_with_pool);
+    RUN_TEST(test_factory_advance_split_round);
+
     printf("\n=== Tapscript (Timeout-Sig-Trees) ===\n");
     RUN_TEST(test_tapscript_leaf_hash);
     RUN_TEST(test_tapscript_tweak_with_tree);
     RUN_TEST(test_tapscript_control_block);
     RUN_TEST(test_tapscript_sighash);
     RUN_TEST(test_factory_tree_with_timeout);
+
+    printf("\n=== Shachain ===\n");
+    RUN_TEST(test_shachain_generation);
+    RUN_TEST(test_shachain_derivation_property);
+    RUN_TEST(test_shachain_insert_derive);
+    RUN_TEST(test_shachain_compact_storage);
+    RUN_TEST(test_shachain_reject_bad_insert);
+
+    printf("\n=== Factory Shachain (L-Output Invalidation) ===\n");
+    RUN_TEST(test_factory_l_stock_with_burn_path);
+    RUN_TEST(test_factory_burn_tx_construction);
+    RUN_TEST(test_factory_advance_with_shachain);
+
+    printf("\n=== Channel (Poon-Dryja) ===\n");
+    RUN_TEST(test_channel_key_derivation);
+    RUN_TEST(test_channel_commitment_tx);
+    RUN_TEST(test_channel_sign_commitment);
+    RUN_TEST(test_channel_update);
+    RUN_TEST(test_channel_revocation);
+    RUN_TEST(test_channel_penalty_tx);
 }
 
 static void run_regtest_tests(void) {
@@ -138,6 +185,8 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_nsequence_edge);
     RUN_TEST(test_regtest_factory_tree);
     RUN_TEST(test_regtest_timeout_spend);
+    RUN_TEST(test_regtest_burn_tx);
+    RUN_TEST(test_regtest_channel_unilateral);
 }
 
 int main(int argc, char *argv[]) {
@@ -152,8 +201,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1 + Phase 2)\n");
-    printf("==========================================\n");
+    printf("SuperScalar Test Suite (Phase 1-5)\n");
+    printf("==================================\n");
 
     if (run_unit) run_unit_tests();
     if (run_regtest) run_regtest_tests();

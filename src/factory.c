@@ -1,7 +1,9 @@
 #include "superscalar/factory.h"
+#include "superscalar/shachain.h"
 #include <string.h>
 #include <stdlib.h>
 
+extern void sha256(const unsigned char *, size_t, unsigned char *);
 extern void sha256_tagged(const char *, const unsigned char *, size_t,
                            unsigned char *);
 extern void reverse_bytes(unsigned char *, size_t);
@@ -160,6 +162,71 @@ static int add_node(
     return idx;
 }
 
+/* Build L-stock scriptPubKey.
+   If shachain is enabled: P2TR with key-path = LSP, script-path = hashlock.
+   If not: simple P2TR of LSP key. */
+static int build_l_stock_spk(const factory_t *f, unsigned char *spk_out34) {
+    if (f->has_shachain) {
+        /* Get current epoch's shachain secret and compute SHA256 hash */
+        uint64_t sc_index = shachain_epoch_to_index(f->counter.current_epoch);
+        unsigned char secret[32];
+        shachain_from_seed(f->shachain_seed, sc_index, secret);
+
+        unsigned char hash[32];
+        sha256(secret, 32, hash);
+        memset(secret, 0, 32);
+
+        /* Build hashlock leaf */
+        tapscript_leaf_t hashlock_leaf;
+        tapscript_build_hashlock(&hashlock_leaf, hash);
+
+        /* Compute merkle root from single leaf */
+        unsigned char merkle_root[32];
+        tapscript_merkle_root(merkle_root, &hashlock_leaf, 1);
+
+        /* Get LSP's xonly pubkey as internal key */
+        secp256k1_xonly_pubkey lsp_internal;
+        if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_internal, NULL,
+                                                  &f->pubkeys[0]))
+            return 0;
+
+        /* Tweak with merkle root */
+        secp256k1_xonly_pubkey tweaked;
+        if (!tapscript_tweak_pubkey(f->ctx, &tweaked, NULL,
+                                     &lsp_internal, merkle_root))
+            return 0;
+
+        build_p2tr_script_pubkey(spk_out34, &tweaked);
+    } else {
+        secp256k1_xonly_pubkey tw;
+        if (!build_single_p2tr_spk(f->ctx, spk_out34, &tw, &f->pubkeys[0]))
+            return 0;
+    }
+    return 1;
+}
+
+/* Update L-stock outputs on leaf state nodes after epoch change.
+   Called by factory_advance() after counter advance. */
+static int update_l_stock_outputs(factory_t *f) {
+    if (!f->has_shachain)
+        return 1;  /* nothing to update */
+
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        /* Leaf state nodes: type == STATE and no children */
+        if (node->type != NODE_STATE || node->n_children > 0)
+            continue;
+
+        /* Output index 2 is always the L-stock */
+        if (node->n_outputs < 3)
+            continue;
+
+        if (!build_l_stock_spk(f, node->outputs[2].script_pubkey))
+            return 0;
+    }
+    return 1;
+}
+
 /* Set up leaf outputs for a leaf state node. */
 static int setup_leaf_outputs(
     factory_t *f,
@@ -198,15 +265,11 @@ static int setup_leaf_outputs(
         node->outputs[1].amount_sats = per_output;
     }
 
-    /* L stock: LSP only */
-    {
-        secp256k1_xonly_pubkey tw;
-        if (!build_single_p2tr_spk(f->ctx, node->outputs[2].script_pubkey,
-                                    &tw, &f->pubkeys[0]))
-            return 0;
-        node->outputs[2].script_pubkey_len = 34;
-        node->outputs[2].amount_sats = per_output + remainder;
-    }
+    /* L stock: LSP only, optionally with hashlock burn path */
+    if (!build_l_stock_spk(f, node->outputs[2].script_pubkey))
+        return 0;
+    node->outputs[2].script_pubkey_len = 34;
+    node->outputs[2].amount_sats = per_output + remainder;
 
     return 1;
 }
@@ -246,6 +309,30 @@ static int build_all_unsigned_txs(factory_t *f) {
         node->is_signed = 0;
     }
     return 1;
+}
+
+/* Compute BIP-341 sighash for a factory node's input. */
+static int compute_node_sighash(const factory_t *f, const factory_node_t *node,
+                                 unsigned char *sighash_out) {
+    const unsigned char *prev_spk;
+    size_t prev_spk_len;
+    uint64_t prev_amount;
+
+    if (node->parent_index < 0) {
+        prev_spk = f->funding_spk;
+        prev_spk_len = f->funding_spk_len;
+        prev_amount = f->funding_amount_sats;
+    } else {
+        const factory_node_t *parent = &f->nodes[node->parent_index];
+        prev_spk = parent->outputs[node->parent_vout].script_pubkey;
+        prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
+        prev_amount = parent->outputs[node->parent_vout].amount_sats;
+    }
+
+    return compute_taproot_sighash(sighash_out,
+                                    node->unsigned_tx.data, node->unsigned_tx.len,
+                                    0, prev_spk, prev_spk_len,
+                                    prev_amount, node->nsequence);
 }
 
 /* ---- Public API ---- */
@@ -355,47 +442,74 @@ int factory_build_tree(factory_t *f) {
     return build_all_unsigned_txs(f);
 }
 
-int factory_sign_all(factory_t *f) {
+/* --- Split-round signing API --- */
+
+int factory_find_signer_slot(const factory_t *f, size_t node_idx,
+                              uint32_t participant_idx) {
+    if (node_idx >= f->n_nodes) return -1;
+    const factory_node_t *node = &f->nodes[node_idx];
+    for (size_t i = 0; i < node->n_signers; i++) {
+        if (node->signer_indices[i] == participant_idx)
+            return (int)i;
+    }
+    return -1;
+}
+
+int factory_sessions_init(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         factory_node_t *node = &f->nodes[i];
         if (!node->is_built) return 0;
+        musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+        node->partial_sigs_received = 0;
+    }
+    return 1;
+}
 
-        /* Previous output info for sighash */
-        const unsigned char *prev_spk;
-        size_t prev_spk_len;
-        uint64_t prev_amount;
+int factory_session_set_nonce(factory_t *f, size_t node_idx, size_t signer_slot,
+                               const secp256k1_musig_pubnonce *pubnonce) {
+    if (node_idx >= f->n_nodes) return 0;
+    return musig_session_set_pubnonce(&f->nodes[node_idx].signing_session,
+                                      signer_slot, pubnonce);
+}
 
-        if (node->parent_index < 0) {
-            prev_spk = f->funding_spk;
-            prev_spk_len = f->funding_spk_len;
-            prev_amount = f->funding_amount_sats;
-        } else {
-            factory_node_t *parent = &f->nodes[node->parent_index];
-            prev_spk = parent->outputs[node->parent_vout].script_pubkey;
-            prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
-            prev_amount = parent->outputs[node->parent_vout].amount_sats;
-        }
+int factory_sessions_finalize(factory_t *f) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
 
         unsigned char sighash[32];
-        if (!compute_taproot_sighash(sighash,
-                                      node->unsigned_tx.data, node->unsigned_tx.len,
-                                      0, prev_spk, prev_spk_len,
-                                      prev_amount, node->nsequence))
+        if (!compute_node_sighash(f, node, sighash))
             return 0;
 
-        /* Gather keypairs for this node's signers */
-        secp256k1_keypair kps[FACTORY_MAX_SIGNERS];
-        for (size_t j = 0; j < node->n_signers; j++)
-            kps[j] = f->keypairs[node->signer_indices[j]];
-
-        /* Sign (copy keyagg since musig_sign_taproot modifies it).
-           Pass merkle_root if this node has a taptree (key-path spend of
-           an output that also has a script path). */
-        unsigned char sig[64];
-        musig_keyagg_t sign_ka = node->keyagg;
         const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
-        if (!musig_sign_taproot(f->ctx, sig, sighash, kps, node->n_signers,
-                                 &sign_ka, mr))
+        if (!musig_session_finalize_nonces(f->ctx, &node->signing_session,
+                                            sighash, mr, NULL))
+            return 0;
+    }
+    return 1;
+}
+
+int factory_session_set_partial_sig(factory_t *f, size_t node_idx,
+                                     size_t signer_slot,
+                                     const secp256k1_musig_partial_sig *psig) {
+    if (node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (signer_slot >= node->n_signers) return 0;
+
+    node->partial_sigs[signer_slot] = *psig;
+    node->partial_sigs_received++;
+    return 1;
+}
+
+int factory_sessions_complete(factory_t *f) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+
+        if (node->partial_sigs_received != (int)node->n_signers)
+            return 0;
+
+        unsigned char sig[64];
+        if (!musig_aggregate_partial_sigs(f->ctx, sig, &node->signing_session,
+                                           node->partial_sigs, node->n_signers))
             return 0;
 
         if (!finalize_signed_tx(&node->signed_tx,
@@ -408,14 +522,205 @@ int factory_sign_all(factory_t *f) {
     return 1;
 }
 
+int factory_sign_all(factory_t *f) {
+    /* Step 1: Initialize sessions */
+    if (!factory_sessions_init(f))
+        return 0;
+
+    /* Count total (node, signer) slots for secnonce storage */
+    size_t total_slots = 0;
+    for (size_t i = 0; i < f->n_nodes; i++)
+        total_slots += f->nodes[i].n_signers;
+
+    /* Allocate secnonces: indexed as [node_offset + signer_slot] */
+    secp256k1_musig_secnonce *secnonces =
+        (secp256k1_musig_secnonce *)calloc(total_slots,
+                                            sizeof(secp256k1_musig_secnonce));
+    if (!secnonces) return 0;
+
+    /* Step 2: Generate nonces and set pubnonces */
+    size_t offset = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        for (size_t j = 0; j < node->n_signers; j++) {
+            uint32_t participant = node->signer_indices[j];
+            unsigned char seckey[32];
+            secp256k1_pubkey pk;
+
+            if (!secp256k1_keypair_sec(f->ctx, seckey, &f->keypairs[participant]))
+                goto fail;
+            if (!secp256k1_keypair_pub(f->ctx, &pk, &f->keypairs[participant]))
+                goto fail;
+
+            secp256k1_musig_pubnonce pubnonce;
+            if (!musig_generate_nonce(f->ctx, &secnonces[offset + j], &pubnonce,
+                                       seckey, &pk, &node->keyagg.cache))
+                goto fail;
+
+            memset(seckey, 0, 32);
+
+            if (!factory_session_set_nonce(f, i, j, &pubnonce))
+                goto fail;
+        }
+        offset += node->n_signers;
+    }
+
+    /* Step 3: Finalize nonces (compute sighash + aggregate nonces + tweak) */
+    if (!factory_sessions_finalize(f))
+        goto fail;
+
+    /* Step 4: Create partial sigs */
+    offset = 0;
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        for (size_t j = 0; j < node->n_signers; j++) {
+            uint32_t participant = node->signer_indices[j];
+            secp256k1_musig_partial_sig psig;
+
+            if (!musig_create_partial_sig(f->ctx, &psig,
+                                           &secnonces[offset + j],
+                                           &f->keypairs[participant],
+                                           &node->signing_session))
+                goto fail;
+
+            if (!factory_session_set_partial_sig(f, i, j, &psig))
+                goto fail;
+        }
+        offset += node->n_signers;
+    }
+
+    /* Step 5: Complete (aggregate + finalize witness) */
+    if (!factory_sessions_complete(f)) goto fail;
+
+    memset(secnonces, 0, total_slots * sizeof(secp256k1_musig_secnonce));
+    free(secnonces);
+    return 1;
+
+fail:
+    memset(secnonces, 0, total_slots * sizeof(secp256k1_musig_secnonce));
+    free(secnonces);
+    return 0;
+}
+
 int factory_advance(factory_t *f) {
     if (!dw_counter_advance(&f->counter))
+        return 0;
+
+    if (!update_l_stock_outputs(f))
         return 0;
 
     if (!build_all_unsigned_txs(f))
         return 0;
 
     return factory_sign_all(f);
+}
+
+void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {
+    memcpy(f->shachain_seed, seed32, 32);
+    f->has_shachain = 1;
+}
+
+int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,
+                                    unsigned char *secret_out32) {
+    if (!f->has_shachain)
+        return 0;
+    uint64_t sc_index = shachain_epoch_to_index(epoch);
+    shachain_from_seed(f->shachain_seed, sc_index, secret_out32);
+    return 1;
+}
+
+int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
+                           const unsigned char *l_stock_txid,
+                           uint32_t l_stock_vout,
+                           uint64_t l_stock_amount,
+                           uint32_t epoch) {
+    if (!f->has_shachain)
+        return 0;
+
+    /* 1. Derive shachain secret for the given epoch */
+    uint64_t sc_index = shachain_epoch_to_index(epoch);
+    unsigned char secret[32];
+    shachain_from_seed(f->shachain_seed, sc_index, secret);
+
+    /* 2. Compute SHA256(secret) -> hashlock hash */
+    unsigned char hash[32];
+    sha256(secret, 32, hash);
+
+    /* 3. Build hashlock tapscript leaf */
+    tapscript_leaf_t hashlock_leaf;
+    tapscript_build_hashlock(&hashlock_leaf, hash);
+
+    /* 4. Compute merkle root from single leaf */
+    unsigned char merkle_root[32];
+    tapscript_merkle_root(merkle_root, &hashlock_leaf, 1);
+
+    /* 5. Get LSP's xonly pubkey (internal key), tweak, get parity */
+    secp256k1_xonly_pubkey lsp_internal;
+    if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_internal, NULL,
+                                              &f->pubkeys[0]))
+        return 0;
+
+    secp256k1_xonly_pubkey tweaked;
+    int parity = 0;
+    if (!tapscript_tweak_pubkey(f->ctx, &tweaked, &parity,
+                                 &lsp_internal, merkle_root))
+        return 0;
+
+    /* 6. Build control block (33 bytes: leaf_version|parity || internal_key) */
+    unsigned char control_block[33];
+    size_t cb_len = 0;
+    if (!tapscript_build_control_block(control_block, &cb_len, parity,
+                                        &lsp_internal, f->ctx))
+        return 0;
+
+    /* 7. Build unsigned burn tx:
+       Input: L-stock outpoint, nSequence = 0xFFFFFFFE
+       Output: OP_RETURN with hashlock hash as data (ensures stripped tx >= 82 bytes) */
+    tx_output_t burn_output;
+    burn_output.amount_sats = 0;
+    burn_output.script_pubkey[0] = 0x6a;  /* OP_RETURN */
+    burn_output.script_pubkey[1] = 0x20;  /* OP_PUSHBYTES_32 */
+    memcpy(burn_output.script_pubkey + 2, hash, 32);
+    burn_output.script_pubkey_len = 34;
+
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 128);
+    if (!build_unsigned_tx(&unsigned_tx, NULL,
+                            l_stock_txid, l_stock_vout,
+                            0xFFFFFFFEu,
+                            &burn_output, 1)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* 8. Build witness: 3 items [preimage(32), script(37), control_block(33)] */
+    tx_buf_reset(burn_tx_out);
+
+    /* nVersion */
+    tx_buf_write_bytes(burn_tx_out, unsigned_tx.data, 4);
+    /* segwit marker + flag */
+    tx_buf_write_u8(burn_tx_out, 0x00);
+    tx_buf_write_u8(burn_tx_out, 0x01);
+    /* inputs + outputs (between nVersion and nLockTime) */
+    tx_buf_write_bytes(burn_tx_out, unsigned_tx.data + 4,
+                        unsigned_tx.len - 8);
+    /* witness: 3 items */
+    tx_buf_write_varint(burn_tx_out, 3);
+    /* Item 1: preimage (32 bytes) */
+    tx_buf_write_varint(burn_tx_out, 32);
+    tx_buf_write_bytes(burn_tx_out, secret, 32);
+    /* Item 2: script */
+    tx_buf_write_varint(burn_tx_out, hashlock_leaf.script_len);
+    tx_buf_write_bytes(burn_tx_out, hashlock_leaf.script, hashlock_leaf.script_len);
+    /* Item 3: control block */
+    tx_buf_write_varint(burn_tx_out, cb_len);
+    tx_buf_write_bytes(burn_tx_out, control_block, cb_len);
+    /* nLockTime */
+    tx_buf_write_bytes(burn_tx_out, unsigned_tx.data + unsigned_tx.len - 4, 4);
+
+    tx_buf_free(&unsigned_tx);
+    memset(secret, 0, 32);
+    return 1;
 }
 
 void factory_free(factory_t *f) {

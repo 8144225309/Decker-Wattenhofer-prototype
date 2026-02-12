@@ -6,6 +6,7 @@
 #include "musig.h"
 #include "tx_builder.h"
 #include "tapscript.h"
+#include "shachain.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
@@ -59,6 +60,11 @@ typedef struct {
     tapscript_leaf_t timeout_leaf;
     unsigned char merkle_root[32];
     int output_parity;        /* parity of tweaked output key */
+
+    /* Split-round signing state */
+    musig_signing_session_t signing_session;
+    secp256k1_musig_partial_sig partial_sigs[FACTORY_MAX_SIGNERS];
+    int partial_sigs_received;
 } factory_node_t;
 
 typedef struct {
@@ -90,6 +96,10 @@ typedef struct {
 
     /* CLTV timeout (absolute block height) */
     uint32_t cltv_timeout;
+
+    /* Shachain for L-output invalidation */
+    unsigned char shachain_seed[32];
+    int has_shachain;
 } factory_t;
 
 void factory_init(factory_t *f, secp256k1_context *ctx,
@@ -105,5 +115,45 @@ int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
 int factory_advance(factory_t *f);
 void factory_free(factory_t *f);
+
+/* Shachain L-output invalidation API */
+
+/* Enable shachain-based L-output invalidation. Call before factory_build_tree. */
+void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32);
+
+/* Get the revocation secret for a given epoch (for sharing with clients). */
+int factory_get_revocation_secret(const factory_t *f, uint32_t epoch,
+                                    unsigned char *secret_out32);
+
+/* Build a burn tx spending an old-state L-stock output via hashlock script path. */
+int factory_build_burn_tx(const factory_t *f, tx_buf_t *burn_tx_out,
+                           const unsigned char *l_stock_txid,
+                           uint32_t l_stock_vout,
+                           uint64_t l_stock_amount,
+                           uint32_t epoch);
+
+/* Split-round signing API (multi-party orchestration) */
+
+/* Find signer_slot for participant_idx in a node. Returns slot index or -1. */
+int factory_find_signer_slot(const factory_t *f, size_t node_idx,
+                              uint32_t participant_idx);
+
+/* Initialize signing sessions for all nodes. Resets partial_sigs_received. */
+int factory_sessions_init(factory_t *f);
+
+/* Set a signer's pubnonce for a specific node. */
+int factory_session_set_nonce(factory_t *f, size_t node_idx, size_t signer_slot,
+                               const secp256k1_musig_pubnonce *pubnonce);
+
+/* Finalize nonces for all nodes: compute sighash, apply tweak, create sessions. */
+int factory_sessions_finalize(factory_t *f);
+
+/* Set a signer's partial sig for a specific node. */
+int factory_session_set_partial_sig(factory_t *f, size_t node_idx,
+                                     size_t signer_slot,
+                                     const secp256k1_musig_partial_sig *psig);
+
+/* Complete signing: aggregate partial sigs, finalize witness for all nodes. */
+int factory_sessions_complete(factory_t *f);
 
 #endif /* SUPERSCALAR_FACTORY_H */

@@ -1,10 +1,12 @@
 #include "superscalar/factory.h"
+#include "superscalar/shachain.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
+extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
@@ -523,6 +525,804 @@ int test_regtest_factory_tree(void) {
 
     printf("  All 6 factory txs confirmed (verified via leaf outputs)!\n");
 
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Unit test: split-round step-by-step signing ---- */
+
+int test_factory_sign_split_round_step_by_step(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Step 1: Init sessions */
+    TEST_ASSERT(factory_sessions_init(&f), "sessions init");
+
+    /* Step 2: Each participant generates nonces for nodes they belong to */
+    /* Allocate secnonces: up to 6 nodes * 5 signers max = 30 slots.
+       We index by [node_idx * FACTORY_MAX_SIGNERS + signer_slot] */
+    secp256k1_musig_secnonce secnonces[6][FACTORY_MAX_SIGNERS];
+    memset(secnonces, 0, sizeof(secnonces));
+
+    for (uint32_t p = 0; p < 5; p++) {
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[p]), "get seckey");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[p]), "get pubkey");
+
+        for (size_t ni = 0; ni < f.n_nodes; ni++) {
+            int slot = factory_find_signer_slot(&f, ni, p);
+            if (slot < 0) continue;  /* not a signer for this node */
+
+            secp256k1_musig_pubnonce pubnonce;
+            TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[ni][slot], &pubnonce,
+                                              seckey, &pk, NULL),
+                        "generate nonce");
+            TEST_ASSERT(factory_session_set_nonce(&f, ni, (size_t)slot, &pubnonce),
+                        "set nonce");
+        }
+        memset(seckey, 0, 32);
+    }
+
+    /* Step 3: Finalize */
+    TEST_ASSERT(factory_sessions_finalize(&f), "sessions finalize");
+
+    /* Step 4: Each participant creates partial sigs for their nodes */
+    for (uint32_t p = 0; p < 5; p++) {
+        for (size_t ni = 0; ni < f.n_nodes; ni++) {
+            int slot = factory_find_signer_slot(&f, ni, p);
+            if (slot < 0) continue;
+
+            secp256k1_musig_partial_sig psig;
+            TEST_ASSERT(musig_create_partial_sig(ctx, &psig,
+                                                   &secnonces[ni][slot],
+                                                   &kps[p],
+                                                   &f.nodes[ni].signing_session),
+                        "create partial sig");
+            TEST_ASSERT(factory_session_set_partial_sig(&f, ni, (size_t)slot, &psig),
+                        "set partial sig");
+        }
+    }
+
+    /* Step 5: Complete */
+    TEST_ASSERT(factory_sessions_complete(&f), "sessions complete");
+
+    /* Verify all 6 signatures */
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        TEST_ASSERT(node->is_signed, "node is signed");
+
+        unsigned char sighash[32];
+        const unsigned char *prev_spk;
+        size_t prev_spk_len;
+        uint64_t prev_amount;
+
+        if (node->parent_index < 0) {
+            prev_spk = f.funding_spk;
+            prev_spk_len = f.funding_spk_len;
+            prev_amount = f.funding_amount_sats;
+        } else {
+            factory_node_t *parent = &f.nodes[node->parent_index];
+            prev_spk = parent->outputs[node->parent_vout].script_pubkey;
+            prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
+            prev_amount = parent->outputs[node->parent_vout].amount_sats;
+        }
+
+        TEST_ASSERT(compute_taproot_sighash(sighash,
+            node->unsigned_tx.data, node->unsigned_tx.len,
+            0, prev_spk, prev_spk_len, prev_amount, node->nsequence),
+            "compute sighash");
+
+        unsigned char sig[64];
+        memcpy(sig, node->signed_tx.data + node->unsigned_tx.len, 64);
+
+        int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32,
+                                                  &node->tweaked_pubkey);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "node %zu sig valid", i);
+        TEST_ASSERT(valid, msg);
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Unit test: split-round with nonce pool ---- */
+
+int test_factory_split_round_with_pool(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Count how many nodes client A (participant 1) participates in */
+    size_t client_a_nodes = 0;
+    for (size_t ni = 0; ni < f.n_nodes; ni++) {
+        if (factory_find_signer_slot(&f, ni, 1) >= 0)
+            client_a_nodes++;
+    }
+    TEST_ASSERT(client_a_nodes == 4, "client A in 4 nodes");
+
+    /* Generate nonce pool for client A */
+    unsigned char seckey_a[32];
+    secp256k1_pubkey pk_a;
+    TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey_a, &kps[1]), "get seckey A");
+    TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk_a, &kps[1]), "get pubkey A");
+
+    musig_nonce_pool_t pool;
+    TEST_ASSERT(musig_nonce_pool_generate(ctx, &pool, client_a_nodes,
+                                           seckey_a, &pk_a, NULL),
+                "generate pool");
+    memset(seckey_a, 0, 32);
+
+    TEST_ASSERT_EQ(musig_nonce_pool_remaining(&pool), client_a_nodes,
+                   "pool has correct count");
+
+    /* Init sessions */
+    TEST_ASSERT(factory_sessions_init(&f), "sessions init");
+
+    /* Store secnonce pointers from pool for client A */
+    secp256k1_musig_secnonce *pool_secnonces[6];
+    memset(pool_secnonces, 0, sizeof(pool_secnonces));
+
+    /* Other participants' secnonces */
+    secp256k1_musig_secnonce other_secnonces[6][FACTORY_MAX_SIGNERS];
+    memset(other_secnonces, 0, sizeof(other_secnonces));
+
+    /* Generate nonces: client A from pool, others ad-hoc */
+    for (uint32_t p = 0; p < 5; p++) {
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        TEST_ASSERT(secp256k1_keypair_sec(ctx, seckey, &kps[p]), "get seckey");
+        TEST_ASSERT(secp256k1_keypair_pub(ctx, &pk, &kps[p]), "get pubkey");
+
+        for (size_t ni = 0; ni < f.n_nodes; ni++) {
+            int slot = factory_find_signer_slot(&f, ni, p);
+            if (slot < 0) continue;
+
+            secp256k1_musig_pubnonce pubnonce;
+
+            if (p == 1) {
+                /* Client A: draw from pool */
+                secp256k1_musig_secnonce *secnonce_ptr;
+                TEST_ASSERT(musig_nonce_pool_next(&pool, &secnonce_ptr, &pubnonce),
+                            "pool next");
+                pool_secnonces[ni] = secnonce_ptr;
+            } else {
+                /* Others: ad-hoc */
+                TEST_ASSERT(musig_generate_nonce(ctx,
+                    &other_secnonces[ni][slot], &pubnonce, seckey, &pk, NULL),
+                    "generate nonce");
+            }
+
+            TEST_ASSERT(factory_session_set_nonce(&f, ni, (size_t)slot, &pubnonce),
+                        "set nonce");
+        }
+        memset(seckey, 0, 32);
+    }
+
+    /* Pool should be exhausted */
+    TEST_ASSERT_EQ(musig_nonce_pool_remaining(&pool), 0, "pool exhausted");
+
+    /* Finalize */
+    TEST_ASSERT(factory_sessions_finalize(&f), "sessions finalize");
+
+    /* Create partial sigs */
+    for (uint32_t p = 0; p < 5; p++) {
+        for (size_t ni = 0; ni < f.n_nodes; ni++) {
+            int slot = factory_find_signer_slot(&f, ni, p);
+            if (slot < 0) continue;
+
+            secp256k1_musig_secnonce *secnonce;
+            if (p == 1) {
+                secnonce = pool_secnonces[ni];
+            } else {
+                secnonce = &other_secnonces[ni][slot];
+            }
+
+            secp256k1_musig_partial_sig psig;
+            TEST_ASSERT(musig_create_partial_sig(ctx, &psig, secnonce,
+                                                   &kps[p],
+                                                   &f.nodes[ni].signing_session),
+                        "create partial sig");
+            TEST_ASSERT(factory_session_set_partial_sig(&f, ni, (size_t)slot, &psig),
+                        "set partial sig");
+        }
+    }
+
+    /* Complete */
+    TEST_ASSERT(factory_sessions_complete(&f), "sessions complete");
+
+    /* Verify all signatures */
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        TEST_ASSERT(node->is_signed, "node is signed");
+
+        unsigned char sighash[32];
+        const unsigned char *prev_spk;
+        size_t prev_spk_len;
+        uint64_t prev_amount;
+
+        if (node->parent_index < 0) {
+            prev_spk = f.funding_spk;
+            prev_spk_len = f.funding_spk_len;
+            prev_amount = f.funding_amount_sats;
+        } else {
+            factory_node_t *parent = &f.nodes[node->parent_index];
+            prev_spk = parent->outputs[node->parent_vout].script_pubkey;
+            prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
+            prev_amount = parent->outputs[node->parent_vout].amount_sats;
+        }
+
+        TEST_ASSERT(compute_taproot_sighash(sighash,
+            node->unsigned_tx.data, node->unsigned_tx.len,
+            0, prev_spk, prev_spk_len, prev_amount, node->nsequence),
+            "compute sighash");
+
+        unsigned char sig[64];
+        memcpy(sig, node->signed_tx.data + node->unsigned_tx.len, 64);
+
+        int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32,
+                                                  &node->tweaked_pubkey);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "node %zu sig valid (pool)", i);
+        TEST_ASSERT(valid, msg);
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Unit test: advance + re-sign via split-round ---- */
+
+int test_factory_advance_split_round(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);  /* step=2, states_per_layer=4 */
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Initial sign via factory_sign_all (which now uses split-round internally) */
+    TEST_ASSERT(factory_sign_all(&f), "initial sign");
+
+    /* Verify initial state */
+    TEST_ASSERT_EQ(f.counter.current_epoch, 0, "epoch 0");
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq = 6 at epoch 0");
+
+    /* Advance once */
+    TEST_ASSERT(factory_advance(&f), "advance 1");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 1, "epoch 1");
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 4, "leaf nseq = 4 at epoch 1");
+    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right leaf nseq = 4 at epoch 1");
+    TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "root nseq still 6 at epoch 1");
+
+    /* Advance to epoch 4: leaf rolls over, root ticks */
+    TEST_ASSERT(factory_advance(&f), "advance 2");
+    TEST_ASSERT(factory_advance(&f), "advance 3");
+    TEST_ASSERT(factory_advance(&f), "advance 4");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 4, "epoch 4");
+    TEST_ASSERT_EQ(f.nodes[1].nsequence, 4, "root nseq = 4 at epoch 4");
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq = 6 at epoch 4 (reset)");
+
+    /* Verify all signatures still valid after advances */
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        TEST_ASSERT(node->is_signed, "node signed after advance");
+
+        unsigned char sighash[32];
+        const unsigned char *prev_spk;
+        size_t prev_spk_len;
+        uint64_t prev_amount;
+
+        if (node->parent_index < 0) {
+            prev_spk = f.funding_spk;
+            prev_spk_len = f.funding_spk_len;
+            prev_amount = f.funding_amount_sats;
+        } else {
+            factory_node_t *parent = &f.nodes[node->parent_index];
+            prev_spk = parent->outputs[node->parent_vout].script_pubkey;
+            prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
+            prev_amount = parent->outputs[node->parent_vout].amount_sats;
+        }
+
+        TEST_ASSERT(compute_taproot_sighash(sighash,
+            node->unsigned_tx.data, node->unsigned_tx.len,
+            0, prev_spk, prev_spk_len, prev_amount, node->nsequence),
+            "compute sighash");
+
+        unsigned char sig[64];
+        memcpy(sig, node->signed_tx.data + node->unsigned_tx.len, 64);
+
+        int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32,
+                                                  &node->tweaked_pubkey);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "node %zu sig valid after advance", i);
+        TEST_ASSERT(valid, msg);
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Shachain integration tests ---- */
+
+static const unsigned char test_shachain_seed[32] = {
+    0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+    0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+    0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89,
+    0xab, 0xcd, 0xef, 0x01, 0x23, 0x45, 0x67, 0x89
+};
+
+/* Test: L-stock outputs differ with/without shachain, and change per epoch */
+int test_factory_l_stock_with_burn_path(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    /* Build factory WITHOUT shachain */
+    factory_t f_plain;
+    factory_init(&f_plain, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f_plain, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f_plain), "build tree (no shachain)");
+
+    /* Build factory WITH shachain */
+    factory_t f_sc;
+    factory_init(&f_sc, ctx, kps, 5, 2, 4);
+    factory_set_shachain_seed(&f_sc, test_shachain_seed);
+    factory_set_funding(&f_sc, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f_sc), "build tree (with shachain)");
+
+    /* L-stock output (index 2) on leaf state nodes (indices 4, 5) should differ */
+    TEST_ASSERT(memcmp(f_plain.nodes[4].outputs[2].script_pubkey,
+                        f_sc.nodes[4].outputs[2].script_pubkey, 34) != 0,
+                "L-stock spk differs with shachain (left leaf)");
+    TEST_ASSERT(memcmp(f_plain.nodes[5].outputs[2].script_pubkey,
+                        f_sc.nodes[5].outputs[2].script_pubkey, 34) != 0,
+                "L-stock spk differs with shachain (right leaf)");
+
+    /* Channel outputs (indices 0, 1) should be the same */
+    TEST_ASSERT(memcmp(f_plain.nodes[4].outputs[0].script_pubkey,
+                        f_sc.nodes[4].outputs[0].script_pubkey, 34) == 0,
+                "channel A spk unchanged");
+    TEST_ASSERT(memcmp(f_plain.nodes[4].outputs[1].script_pubkey,
+                        f_sc.nodes[4].outputs[1].script_pubkey, 34) == 0,
+                "channel B spk unchanged");
+
+    /* Save L-stock spk at epoch 0 */
+    unsigned char l_spk_epoch0[34];
+    memcpy(l_spk_epoch0, f_sc.nodes[4].outputs[2].script_pubkey, 34);
+
+    /* Sign and advance to epoch 1 */
+    TEST_ASSERT(factory_sign_all(&f_sc), "sign at epoch 0");
+    TEST_ASSERT(factory_advance(&f_sc), "advance to epoch 1");
+
+    /* L-stock spk should change after epoch advance */
+    TEST_ASSERT(memcmp(l_spk_epoch0, f_sc.nodes[4].outputs[2].script_pubkey, 34) != 0,
+                "L-stock spk changes with new epoch");
+
+    factory_free(&f_plain);
+    factory_free(&f_sc);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: burn tx construction and witness correctness */
+int test_factory_burn_tx_construction(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_shachain_seed(&f, test_shachain_seed);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Get leaf state node's txid and L-stock amount */
+    factory_node_t *leaf = &f.nodes[4];
+    uint64_t l_amount = leaf->outputs[2].amount_sats;
+
+    /* Build burn tx for epoch 0 */
+    tx_buf_t burn_tx;
+    tx_buf_init(&burn_tx, 256);
+    TEST_ASSERT(factory_build_burn_tx(&f, &burn_tx, leaf->txid, 2,
+                                        l_amount, 0),
+                "build burn tx");
+
+    /* Verify burn tx is non-empty */
+    TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
+
+    /* Verify the burn tx contains the correct preimage */
+    unsigned char expected_secret[32];
+    TEST_ASSERT(factory_get_revocation_secret(&f, 0, expected_secret),
+                "get revocation secret");
+
+    /* Verify the preimage hashes to the expected hashlock */
+    unsigned char expected_hash[32];
+    sha256(expected_secret, 32, expected_hash);
+
+    /* Search for the preimage in the tx data */
+    int found_preimage = 0;
+    for (size_t i = 0; i + 32 <= burn_tx.len; i++) {
+        if (memcmp(burn_tx.data + i, expected_secret, 32) == 0) {
+            found_preimage = 1;
+            break;
+        }
+    }
+    TEST_ASSERT(found_preimage, "burn tx contains correct preimage");
+
+    /* Verify that building burn tx without shachain fails */
+    factory_t f_no_sc;
+    factory_init(&f_no_sc, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f_no_sc, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f_no_sc), "build tree (no shachain)");
+
+    tx_buf_t burn_tx2;
+    tx_buf_init(&burn_tx2, 256);
+    int result = factory_build_burn_tx(&f_no_sc, &burn_tx2, leaf->txid, 2,
+                                         l_amount, 0);
+    TEST_ASSERT(result == 0, "burn tx fails without shachain");
+
+    tx_buf_free(&burn_tx);
+    tx_buf_free(&burn_tx2);
+    factory_free(&f);
+    factory_free(&f_no_sc);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: advance with shachain, verify revocation secrets and signature validity */
+int test_factory_advance_with_shachain(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_shachain_seed(&f, test_shachain_seed);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign at epoch 0");
+
+    /* Save old L-stock info from epoch 0 */
+    unsigned char old_leaf_txid[32];
+    memcpy(old_leaf_txid, f.nodes[4].txid, 32);
+    uint64_t old_l_amount = f.nodes[4].outputs[2].amount_sats;
+
+    /* Advance to epoch 1 */
+    TEST_ASSERT(factory_advance(&f), "advance to epoch 1");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 1, "epoch 1");
+
+    /* Get revocation secret for old epoch 0 */
+    unsigned char secret_epoch0[32];
+    TEST_ASSERT(factory_get_revocation_secret(&f, 0, secret_epoch0),
+                "get epoch 0 secret");
+
+    /* Verify it matches the shachain derivation */
+    unsigned char expected[32];
+    uint64_t sc_idx = shachain_epoch_to_index(0);
+    shachain_from_seed(test_shachain_seed, sc_idx, expected);
+    TEST_ASSERT(memcmp(secret_epoch0, expected, 32) == 0,
+                "epoch 0 secret matches shachain");
+
+    /* Build burn tx for epoch 0 using the old L-stock outpoint */
+    tx_buf_t burn_tx;
+    tx_buf_init(&burn_tx, 256);
+    TEST_ASSERT(factory_build_burn_tx(&f, &burn_tx, old_leaf_txid, 2,
+                                        old_l_amount, 0),
+                "build burn tx for epoch 0");
+    TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
+
+    /* Verify current (epoch 1) signatures are still valid */
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        TEST_ASSERT(node->is_signed, "node signed after advance");
+
+        unsigned char sighash[32];
+        const unsigned char *prev_spk;
+        size_t prev_spk_len;
+        uint64_t prev_amount;
+
+        if (node->parent_index < 0) {
+            prev_spk = f.funding_spk;
+            prev_spk_len = f.funding_spk_len;
+            prev_amount = f.funding_amount_sats;
+        } else {
+            factory_node_t *parent = &f.nodes[node->parent_index];
+            prev_spk = parent->outputs[node->parent_vout].script_pubkey;
+            prev_spk_len = parent->outputs[node->parent_vout].script_pubkey_len;
+            prev_amount = parent->outputs[node->parent_vout].amount_sats;
+        }
+
+        TEST_ASSERT(compute_taproot_sighash(sighash,
+            node->unsigned_tx.data, node->unsigned_tx.len,
+            0, prev_spk, prev_spk_len, prev_amount, node->nsequence),
+            "compute sighash");
+
+        unsigned char sig[64];
+        memcpy(sig, node->signed_tx.data + node->unsigned_tx.len, 64);
+
+        int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32,
+                                                  &node->tweaked_pubkey);
+        char msg[64];
+        snprintf(msg, sizeof(msg), "node %zu sig valid after shachain advance", i);
+        TEST_ASSERT(valid, msg);
+    }
+
+    tx_buf_free(&burn_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Regtest test: broadcast factory tree then spend L-stock via burn tx ---- */
+
+int test_regtest_burn_tx(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_burn");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    /* Compute funding spk */
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    /* Derive bech32m address for funding */
+    unsigned char tweaked_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked);
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char factory_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "addr quote");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "addr end quote");
+        size_t len = (size_t)(end - start);
+        memcpy(factory_addr, start, len);
+        factory_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    /* Fund factory */
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    /* Find factory vout */
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                   &found_vout, &fund_amount),
+                "find factory vout");
+    printf("  Factory funded: %s vout=%d amount=%lu sats\n",
+           funding_txid_hex, found_vout, (unsigned long)fund_amount);
+
+    /* Init factory WITH shachain, advance to max state (all delays = 0) */
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
+    factory_set_shachain_seed(&f, test_shachain_seed);
+
+    for (int i = 0; i < 15; i++)
+        dw_counter_advance(&f.counter);
+
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+    printf("  Tree built: %zu nodes, L-stock has shachain burn path\n", f.n_nodes);
+
+    /* Broadcast all 6 nodes in groups */
+    size_t broadcast_groups[][2] = {
+        {0, 1}, {1, 2}, {2, 4}, {4, 6},
+    };
+    char txid_hexes[6][65];
+
+    for (int g = 0; g < 4; g++) {
+        size_t start = broadcast_groups[g][0];
+        size_t end = broadcast_groups[g][1];
+
+        for (size_t i = start; i < end; i++) {
+            factory_node_t *node = &f.nodes[i];
+            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+
+            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+            free(tx_hex);
+
+            if (!sent) {
+                printf("  FAIL: broadcast node %zu failed\n", i);
+                factory_free(&f);
+                secp256k1_context_destroy(ctx);
+                return 0;
+            }
+            printf("  Broadcast node %zu: %s\n", i, txid_hexes[i]);
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+    }
+
+    /* Verify leaf outputs are confirmed */
+    for (int leaf = 4; leaf <= 5; leaf++) {
+        char gettxout_params[256];
+        snprintf(gettxout_params, sizeof(gettxout_params),
+                 "\"%s\" 2", txid_hexes[leaf]);  /* vout 2 = L-stock */
+        char *txout = regtest_exec(&rt, "gettxout", gettxout_params);
+        TEST_ASSERT(txout != NULL, "gettxout L-stock");
+
+        cJSON *txout_json = cJSON_Parse(txout);
+        free(txout);
+        TEST_ASSERT(txout_json != NULL, "parse gettxout");
+
+        cJSON *conf_item = cJSON_GetObjectItem(txout_json, "confirmations");
+        int conf = conf_item ? conf_item->valueint : -1;
+        cJSON_Delete(txout_json);
+
+        char msg[64];
+        snprintf(msg, sizeof(msg), "leaf %d L-stock confirmed (conf=%d)", leaf, conf);
+        TEST_ASSERT(conf > 0, msg);
+    }
+    printf("  All factory txs confirmed, L-stock outputs on-chain\n");
+
+    /* Now build and broadcast the burn tx for state_left (node 4) L-stock */
+    tx_buf_t burn_tx;
+    tx_buf_init(&burn_tx, 256);
+
+    /* f.nodes[4].txid is internal byte order, which is what factory_build_burn_tx wants */
+    uint64_t l_stock_amount = f.nodes[4].outputs[2].amount_sats;
+    printf("  L-stock amount: %lu sats\n", (unsigned long)l_stock_amount);
+
+    TEST_ASSERT(factory_build_burn_tx(&f, &burn_tx, f.nodes[4].txid, 2,
+                                        l_stock_amount, f.counter.current_epoch),
+                "build burn tx");
+    TEST_ASSERT(burn_tx.len > 0, "burn tx non-empty");
+
+    /* Broadcast burn tx */
+    char *burn_hex = (char *)malloc(burn_tx.len * 2 + 1);
+    hex_encode(burn_tx.data, burn_tx.len, burn_hex);
+
+    char burn_txid[65];
+    int sent = regtest_send_raw_tx(&rt, burn_hex, burn_txid);
+    if (!sent) {
+        printf("  FAIL: burn tx broadcast failed\n");
+        printf("  Burn tx hex (%zu bytes): %s\n", burn_tx.len, burn_hex);
+    }
+    free(burn_hex);
+    TEST_ASSERT(sent, "broadcast burn tx");
+    printf("  Broadcast burn tx: %s\n", burn_txid);
+
+    /* Mine and verify confirmed */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, burn_txid);
+    printf("  Burn tx confirmations: %d\n", conf);
+    TEST_ASSERT(conf > 0, "burn tx confirmed");
+
+    /* Verify the L-stock UTXO is now spent (gettxout returns null) */
+    {
+        char gettxout_params[256];
+        snprintf(gettxout_params, sizeof(gettxout_params),
+                 "\"%s\" 2", txid_hexes[4]);
+        char *txout = regtest_exec(&rt, "gettxout", gettxout_params);
+        /* gettxout returns null/empty for spent outputs */
+        int is_spent = (txout == NULL || strcmp(txout, "") == 0 ||
+                         strcmp(txout, "null") == 0 || strcmp(txout, "\n") == 0);
+        if (txout) free(txout);
+        TEST_ASSERT(is_spent, "L-stock UTXO is spent");
+    }
+
+    printf("  Burn tx confirmed! L-stock output successfully burned via hashlock script path\n");
+
+    tx_buf_free(&burn_tx);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
     return 1;

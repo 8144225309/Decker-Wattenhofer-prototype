@@ -1,0 +1,152 @@
+#ifndef SUPERSCALAR_CHANNEL_H
+#define SUPERSCALAR_CHANNEL_H
+
+#include "types.h"
+#include "musig.h"
+#include "shachain.h"
+#include "tapscript.h"
+#include "tx_builder.h"
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
+
+#define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
+
+typedef struct {
+    secp256k1_context *ctx;
+
+    /* Funding output (from factory leaf state tx) */
+    unsigned char funding_txid[32];
+    uint32_t funding_vout;
+    uint64_t funding_amount;
+    unsigned char funding_spk[34];
+    size_t funding_spk_len;
+
+    /* Funding keys (order matters for MuSig keyagg) */
+    secp256k1_pubkey local_funding_pubkey;
+    secp256k1_pubkey remote_funding_pubkey;
+    unsigned char local_funding_secret[32];
+    musig_keyagg_t funding_keyagg;
+    secp256k1_keypair local_funding_keypair;
+
+    /* Local basepoints + secrets */
+    secp256k1_pubkey local_payment_basepoint;
+    unsigned char local_payment_basepoint_secret[32];
+    secp256k1_pubkey local_delayed_payment_basepoint;
+    unsigned char local_delayed_payment_basepoint_secret[32];
+    secp256k1_pubkey local_revocation_basepoint;
+    unsigned char local_revocation_basepoint_secret[32];
+
+    /* Remote basepoints (public only) */
+    secp256k1_pubkey remote_payment_basepoint;
+    secp256k1_pubkey remote_delayed_payment_basepoint;
+    secp256k1_pubkey remote_revocation_basepoint;
+
+    /* Per-commitment state */
+    unsigned char shachain_seed[32];
+    shachain_t received_secrets;
+    uint64_t commitment_number;
+
+    /* Balance (satoshis) */
+    uint64_t local_amount;
+    uint64_t remote_amount;
+
+    /* Config */
+    uint32_t to_self_delay;
+} channel_t;
+
+/* --- Key derivation (BOLT #3) --- */
+
+/* Simple: derived = basepoint + SHA256(per_commitment_point || basepoint) * G */
+int channel_derive_pubkey(const secp256k1_context *ctx, secp256k1_pubkey *derived,
+                           const secp256k1_pubkey *basepoint,
+                           const secp256k1_pubkey *per_commitment_point);
+
+/* Two-scalar: revocation_key = rb*H1 + pcp*H2 */
+int channel_derive_revocation_pubkey(const secp256k1_context *ctx,
+                                      secp256k1_pubkey *derived,
+                                      const secp256k1_pubkey *revocation_basepoint,
+                                      const secp256k1_pubkey *per_commitment_point);
+
+/* Private key version of simple derivation */
+int channel_derive_privkey(const secp256k1_context *ctx, unsigned char *derived32,
+                            const unsigned char *base_secret32,
+                            const secp256k1_pubkey *per_commitment_point);
+
+/* Private key version of revocation derivation */
+int channel_derive_revocation_privkey(const secp256k1_context *ctx,
+                                       unsigned char *derived32,
+                                       const unsigned char *revocation_basepoint_secret32,
+                                       const unsigned char *per_commitment_secret32,
+                                       const secp256k1_pubkey *revocation_basepoint,
+                                       const secp256k1_pubkey *per_commitment_point);
+
+/* --- Channel lifecycle --- */
+
+int channel_init(channel_t *ch, secp256k1_context *ctx,
+                  const unsigned char *local_funding_secret32,
+                  const secp256k1_pubkey *local_funding_pubkey,
+                  const secp256k1_pubkey *remote_funding_pubkey,
+                  const unsigned char *funding_txid, uint32_t funding_vout,
+                  uint64_t funding_amount,
+                  const unsigned char *funding_spk, size_t funding_spk_len,
+                  uint64_t local_amount, uint64_t remote_amount,
+                  uint32_t to_self_delay);
+
+void channel_set_local_basepoints(channel_t *ch,
+                                    const unsigned char *payment_secret32,
+                                    const unsigned char *delayed_payment_secret32,
+                                    const unsigned char *revocation_secret32);
+
+void channel_set_remote_basepoints(channel_t *ch,
+                                     const secp256k1_pubkey *payment,
+                                     const secp256k1_pubkey *delayed_payment,
+                                     const secp256k1_pubkey *revocation);
+
+void channel_set_shachain_seed(channel_t *ch, const unsigned char *seed32);
+
+int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_num,
+                                      secp256k1_pubkey *point_out);
+
+int channel_get_per_commitment_secret(const channel_t *ch, uint64_t commitment_num,
+                                       unsigned char *secret_out32);
+
+/* --- Commitment TX --- */
+
+int channel_build_commitment_tx(const channel_t *ch,
+                                  tx_buf_t *unsigned_tx_out,
+                                  unsigned char *txid_out32);
+
+int channel_sign_commitment(const channel_t *ch,
+                              tx_buf_t *signed_tx_out,
+                              const tx_buf_t *unsigned_tx,
+                              const secp256k1_keypair *remote_keypair);
+
+/* --- Revocation + Penalty --- */
+
+int channel_get_revocation_secret(const channel_t *ch, uint64_t old_commitment_num,
+                                    unsigned char *secret_out32);
+
+int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
+                                 const unsigned char *secret32);
+
+int channel_build_penalty_tx(const channel_t *ch,
+                               tx_buf_t *penalty_tx_out,
+                               const unsigned char *commitment_txid,
+                               uint32_t to_local_vout,
+                               uint64_t to_local_amount,
+                               const unsigned char *to_local_spk,
+                               size_t to_local_spk_len,
+                               uint64_t old_commitment_num);
+
+/* --- Channel update --- */
+
+int channel_update(channel_t *ch, int64_t delta_sats);
+
+void channel_update_funding(channel_t *ch,
+                              const unsigned char *new_funding_txid,
+                              uint32_t new_funding_vout,
+                              uint64_t new_funding_amount,
+                              const unsigned char *new_funding_spk,
+                              size_t new_funding_spk_len);
+
+#endif /* SUPERSCALAR_CHANNEL_H */

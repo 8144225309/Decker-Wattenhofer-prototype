@@ -9,10 +9,15 @@ extern void sha256_tagged(const char *tag, const unsigned char *data, size_t dat
                            unsigned char *out32);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
-/* Encode locktime as minimal CScriptNum (little-endian, with sign bit handling). */
+/* Encode locktime as minimal CScriptNum (little-endian, with sign bit handling).
+   Uses OP_0 for 0, OP_1..OP_16 for 1..16 (BIP342 MINIMALDATA), data push otherwise. */
 static size_t encode_scriptnum(unsigned char *out, uint32_t val) {
     if (val == 0) {
         out[0] = 0x00;  /* OP_0 */
+        return 1;
+    }
+    if (val <= 16) {
+        out[0] = 0x50 + (unsigned char)val;  /* OP_1(0x51)..OP_16(0x60) */
         return 1;
     }
 
@@ -32,6 +37,24 @@ static size_t encode_scriptnum(unsigned char *out, uint32_t val) {
     out[0] = (unsigned char)n;  /* OP_PUSHBYTES_N for 1..75 */
     memcpy(out + 1, tmp, n);
     return 1 + n;
+}
+
+void tapscript_build_hashlock(tapscript_leaf_t *leaf,
+                               const unsigned char *hash32) {
+    size_t pos = 0;
+
+    leaf->script[pos++] = 0x82;  /* OP_SIZE */
+    leaf->script[pos++] = 0x01;  /* OP_PUSHBYTES_1 */
+    leaf->script[pos++] = 0x20;  /* 32 */
+    leaf->script[pos++] = 0x88;  /* OP_EQUALVERIFY */
+    leaf->script[pos++] = 0xa8;  /* OP_SHA256 */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    memcpy(leaf->script + pos, hash32, 32);
+    pos += 32;
+    leaf->script[pos++] = 0x87;  /* OP_EQUAL */
+
+    leaf->script_len = pos;  /* 37 bytes */
+    tapscript_compute_leaf_hash(leaf);
 }
 
 void tapscript_build_cltv_timeout(
@@ -62,6 +85,35 @@ void tapscript_build_cltv_timeout(
     leaf->script_len = pos;
 
     /* Compute leaf hash */
+    tapscript_compute_leaf_hash(leaf);
+}
+
+void tapscript_build_csv_delay(
+    tapscript_leaf_t *leaf,
+    uint32_t delay,
+    const secp256k1_xonly_pubkey *pubkey,
+    const secp256k1_context *ctx
+) {
+    size_t pos = 0;
+
+    /* <delay> as CScriptNum push */
+    pos += encode_scriptnum(leaf->script + pos, delay);
+
+    /* OP_CHECKSEQUENCEVERIFY */
+    leaf->script[pos++] = 0xb2;
+
+    /* OP_DROP */
+    leaf->script[pos++] = 0x75;
+
+    /* <32-byte x-only pubkey> push */
+    leaf->script[pos++] = 0x20;  /* OP_PUSHBYTES_32 */
+    secp256k1_xonly_pubkey_serialize(ctx, leaf->script + pos, pubkey);
+    pos += 32;
+
+    /* OP_CHECKSIG */
+    leaf->script[pos++] = 0xac;
+
+    leaf->script_len = pos;
     tapscript_compute_leaf_hash(leaf);
 }
 

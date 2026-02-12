@@ -1,0 +1,1089 @@
+#include "superscalar/channel.h"
+#include "superscalar/factory.h"
+#include "superscalar/regtest.h"
+#include "cJSON.h"
+#include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
+
+extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+extern void reverse_bytes(unsigned char *data, size_t len);
+extern void sha256_tagged(const char *, const unsigned char *, size_t,
+                           unsigned char *);
+
+#define TEST_ASSERT(cond, msg) do { \
+    if (!(cond)) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        return 0; \
+    } \
+} while(0)
+
+#define TEST_ASSERT_EQ(a, b, msg) do { \
+    if ((a) != (b)) { \
+        printf("  FAIL: %s (line %d): %s (got %ld, expected %ld)\n", \
+               __func__, __LINE__, msg, (long)(a), (long)(b)); \
+        return 0; \
+    } \
+} while(0)
+
+#define TEST_ASSERT_MEM_EQ(a, b, len, msg) do { \
+    if (memcmp((a), (b), (len)) != 0) { \
+        printf("  FAIL: %s (line %d): %s\n", __func__, __LINE__, msg); \
+        return 0; \
+    } \
+} while(0)
+
+/* Secret keys */
+static const unsigned char local_funding_secret[32] = {
+    [0 ... 31] = 0x11
+};
+static const unsigned char remote_funding_secret[32] = {
+    [0 ... 31] = 0x22
+};
+static const unsigned char local_payment_secret[32] = {
+    [0 ... 31] = 0x31
+};
+static const unsigned char local_delayed_secret[32] = {
+    [0 ... 31] = 0x41
+};
+static const unsigned char local_revocation_secret[32] = {
+    [0 ... 31] = 0x51
+};
+static const unsigned char remote_payment_secret[32] = {
+    [0 ... 31] = 0x61
+};
+static const unsigned char remote_delayed_secret[32] = {
+    [0 ... 31] = 0x71
+};
+static const unsigned char remote_revocation_secret[32] = {
+    [0 ... 31] = 0x81
+};
+static const unsigned char local_shachain_seed[32] = {
+    [0 ... 31] = 0xa1
+};
+static const unsigned char remote_shachain_seed[32] = {
+    [0 ... 31] = 0xb1
+};
+
+static secp256k1_context *test_ctx(void) {
+    return secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+}
+
+/* Helper: set up a local channel with all basepoints configured */
+static int setup_channel(channel_t *ch, secp256k1_context *ctx,
+                           const unsigned char *fund_txid,
+                           uint32_t fund_vout,
+                           const unsigned char *fund_spk,
+                           size_t fund_spk_len,
+                           uint64_t fund_amount,
+                           uint64_t local_amt, uint64_t remote_amt,
+                           const unsigned char *funding_sec,
+                           const secp256k1_pubkey *local_fund_pk,
+                           const secp256k1_pubkey *remote_fund_pk) {
+    if (!channel_init(ch, ctx, funding_sec, local_fund_pk, remote_fund_pk,
+                       fund_txid, fund_vout, fund_amount,
+                       fund_spk, fund_spk_len,
+                       local_amt, remote_amt, CHANNEL_DEFAULT_CSV_DELAY))
+        return 0;
+
+    channel_set_local_basepoints(ch, local_payment_secret,
+                                   local_delayed_secret,
+                                   local_revocation_secret);
+
+    /* Compute remote basepoints from secrets */
+    secp256k1_pubkey rp, rd, rr;
+    secp256k1_ec_pubkey_create(ctx, &rp, remote_payment_secret);
+    secp256k1_ec_pubkey_create(ctx, &rd, remote_delayed_secret);
+    secp256k1_ec_pubkey_create(ctx, &rr, remote_revocation_secret);
+
+    channel_set_remote_basepoints(ch, &rp, &rd, &rr);
+    channel_set_shachain_seed(ch, local_shachain_seed);
+
+    return 1;
+}
+
+/* Helper: compute 2-of-2 MuSig funding scriptPubKey */
+static int compute_channel_funding_spk(secp256k1_context *ctx,
+                                         const secp256k1_pubkey *local_pk,
+                                         const secp256k1_pubkey *remote_pk,
+                                         unsigned char *spk_out34) {
+    secp256k1_pubkey pks[2] = { *local_pk, *remote_pk };
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, 2))
+        return 0;
+
+    /* Key-path-only taproot tweak */
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    musig_keyagg_t tmp = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
+                                                  &tmp.cache, tweak))
+        return 0;
+
+    secp256k1_xonly_pubkey tweaked_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    build_p2tr_script_pubkey(spk_out34, &tweaked_xonly);
+    return 1;
+}
+
+/* ---- Test 1: Key derivation ---- */
+
+int test_channel_key_derivation(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    /* Generate random basepoints */
+    unsigned char base_secret[32] = { [0 ... 31] = 0x33 };
+    unsigned char pcp_secret[32] = { [0 ... 31] = 0x44 };
+
+    secp256k1_pubkey basepoint, pcp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &basepoint, base_secret),
+                "create basepoint");
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pcp, pcp_secret),
+                "create pcp");
+
+    /* Simple derivation: pubkey path */
+    secp256k1_pubkey derived_pub;
+    TEST_ASSERT(channel_derive_pubkey(ctx, &derived_pub, &basepoint, &pcp),
+                "derive pubkey");
+
+    /* Simple derivation: privkey path */
+    unsigned char derived_sec[32];
+    TEST_ASSERT(channel_derive_privkey(ctx, derived_sec, base_secret, &pcp),
+                "derive privkey");
+
+    /* Verify they match */
+    secp256k1_pubkey derived_from_sec;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &derived_from_sec, derived_sec),
+                "create from derived secret");
+
+    unsigned char pub_ser[33], sec_ser[33];
+    size_t len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, pub_ser, &len, &derived_pub,
+                                   SECP256K1_EC_COMPRESSED);
+    len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, sec_ser, &len, &derived_from_sec,
+                                   SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT_MEM_EQ(pub_ser, sec_ser, 33, "simple derivation pubkey matches privkey");
+
+    /* Revocation derivation: pubkey path */
+    unsigned char rev_base_secret[32] = { [0 ... 31] = 0x55 };
+    secp256k1_pubkey rev_basepoint;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &rev_basepoint, rev_base_secret),
+                "create revocation basepoint");
+
+    secp256k1_pubkey rev_derived_pub;
+    TEST_ASSERT(channel_derive_revocation_pubkey(ctx, &rev_derived_pub,
+                                                    &rev_basepoint, &pcp),
+                "derive revocation pubkey");
+
+    /* Revocation derivation: privkey path */
+    unsigned char rev_derived_sec[32];
+    TEST_ASSERT(channel_derive_revocation_privkey(ctx, rev_derived_sec,
+                                                     rev_base_secret, pcp_secret,
+                                                     &rev_basepoint, &pcp),
+                "derive revocation privkey");
+
+    /* Verify they match */
+    secp256k1_pubkey rev_from_sec;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &rev_from_sec, rev_derived_sec),
+                "create from revocation secret");
+
+    len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, pub_ser, &len, &rev_derived_pub,
+                                   SECP256K1_EC_COMPRESSED);
+    len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, sec_ser, &len, &rev_from_sec,
+                                   SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT_MEM_EQ(pub_ser, sec_ser, 33, "revocation pubkey matches privkey");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test 2: Commitment TX structure ---- */
+
+int test_channel_commitment_tx(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
+    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    channel_t ch;
+    TEST_ASSERT(setup_channel(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &unsigned_tx, txid),
+                "build commitment tx");
+
+    /* Verify non-empty */
+    TEST_ASSERT(unsigned_tx.len > 0, "commitment tx non-empty");
+
+    /* Verify txid is non-zero */
+    unsigned char zero[32];
+    memset(zero, 0, 32);
+    TEST_ASSERT(memcmp(txid, zero, 32) != 0, "txid non-zero");
+
+    /* Parse output count: at offset 46 (after nVersion(4)+varint(1)+
+       txid(32)+vout(4)+scriptSig_len(1)+nSequence(4)), read varint */
+    TEST_ASSERT(unsigned_tx.data[46] == 2, "2 outputs");
+
+    /* Parse output amounts */
+    uint64_t amt0 = 0, amt1 = 0;
+    size_t out_start = 47;  /* after output count varint */
+    for (int i = 0; i < 8; i++) {
+        amt0 |= ((uint64_t)unsigned_tx.data[out_start + i]) << (i * 8);
+    }
+    /* to-local spk: varint(1) + 34 bytes = 35. Next output at out_start + 8 + 35 */
+    size_t out1_start = out_start + 8 + 1 + 34;
+    for (int i = 0; i < 8; i++) {
+        amt1 |= ((uint64_t)unsigned_tx.data[out1_start + i]) << (i * 8);
+    }
+
+    TEST_ASSERT_EQ(amt0, 70000, "to-local amount = local_amount");
+    TEST_ASSERT_EQ(amt1, 30000, "to-remote amount = remote_amount");
+
+    /* Verify to-local SPK differs from to-remote SPK */
+    unsigned char spk0[34], spk1[34];
+    memcpy(spk0, unsigned_tx.data + out_start + 8 + 1, 34);  /* skip amount(8) + varint(1) */
+    memcpy(spk1, unsigned_tx.data + out1_start + 8 + 1, 34);
+    TEST_ASSERT(memcmp(spk0, spk1, 34) != 0, "to-local != to-remote spk");
+
+    tx_buf_free(&unsigned_tx);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test 3: Sign commitment TX ---- */
+
+int test_channel_sign_commitment(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
+    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    channel_t ch;
+    TEST_ASSERT(setup_channel(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &unsigned_tx, txid),
+                "build commitment tx");
+
+    /* Sign with both keypairs */
+    secp256k1_keypair remote_kp;
+    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+
+    tx_buf_t signed_tx;
+    tx_buf_init(&signed_tx, 512);
+    TEST_ASSERT(channel_sign_commitment(&ch, &signed_tx, &unsigned_tx, &remote_kp),
+                "sign commitment tx");
+
+    TEST_ASSERT(signed_tx.len > unsigned_tx.len, "signed tx larger than unsigned");
+
+    /* Verify Schnorr signature against the funding output key */
+    unsigned char sighash[32];
+    TEST_ASSERT(compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                          0, fund_spk, 34, 100000, 0xFFFFFFFE),
+                "compute sighash");
+
+    /* Extract sig from witness data */
+    unsigned char sig[64];
+    memcpy(sig, signed_tx.data + unsigned_tx.len, 64);
+
+    /* Get the tweaked funding key for verification */
+    secp256k1_pubkey pks[2] = { local_fund_pk, remote_fund_pk };
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 2);
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    musig_keyagg_t ka2 = ka;
+    secp256k1_pubkey tweaked_pk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka2.cache, tweak);
+    secp256k1_xonly_pubkey tweaked_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+
+    int valid = secp256k1_schnorrsig_verify(ctx, sig, sighash, 32, &tweaked_xonly);
+    TEST_ASSERT(valid, "schnorr sig valid");
+
+    tx_buf_free(&unsigned_tx);
+    tx_buf_free(&signed_tx);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test 4: Channel update ---- */
+
+int test_channel_update(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
+    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    channel_t ch;
+    TEST_ASSERT(setup_channel(&ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup channel");
+
+    /* Build commitment #0 */
+    tx_buf_t tx0;
+    tx_buf_init(&tx0, 256);
+    unsigned char txid0[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx0, txid0),
+                "build commitment tx #0");
+
+    /* Update: transfer 10000 local -> remote */
+    TEST_ASSERT(channel_update(&ch, 10000), "update channel");
+    TEST_ASSERT_EQ(ch.local_amount, 60000, "local = 60000");
+    TEST_ASSERT_EQ(ch.remote_amount, 40000, "remote = 40000");
+    TEST_ASSERT_EQ(ch.commitment_number, 1, "commitment_number = 1");
+
+    /* Build commitment #1 */
+    tx_buf_t tx1;
+    tx_buf_init(&tx1, 256);
+    unsigned char txid1[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &tx1, txid1),
+                "build commitment tx #1");
+
+    /* Verify different txids (different amounts + different derived keys) */
+    TEST_ASSERT(memcmp(txid0, txid1, 32) != 0, "different txids after update");
+
+    tx_buf_free(&tx0);
+    tx_buf_free(&tx1);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test 5: Revocation ---- */
+
+int test_channel_revocation(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
+    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    /* Set up local channel */
+    channel_t local_ch;
+    TEST_ASSERT(setup_channel(&local_ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup local channel");
+
+    /* Set up remote channel (mirror) */
+    channel_t remote_ch;
+    TEST_ASSERT(channel_init(&remote_ch, ctx, remote_funding_secret,
+                               &remote_fund_pk, &local_fund_pk,
+                               fake_txid, 0, 100000, fund_spk, 34,
+                               30000, 70000, CHANNEL_DEFAULT_CSV_DELAY),
+                "init remote channel");
+
+    /* Remote needs local's revocation basepoint as its "remote_revocation_basepoint" */
+    secp256k1_pubkey lp, ld, lr;
+    secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
+    secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret);
+    secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret);
+
+    channel_set_local_basepoints(&remote_ch, remote_payment_secret,
+                                   remote_delayed_secret,
+                                   remote_revocation_secret);
+    channel_set_remote_basepoints(&remote_ch, &lp, &ld, &lr);
+    channel_set_shachain_seed(&remote_ch, remote_shachain_seed);
+
+    /* Advance local to commitment #1 */
+    TEST_ASSERT(channel_update(&local_ch, 10000), "local update");
+
+    /* Get revocation secret for commitment #0 */
+    unsigned char secret0[32];
+    TEST_ASSERT(channel_get_revocation_secret(&local_ch, 0, secret0),
+                "get revocation secret for #0");
+
+    /* Remote receives revocation */
+    TEST_ASSERT(channel_receive_revocation(&remote_ch, 0, secret0),
+                "remote receive revocation for #0");
+
+    /* Verify: remote can derive the per_commitment_point from stored secret */
+    uint64_t index0 = ((UINT64_C(1) << 48) - 1) - 0;
+    unsigned char derived_secret[32];
+    TEST_ASSERT(shachain_derive(&remote_ch.received_secrets, index0, derived_secret),
+                "derive stored secret");
+    TEST_ASSERT_MEM_EQ(derived_secret, secret0, 32, "derived secret matches");
+
+    /* Verify per_commitment_point is valid */
+    secp256k1_pubkey pcp;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pcp, secret0),
+                "create pcp from secret");
+
+    /* Derive revocation pubkey */
+    secp256k1_pubkey rev_pub;
+    TEST_ASSERT(channel_derive_revocation_pubkey(ctx, &rev_pub,
+                                                    &remote_ch.local_revocation_basepoint,
+                                                    &pcp),
+                "derive revocation pubkey");
+
+    /* Verify revocation pubkey is valid (non-zero) */
+    unsigned char rev_ser[33];
+    size_t rlen = 33;
+    TEST_ASSERT(secp256k1_ec_pubkey_serialize(ctx, rev_ser, &rlen, &rev_pub,
+                                                SECP256K1_EC_COMPRESSED),
+                "serialize revocation pubkey");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test 6: Penalty TX ---- */
+
+int test_channel_penalty_tx(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_pubkey local_fund_pk, remote_fund_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_fund_pk, local_funding_secret);
+    secp256k1_ec_pubkey_create(ctx, &remote_fund_pk, remote_funding_secret);
+
+    unsigned char fund_spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_fund_pk, &remote_fund_pk,
+                                              fund_spk),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xBB, 32);
+
+    /* LOCAL channel */
+    channel_t local_ch;
+    TEST_ASSERT(setup_channel(&local_ch, ctx, fake_txid, 0, fund_spk, 34,
+                                100000, 70000, 30000,
+                                local_funding_secret,
+                                &local_fund_pk, &remote_fund_pk),
+                "setup local channel");
+
+    /* REMOTE channel (mirror perspective) */
+    channel_t remote_ch;
+    TEST_ASSERT(channel_init(&remote_ch, ctx, remote_funding_secret,
+                               &remote_fund_pk, &local_fund_pk,
+                               fake_txid, 0, 100000, fund_spk, 34,
+                               30000, 70000, CHANNEL_DEFAULT_CSV_DELAY),
+                "init remote channel");
+
+    secp256k1_pubkey lp, ld, lr;
+    secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
+    secp256k1_ec_pubkey_create(ctx, &ld, local_delayed_secret);
+    secp256k1_ec_pubkey_create(ctx, &lr, local_revocation_secret);
+
+    channel_set_local_basepoints(&remote_ch, remote_payment_secret,
+                                   remote_delayed_secret,
+                                   remote_revocation_secret);
+    channel_set_remote_basepoints(&remote_ch, &lp, &ld, &lr);
+    channel_set_shachain_seed(&remote_ch, remote_shachain_seed);
+
+    /* Build and sign local's commitment tx #0 */
+    tx_buf_t local_unsigned;
+    tx_buf_init(&local_unsigned, 256);
+    unsigned char local_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&local_ch, &local_unsigned, local_txid),
+                "build local commitment #0");
+
+    secp256k1_keypair remote_kp;
+    secp256k1_keypair_create(ctx, &remote_kp, remote_funding_secret);
+
+    tx_buf_t local_signed;
+    tx_buf_init(&local_signed, 512);
+    TEST_ASSERT(channel_sign_commitment(&local_ch, &local_signed, &local_unsigned,
+                                          &remote_kp),
+                "sign local commitment #0");
+
+    /* Advance local to #1 */
+    TEST_ASSERT(channel_update(&local_ch, 10000), "local update");
+
+    /* Exchange revocation: local reveals secret for #0 */
+    unsigned char secret0[32];
+    TEST_ASSERT(channel_get_revocation_secret(&local_ch, 0, secret0),
+                "get revocation secret #0");
+    TEST_ASSERT(channel_receive_revocation(&remote_ch, 0, secret0),
+                "remote receive revocation #0");
+
+    /* Extract to-local SPK from local's old commitment tx #0.
+       to-local is output 0, starts at offset 47 in the unsigned tx */
+    unsigned char to_local_spk[34];
+    memcpy(to_local_spk, local_unsigned.data + 47 + 8 + 1, 34);
+    uint64_t to_local_amount = 70000;
+
+    /* Remote builds penalty tx for local's old commitment #0 */
+    tx_buf_t penalty_tx;
+    tx_buf_init(&penalty_tx, 512);
+    TEST_ASSERT(channel_build_penalty_tx(&remote_ch, &penalty_tx,
+                                           local_txid, 0,
+                                           to_local_amount, to_local_spk, 34,
+                                           0),
+                "build penalty tx");
+
+    TEST_ASSERT(penalty_tx.len > 0, "penalty tx non-empty");
+
+    /* Verify the penalty tx signature is valid.
+       The penalty tx spends the to-local output via key-path (tweaked revocation key).
+       Extract sig from witness and verify against the to-local output key. */
+
+    /* The to-local output key is the tweaked key in the SPK (bytes 2..33 of the P2TR spk) */
+    secp256k1_xonly_pubkey to_local_output_key;
+    TEST_ASSERT(secp256k1_xonly_pubkey_parse(ctx, &to_local_output_key,
+                                               to_local_spk + 2),
+                "parse to-local output key");
+
+    /* Build an unsigned version of the penalty tx to compute its sighash.
+       The penalty tx input spends local_txid:0 with nSequence=0xFFFFFFFE */
+    /* Penalty output amount = to_local_amount - 500 fee */
+    uint64_t penalty_output_amount = to_local_amount - 500;
+
+    /* Extract the output spk from penalty tx for sighash computation.
+       Parse: nVersion(4) + marker(1) + flag(1) + varint(1) + txid(32) + vout(4) +
+              scriptSig_len(1) + nSequence(4) + varint(1) = output_start at 49.
+       Then amount(8) + varint(1) + spk(34) */
+    /* Actually, let's rebuild the unsigned tx properly */
+    unsigned char penalty_out_spk[34];
+    /* Skip witness header: nVersion(4) + marker(1) + flag(1) = 6, then
+       rest of inputs+outputs is same layout as unsigned tx starting at offset 4 */
+    /* Find output: from offset 6, inputs start. varint(1)=1 input,
+       txid(32), vout(4), scriptSig(1)=0, nSequence(4) = 42 bytes for input section.
+       offset 6 + 1 + 32 + 4 + 1 + 4 = 48. varint(1)=1 output.
+       Amount at 49, spk_len varint at 57, spk at 58. */
+    memcpy(penalty_out_spk, penalty_tx.data + 58, 34);
+
+    tx_output_t penalty_output;
+    memcpy(penalty_output.script_pubkey, penalty_out_spk, 34);
+    penalty_output.script_pubkey_len = 34;
+    penalty_output.amount_sats = penalty_output_amount;
+
+    tx_buf_t penalty_unsigned;
+    tx_buf_init(&penalty_unsigned, 256);
+    build_unsigned_tx(&penalty_unsigned, NULL, local_txid, 0,
+                       0xFFFFFFFE, &penalty_output, 1);
+
+    unsigned char penalty_sighash[32];
+    TEST_ASSERT(compute_taproot_sighash(penalty_sighash,
+                                          penalty_unsigned.data, penalty_unsigned.len,
+                                          0, to_local_spk, 34,
+                                          to_local_amount, 0xFFFFFFFE),
+                "compute penalty sighash");
+
+    /* Extract sig: in the signed tx, witness starts after the inputs+outputs section.
+       The sig is the first witness item. After the witness count varint(1)=1,
+       sig_len varint(1)=64, then 64 bytes of sig. */
+    /* The witness data starts at: 6 (header) + inputs+outputs - nLockTime(4) region.
+       Actually in our finalize_signed_tx format:
+       nVersion(4) + marker(1) + flag(1) + [inputs+outputs from unsigned: unsigned_len-8]
+       + witness_count(1) + sig_len(1) + sig(64) + nLockTime(4)
+       So witness_count is at offset: 4+1+1+(unsigned_len-8) = unsigned_len - 2 */
+    size_t witness_offset = penalty_unsigned.len - 2;
+    /* witness_count = 1, then varint(64), then sig */
+    unsigned char penalty_sig[64];
+    memcpy(penalty_sig, penalty_tx.data + witness_offset + 2, 64);
+
+    int valid = secp256k1_schnorrsig_verify(ctx, penalty_sig, penalty_sighash, 32,
+                                              &to_local_output_key);
+    TEST_ASSERT(valid, "penalty sig valid");
+
+    tx_buf_free(&local_unsigned);
+    tx_buf_free(&local_signed);
+    tx_buf_free(&penalty_tx);
+    tx_buf_free(&penalty_unsigned);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test 7: Regtest unilateral close ---- */
+
+/* Factory setup secret keys (same as test_factory.c) */
+static const unsigned char factory_seckeys[5][32] = {
+    { [0 ... 31] = 0x10 },  /* LSP */
+    { [0 ... 31] = 0x21 },  /* Client A */
+    { [0 ... 31] = 0x32 },  /* Client B */
+    { [0 ... 31] = 0x43 },  /* Client C */
+    { [0 ... 31] = 0x54 },  /* Client D */
+};
+
+static void make_factory_keypairs(secp256k1_context *ctx, secp256k1_keypair *kps) {
+    for (int i = 0; i < 5; i++)
+        secp256k1_keypair_create(ctx, &kps[i], factory_seckeys[i]);
+}
+
+static int compute_factory_funding_spk(
+    secp256k1_context *ctx,
+    const secp256k1_keypair *kps,
+    unsigned char *spk_out34,
+    secp256k1_xonly_pubkey *tweaked_xonly_out
+) {
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+
+    musig_keyagg_t ka;
+    if (!musig_aggregate_keys(ctx, &ka, pks, 5)) return 0;
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    musig_keyagg_t tmp = ka;
+    secp256k1_pubkey tweaked_pk;
+    if (!secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk,
+                                                  &tmp.cache, tweak))
+        return 0;
+    if (!secp256k1_xonly_pubkey_from_pubkey(ctx, tweaked_xonly_out, NULL,
+                                              &tweaked_pk))
+        return 0;
+
+    build_p2tr_script_pubkey(spk_out34, tweaked_xonly_out);
+    return 1;
+}
+
+static int find_funding_vout(
+    regtest_t *rt,
+    const char *txid_hex,
+    const unsigned char *expected_spk,
+    size_t expected_spk_len,
+    int *vout_out,
+    uint64_t *amount_out
+) {
+    char params[256];
+    snprintf(params, sizeof(params), "\"%s\" true true", txid_hex);
+    char *result = regtest_exec(rt, "gettransaction", params);
+    if (!result) return 0;
+
+    char expected_hex[69];
+    hex_encode(expected_spk, expected_spk_len, expected_hex);
+
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json) return 0;
+
+    cJSON *decoded = cJSON_GetObjectItem(json, "decoded");
+    if (!decoded) { cJSON_Delete(json); return 0; }
+
+    cJSON *vouts = cJSON_GetObjectItem(decoded, "vout");
+    if (!vouts || !cJSON_IsArray(vouts)) { cJSON_Delete(json); return 0; }
+
+    int found = 0;
+    int arr_size = cJSON_GetArraySize(vouts);
+    for (int i = 0; i < arr_size; i++) {
+        cJSON *vout_obj = cJSON_GetArrayItem(vouts, i);
+        if (!vout_obj) continue;
+
+        cJSON *n_item = cJSON_GetObjectItem(vout_obj, "n");
+        cJSON *value_item = cJSON_GetObjectItem(vout_obj, "value");
+        cJSON *spk_obj = cJSON_GetObjectItem(vout_obj, "scriptPubKey");
+        if (!n_item || !value_item || !spk_obj) continue;
+
+        cJSON *hex_item = cJSON_GetObjectItem(spk_obj, "hex");
+        if (!hex_item || !cJSON_IsString(hex_item)) continue;
+
+        if (strcmp(hex_item->valuestring, expected_hex) == 0) {
+            *vout_out = n_item->valueint;
+            *amount_out = (uint64_t)(value_item->valuedouble * 100000000.0 + 0.5);
+            found = 1;
+            break;
+        }
+    }
+
+    cJSON_Delete(json);
+    return found;
+}
+
+int test_regtest_channel_unilateral(void) {
+    secp256k1_context *ctx = test_ctx();
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_chan");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* Create 5 keypairs, build factory */
+    secp256k1_keypair kps[5];
+    make_factory_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_factory_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute factory funding spk");
+
+    /* Derive bech32m address */
+    unsigned char tweaked_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &fund_tweaked);
+    char key_hex[65];
+    hex_encode(tweaked_ser, 32, key_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", key_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    {
+        char *dstart = strstr(desc_result, "\"descriptor\"");
+        TEST_ASSERT(dstart != NULL, "find descriptor");
+        dstart = strchr(dstart + 12, '"');
+        TEST_ASSERT(dstart != NULL, "descriptor value start");
+        dstart++;
+        char *dend = strchr(dstart, '"');
+        TEST_ASSERT(dend != NULL, "descriptor value end");
+        size_t dlen = (size_t)(dend - dstart);
+        memcpy(checksummed_desc, dstart, dlen);
+        checksummed_desc[dlen] = '\0';
+    }
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char factory_addr[128];
+    {
+        char *start = strchr(addr_result, '"');
+        TEST_ASSERT(start != NULL, "addr quote");
+        start++;
+        char *end = strchr(start, '"');
+        TEST_ASSERT(end != NULL, "addr end quote");
+        size_t len = (size_t)(end - start);
+        memcpy(factory_addr, start, len);
+        factory_addr[len] = '\0';
+    }
+    free(addr_result);
+
+    /* Fund factory */
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, factory_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    uint64_t fund_amount = 0;
+    int found_vout = -1;
+    TEST_ASSERT(find_funding_vout(&rt, funding_txid_hex, fund_spk, 34,
+                                    &found_vout, &fund_amount),
+                "find factory vout");
+    printf("  Factory funded: %s vout=%d amount=%lu sats\n",
+           funding_txid_hex, found_vout, (unsigned long)fund_amount);
+
+    /* Build factory tree, advance to max state (all delays = 0) */
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);  /* step=1, states=4 */
+    for (int i = 0; i < 15; i++)
+        dw_counter_advance(&f.counter);
+
+    factory_set_funding(&f, fund_txid_bytes, (uint32_t)found_vout,
+                         fund_amount, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Broadcast factory tree */
+    size_t broadcast_groups[][2] = {
+        {0, 1}, {1, 2}, {2, 4}, {4, 6},
+    };
+    char txid_hexes[6][65];
+
+    for (int g = 0; g < 4; g++) {
+        size_t start = broadcast_groups[g][0];
+        size_t end = broadcast_groups[g][1];
+        for (size_t i = start; i < end; i++) {
+            factory_node_t *node = &f.nodes[i];
+            char *tx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+            hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+            int sent = regtest_send_raw_tx(&rt, tx_hex, txid_hexes[i]);
+            free(tx_hex);
+            TEST_ASSERT(sent, "broadcast factory node");
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+    }
+    printf("  Factory tree confirmed on-chain\n");
+
+    /* Get leaf state tx (node 4) channel A output (vout 0) info */
+    factory_node_t *leaf = &f.nodes[4];
+    unsigned char chan_funding_txid[32];
+    memcpy(chan_funding_txid, leaf->txid, 32);
+
+    unsigned char chan_spk[34];
+    memcpy(chan_spk, leaf->outputs[0].script_pubkey, 34);
+    uint64_t chan_amount = leaf->outputs[0].amount_sats;
+
+    /* Channel is between Client A (index 1) and LSP (index 0) */
+    secp256k1_pubkey client_a_pk, lsp_pk;
+    secp256k1_keypair_pub(ctx, &client_a_pk, &kps[1]);
+    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+
+    /* Channel funding keys must match factory leaf output order:
+       setup_leaf_outputs uses [client_a, LSP] for channel A */
+    channel_t ch;
+    uint64_t commit_fee = 500;  /* fee for commitment tx */
+    uint64_t usable = chan_amount - commit_fee;
+    uint64_t local_amt = usable / 2;
+    uint64_t remote_amt = usable - local_amt;
+
+    /* Use a small CSV delay for the regtest test */
+    uint32_t csv_delay = 6;
+
+    TEST_ASSERT(channel_init(&ch, ctx, factory_seckeys[1],
+                               &client_a_pk, &lsp_pk,
+                               chan_funding_txid, 0, chan_amount,
+                               chan_spk, 34,
+                               local_amt, remote_amt, csv_delay),
+                "init channel");
+
+    /* Set basepoints from deterministic keys */
+    unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
+    unsigned char chan_delayed_sec[32] = { [0 ... 31] = 0xC2 };
+    unsigned char chan_revocation_sec[32] = { [0 ... 31] = 0xC3 };
+    channel_set_local_basepoints(&ch, chan_payment_sec, chan_delayed_sec,
+                                   chan_revocation_sec);
+
+    unsigned char lsp_payment_sec[32] = { [0 ... 31] = 0xD1 };
+    unsigned char lsp_delayed_sec[32] = { [0 ... 31] = 0xD2 };
+    unsigned char lsp_revocation_sec[32] = { [0 ... 31] = 0xD3 };
+    secp256k1_pubkey lsp_pay_bp, lsp_del_bp, lsp_rev_bp;
+    secp256k1_ec_pubkey_create(ctx, &lsp_pay_bp, lsp_payment_sec);
+    secp256k1_ec_pubkey_create(ctx, &lsp_del_bp, lsp_delayed_sec);
+    secp256k1_ec_pubkey_create(ctx, &lsp_rev_bp, lsp_revocation_sec);
+    channel_set_remote_basepoints(&ch, &lsp_pay_bp, &lsp_del_bp, &lsp_rev_bp);
+
+    unsigned char chan_seed[32] = { [0 ... 31] = 0xE1 };
+    channel_set_shachain_seed(&ch, chan_seed);
+
+    /* Build and sign commitment tx */
+    tx_buf_t commit_unsigned;
+    tx_buf_init(&commit_unsigned, 256);
+    unsigned char commit_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&ch, &commit_unsigned, commit_txid),
+                "build commitment tx");
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, factory_seckeys[0]);
+
+    tx_buf_t commit_signed;
+    tx_buf_init(&commit_signed, 512);
+    TEST_ASSERT(channel_sign_commitment(&ch, &commit_signed, &commit_unsigned,
+                                          &lsp_kp),
+                "sign commitment tx");
+
+    /* Broadcast commitment tx */
+    char *commit_hex = (char *)malloc(commit_signed.len * 2 + 1);
+    hex_encode(commit_signed.data, commit_signed.len, commit_hex);
+
+    char commit_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, commit_hex, commit_txid_hex);
+    free(commit_hex);
+    TEST_ASSERT(sent, "broadcast commitment tx");
+    printf("  Commitment tx broadcast: %s\n", commit_txid_hex);
+
+    /* Mine CSV delay blocks */
+    regtest_mine_blocks(&rt, (int)csv_delay + 1, mine_addr);
+
+    int conf = regtest_get_confirmations(&rt, commit_txid_hex);
+    printf("  Commitment tx confirmations: %d\n", conf);
+    TEST_ASSERT(conf > 0, "commitment tx confirmed");
+
+    /* Now build script-path spend of to-local output (CSV delay + delayed_payment_key) */
+    /* Reconstruct the commitment tx's to-local output details */
+    secp256k1_pubkey pcp;
+    TEST_ASSERT(channel_get_per_commitment_point(&ch, 0, &pcp), "get pcp");
+
+    /* Derive delayed_payment_pubkey and privkey */
+    secp256k1_pubkey delayed_pub;
+    TEST_ASSERT(channel_derive_pubkey(ctx, &delayed_pub,
+                                        &ch.local_delayed_payment_basepoint, &pcp),
+                "derive delayed pubkey");
+
+    unsigned char delayed_priv[32];
+    TEST_ASSERT(channel_derive_privkey(ctx, delayed_priv, chan_delayed_sec, &pcp),
+                "derive delayed privkey");
+
+    /* Derive revocation pubkey (internal key of the to-local taptree) */
+    secp256k1_pubkey rev_pub;
+    TEST_ASSERT(channel_derive_revocation_pubkey(ctx, &rev_pub,
+                                                    &lsp_rev_bp, &pcp),
+                "derive revocation pubkey");
+
+    secp256k1_xonly_pubkey rev_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &rev_xonly, NULL, &rev_pub);
+
+    secp256k1_xonly_pubkey delayed_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &delayed_xonly, NULL, &delayed_pub);
+
+    /* Rebuild CSV leaf */
+    tapscript_leaf_t csv_leaf;
+    tapscript_build_csv_delay(&csv_leaf, csv_delay, &delayed_xonly, ctx);
+
+    unsigned char merkle_root[32];
+    tapscript_merkle_root(merkle_root, &csv_leaf, 1);
+
+    /* Get tweaked output key + parity for control block */
+    secp256k1_xonly_pubkey to_local_tweaked;
+    int output_parity;
+    TEST_ASSERT(tapscript_tweak_pubkey(ctx, &to_local_tweaked, &output_parity,
+                                         &rev_xonly, merkle_root),
+                "tweak to-local pubkey");
+
+    /* Build control block */
+    unsigned char control_block[33];
+    size_t cb_len;
+    TEST_ASSERT(tapscript_build_control_block(control_block, &cb_len,
+                                                output_parity, &rev_xonly, ctx),
+                "build control block");
+
+    /* Get to-local SPK and amount from the commitment tx */
+    unsigned char to_local_spk[34];
+    build_p2tr_script_pubkey(to_local_spk, &to_local_tweaked);
+
+    /* Build the CSV spend tx:
+       Input: commitment_txid:0, nSequence = csv_delay (BIP-68)
+       Output: simple P2TR to a destination key */
+    unsigned char dest_secret[32] = { [0 ... 31] = 0xF1 };
+    secp256k1_keypair dest_kp;
+    secp256k1_keypair_create(ctx, &dest_kp, dest_secret);
+    secp256k1_xonly_pubkey dest_xonly;
+    secp256k1_keypair_xonly_pub(ctx, &dest_xonly, NULL, &dest_kp);
+
+    /* Key-path-only tweak for destination */
+    unsigned char dest_internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, dest_internal_ser, &dest_xonly);
+    unsigned char dest_tweak[32];
+    sha256_tagged("TapTweak", dest_internal_ser, 32, dest_tweak);
+    secp256k1_pubkey dest_tweaked_full;
+    secp256k1_xonly_pubkey_tweak_add(ctx, &dest_tweaked_full, &dest_xonly, dest_tweak);
+    secp256k1_xonly_pubkey dest_tweaked;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &dest_tweaked, NULL, &dest_tweaked_full);
+
+    uint64_t spend_amount = local_amt - 500;  /* fee */
+    tx_output_t spend_output;
+    build_p2tr_script_pubkey(spend_output.script_pubkey, &dest_tweaked);
+    spend_output.script_pubkey_len = 34;
+    spend_output.amount_sats = spend_amount;
+
+    tx_buf_t spend_unsigned;
+    tx_buf_init(&spend_unsigned, 256);
+    unsigned char spend_txid_bytes[32];
+    build_unsigned_tx(&spend_unsigned, spend_txid_bytes,
+                       commit_txid, 0, csv_delay, &spend_output, 1);
+
+    /* Compute tapscript sighash */
+    unsigned char spend_sighash[32];
+    TEST_ASSERT(compute_tapscript_sighash(spend_sighash,
+                                            spend_unsigned.data, spend_unsigned.len,
+                                            0, to_local_spk, 34,
+                                            local_amt, csv_delay,
+                                            &csv_leaf),
+                "compute tapscript sighash");
+
+    /* Sign with delayed_payment privkey */
+    secp256k1_keypair delayed_kp;
+    secp256k1_keypair_create(ctx, &delayed_kp, delayed_priv);
+    unsigned char spend_sig[64];
+    TEST_ASSERT(secp256k1_schnorrsig_sign32(ctx, spend_sig, spend_sighash,
+                                              &delayed_kp, NULL),
+                "sign CSV spend");
+
+    /* Finalize with script-path witness */
+    tx_buf_t spend_signed;
+    tx_buf_init(&spend_signed, 512);
+    TEST_ASSERT(finalize_script_path_tx(&spend_signed,
+                                          spend_unsigned.data, spend_unsigned.len,
+                                          spend_sig,
+                                          csv_leaf.script, csv_leaf.script_len,
+                                          control_block, cb_len),
+                "finalize script-path tx");
+
+    /* Broadcast CSV spend */
+    char *spend_hex = (char *)malloc(spend_signed.len * 2 + 1);
+    hex_encode(spend_signed.data, spend_signed.len, spend_hex);
+
+    char spend_txid_hex[65];
+    sent = regtest_send_raw_tx(&rt, spend_hex, spend_txid_hex);
+    if (!sent) {
+        printf("  CSV spend broadcast failed\n");
+        printf("  Spend tx hex (%zu bytes): %s\n", spend_signed.len, spend_hex);
+    }
+    free(spend_hex);
+    TEST_ASSERT(sent, "broadcast CSV spend");
+    printf("  CSV spend broadcast: %s\n", spend_txid_hex);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    conf = regtest_get_confirmations(&rt, spend_txid_hex);
+    printf("  CSV spend confirmations: %d\n", conf);
+    TEST_ASSERT(conf > 0, "CSV spend confirmed");
+
+    printf("  Unilateral close complete: commitment -> CSV wait -> to-local spend confirmed!\n");
+
+    tx_buf_free(&commit_unsigned);
+    tx_buf_free(&commit_signed);
+    tx_buf_free(&spend_unsigned);
+    tx_buf_free(&spend_signed);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
