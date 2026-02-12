@@ -8,6 +8,7 @@ A Bitcoin channel factory protocol combining:
 
 - **Decker-Wattenhofer invalidation** — alternating kickoff/state transaction layers with decrementing nSequence relative timelocks
 - **Timeout-sig-trees** — N-of-N MuSig2 key-path spending with CLTV timeout script-path fallback
+- **Poon-Dryja payment channels** — standard Lightning channels at leaf outputs with HTLCs
 - **LSP + N clients** architecture — not symmetric N-of-N; the LSP participates in all branches
 
 No consensus changes or soft forks required. Runs on Bitcoin today.
@@ -25,14 +26,16 @@ Dependencies (auto-fetched via CMake FetchContent):
 
 ## Test
 
+72 tests (60 unit + 12 regtest integration).
+
 ```bash
 # unit tests (no bitcoind needed)
 LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_superscalar --unit
 
 # integration tests (needs bitcoind -regtest)
-bitcoind -regtest -daemon -rpcuser=rpcuser -rpcpassword=rpcpass
+bitcoind -regtest -daemon -rpcuser=rpcuser -rpcpassword=rpcpass -fallbackfee=0.00001 -txindex=1
 LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_superscalar --regtest
-bitcoin-cli -regtest stop
+bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
 
 # all tests
 LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_superscalar --all
@@ -43,10 +46,12 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | Module | File | Purpose |
 |--------|------|---------|
 | `dw_state` | dw_state.c | nSequence state machine, odometer-style multi-layer counter |
-| `musig` | musig.c | MuSig2 key aggregation + 2-round signing with taproot tweaking |
+| `musig` | musig.c | MuSig2 key aggregation, 2-round signing, split-round protocol, nonce pools |
 | `tx_builder` | tx_builder.c | Raw Bitcoin tx serialization, BIP-341 key-path sighash, witness finalization |
 | `tapscript` | tapscript.c | TapLeaf/TapBranch hashing, CLTV timeout scripts, script-path sighash, control blocks |
-| `factory` | factory.c | 6-node factory tree: build, sign, advance DW counter, timeout-sig-tree outputs |
+| `factory` | factory.c | Factory tree: build, sign, advance, timeout-sig-tree outputs, cooperative close |
+| `shachain` | shachain.c | BOLT #3 shachain algorithm, compact storage, epoch-to-index mapping |
+| `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
 
@@ -74,6 +79,7 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 - **6 transactions** in the tree, all pre-signed cooperatively via MuSig2
 - **Alternating kickoff/state layers** prevents the cascade problem
 - **Leaf outputs**: 2 Poon-Dryja payment channels + 1 LSP liquidity stock per branch
+- **L-stock outputs**: Shachain-based invalidation with burn path for old states
 
 ### Decker-Wattenhofer Invalidation
 
@@ -88,7 +94,7 @@ State 3 (newest): nSequence = 0 blocks    <- confirms immediately
 
 Multi-layer counter works like an odometer: 2 layers x 4 states = 16 epochs.
 
-### Timeout-Sig-Trees (Phase 2)
+### Timeout-Sig-Trees
 
 State transaction outputs include a taproot script tree with a CLTV timeout fallback:
 
@@ -98,32 +104,81 @@ Output key = TapTweak(internal_key, merkle_root)
   Script path: <cltv_timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP <LSP_pubkey> OP_CHECKSIG
 ```
 
-If clients disappear, the LSP can unilaterally recover funds after the timeout expires. This is the core safety mechanism: the LSP is never stuck with locked capital indefinitely.
+If clients disappear, the LSP can unilaterally recover funds after the timeout expires.
 
-- **state_root outputs** (feeding kickoff_left/kickoff_right) get the taptree
-- **kickoff outputs** remain pure key-path (circuit breaker)
-- **leaf outputs** remain pure key-path (Poon-Dryja channels are a future phase)
+### Payment Channels
+
+Each leaf channel is a standard Poon-Dryja Lightning channel:
+
+```
+Commitment TX (held by each party):
+  Input:  leaf output (2-of-2 MuSig key-path)
+  Output 0: to_local  (revocable with per-commitment point)
+  Output 1: to_remote (immediate)
+  Output 2+: HTLC outputs (offered/received)
+```
+
+- **Revocation**: Shachain-derived per-commitment secrets
+- **Penalty**: Full channel balance to counterparty on breach
+- **HTLCs**: 2-leaf taproot trees (success + timeout paths, or revocation + claim)
+- **Cooperative close**: Single key-path spend bypassing commitment structure
 
 ## Implementation Status
 
-### Phase 1: DW Factory Tree
+### Phase 0: DW Invalidation
+- Multi-layer odometer counter (BIP-68 nSequence)
+- Layer exhaustion detection and state advancement
+
+### Phase 1: Factory Transaction Tree
 - 6-node alternating kickoff/state tree topology
 - MuSig2 N-of-N signing with taproot key-path tweak
-- Multi-layer DW counter with odometer advancement
 - Full on-chain broadcast and confirmation on regtest
 
 ### Phase 2: Timeout-Sig-Trees
 - CLTV timeout script construction (BIP-341 tapscript)
-- TapLeaf hashing, merkle root computation
-- Taproot output tweaking with script tree
-- Script-path sighash (BIP-341 spend_type=0x02)
-- Control block construction for single-leaf trees
+- TapLeaf hashing, merkle root, taproot output tweaking
+- Script-path sighash and control block construction
 - LSP timeout spend via script-path witness on regtest
-- Key-path cooperative spending still works with taptree present
 
-### Future Phases
-- Poon-Dryja payment channels at leaf outputs
-- PTLC key turnover (scalar = client private key)
-- Shachain-based L-output invalidation
-- Factory laddering (30-day active + 3-day dying lifecycle)
+### Phase 3a: Split-Round MuSig2
+- Nonce pool pre-generation (up to 256 nonces per client)
+- Nonce/partial-sig serialization for offline clients
+- 3-phase split-round signing orchestration
+- N-of-N split-round signing (tested with 5 participants)
+
+### Phase 4: Shachain + L-Output Invalidation
+- BOLT #3 shachain generation and compact storage (49 elements)
+- Epoch-to-index mapping for factory states
+- Burn transaction construction for L-stock outputs
+- Shachain secret verification on insert
+
+### Phase 5: Poon-Dryja Payment Channels
+- Channel initialization from factory leaf outputs
+- Per-commitment point/secret generation (shachain-based)
+- Commitment transaction construction and signing
+- Key derivation (simple + revocation keys)
+- Penalty transaction for breach enforcement
+- Regtest: unilateral close with on-chain confirmation
+
+### Phase 6: HTLC Outputs
+- Offered/Received HTLC scripts (2-leaf taproot trees)
+- HTLC-success and HTLC-timeout transaction paths
+- HTLC penalty transactions (revocation spending)
+- HTLC commitment transaction integration
+- Regtest: HTLC success (preimage reveal) and timeout (CLTV expiry)
+
+### Phase 7: Cooperative Close
+- Factory-level cooperative close (single tx, bypasses entire tree)
+- Channel-level cooperative close (key-path spend, no timelocks)
+- Arbitrary output distribution with negotiated balances
+- Regtest: factory coop close + channel coop close after balance shift
+
+### Future: Phase 8 — Laddering
+- PTLC key turnover (adaptor signatures, scalar = client private key)
+- Factory lifecycle (30-day active + 3-day dying)
+- Rolling factory creation with client migration
 - CTV upgrade path (replace N-of-N emulation with covenant)
+
+## License
+
+MIT
