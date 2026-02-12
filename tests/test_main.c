@@ -65,6 +65,11 @@ extern int test_regtest_old_first_attack(void);
 extern int test_regtest_musig_onchain(void);
 extern int test_regtest_nsequence_edge(void);
 
+extern int test_factory_build_tree(void);
+extern int test_factory_sign_all(void);
+extern int test_factory_advance(void);
+extern int test_regtest_factory_tree(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -88,6 +93,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_build_unsigned_tx);
     RUN_TEST(test_finalize_signed_tx);
     RUN_TEST(test_varint_encoding);
+
+    printf("\n=== Factory Tree ===\n");
+    RUN_TEST(test_factory_build_tree);
+    RUN_TEST(test_factory_sign_all);
+    RUN_TEST(test_factory_advance);
 }
 
 static void run_regtest_tests(void) {
@@ -97,6 +107,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_old_first_attack);
     RUN_TEST(test_regtest_musig_onchain);
     RUN_TEST(test_regtest_nsequence_edge);
+    RUN_TEST(test_regtest_factory_tree);
 }
 
 int main(int argc, char *argv[]) {
@@ -111,7 +122,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Phase 0 Test Suite\n");
+    printf("SuperScalar Phase 1 Test Suite\n");
     printf("==============================\n");
 
     if (run_unit) run_unit_tests();

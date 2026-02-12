@@ -32,14 +32,14 @@ int test_dw_delay_for_state(void) {
     dw_layer_config_t cfg = { .step_blocks = 144, .max_states = 4 };
 
     /* step=144, max_states=4:
-     *   state 0 (oldest): 144 * 4 = 576
-     *   state 1:          144 * 3 = 432
-     *   state 2:          144 * 2 = 288
-     *   state 3 (newest): 144 * 1 = 144 */
-    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 0), 576, "state 0 delay");
-    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 1), 432, "state 1 delay");
-    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 2), 288, "state 2 delay");
-    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 3), 144, "state 3 delay");
+     *   state 0 (oldest): 144 * 3 = 432
+     *   state 1:          144 * 2 = 288
+     *   state 2:          144 * 1 = 144
+     *   state 3 (newest): 144 * 0 = 0   (confirms immediately) */
+    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 0), 432, "state 0 delay");
+    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 1), 288, "state 1 delay");
+    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 2), 144, "state 2 delay");
+    TEST_ASSERT_EQ(dw_delay_for_state(&cfg, 3), 0, "state 3 delay");
 
     for (uint32_t i = 1; i < 4; i++) {
         TEST_ASSERT(dw_delay_for_state(&cfg, i) < dw_delay_for_state(&cfg, i - 1),
@@ -53,8 +53,8 @@ int test_dw_nsequence_for_state(void) {
     dw_layer_config_t cfg = { .step_blocks = 144, .max_states = 4 };
 
     /* BIP-68 block-based: nSequence = delay, bits 31 and 22 clear */
-    TEST_ASSERT_EQ(dw_nsequence_for_state(&cfg, 0), 576, "state 0 nsequence");
-    TEST_ASSERT_EQ(dw_nsequence_for_state(&cfg, 3), 144, "state 3 nsequence");
+    TEST_ASSERT_EQ(dw_nsequence_for_state(&cfg, 0), 432, "state 0 nsequence");
+    TEST_ASSERT_EQ(dw_nsequence_for_state(&cfg, 3), 0, "state 3 nsequence");
 
     for (uint32_t i = 0; i < 4; i++) {
         uint32_t seq = dw_nsequence_for_state(&cfg, i);

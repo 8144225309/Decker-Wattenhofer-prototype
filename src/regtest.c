@@ -184,20 +184,64 @@ int regtest_send_raw_tx(regtest_t *rt, const char *tx_hex, char *txid_out) {
 
 int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     char params[256];
+
+    /* Try gettransaction (wallet txs) */
     snprintf(params, sizeof(params), "\"%s\" true", txid);
     char *result = regtest_exec(rt, "gettransaction", params);
+    if (result) {
+        cJSON *json = cJSON_Parse(result);
+        free(result);
+        if (json) {
+            cJSON *conf = cJSON_GetObjectItem(json, "confirmations");
+            if (conf && cJSON_IsNumber(conf)) {
+                int val = conf->valueint;
+                cJSON_Delete(json);
+                return val;
+            }
+            cJSON_Delete(json);
+        }
+    }
+
+    /* Fallback: scan recent blocks with getrawtransaction + blockhash */
+    result = regtest_exec(rt, "getblockcount", "");
     if (!result) return -1;
-
-    cJSON *json = cJSON_Parse(result);
+    int height = atoi(result);
     free(result);
-    if (!json) return -1;
 
-    cJSON *conf = cJSON_GetObjectItem(json, "confirmations");
-    int val = -1;
-    if (conf && cJSON_IsNumber(conf))
-        val = conf->valueint;
-    cJSON_Delete(json);
-    return val;
+    for (int i = 0; i < 20 && i <= height; i++) {
+        snprintf(params, sizeof(params), "%d", height - i);
+        char *hash_result = regtest_exec(rt, "getblockhash", params);
+        if (!hash_result) continue;
+
+        /* Trim whitespace */
+        char blockhash[65];
+        char *s = hash_result;
+        while (*s == ' ' || *s == '\n' || *s == '"') s++;
+        char *e = s + strlen(s) - 1;
+        while (e > s && (*e == ' ' || *e == '\n' || *e == '"' || *e == '\r'))
+            *e-- = '\0';
+        strncpy(blockhash, s, 64);
+        blockhash[64] = '\0';
+        free(hash_result);
+
+        snprintf(params, sizeof(params), "\"%s\" true \"%s\"", txid, blockhash);
+        char *tx_result = regtest_exec(rt, "getrawtransaction", params);
+        if (!tx_result) continue;
+
+        cJSON *json = cJSON_Parse(tx_result);
+        free(tx_result);
+        if (!json) continue;
+
+        cJSON *conf = cJSON_GetObjectItem(json, "confirmations");
+        if (conf && cJSON_IsNumber(conf)) {
+            int val = conf->valueint;
+            cJSON_Delete(json);
+            return val;
+        }
+        cJSON_Delete(json);
+    }
+
+    return -1;
 }
 
 bool regtest_is_in_mempool(regtest_t *rt, const char *txid) {
@@ -211,30 +255,10 @@ bool regtest_is_in_mempool(regtest_t *rt, const char *txid) {
     return in_mempool;
 }
 
-int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
-                          uint64_t *amount_sats_out,
-                          unsigned char *scriptpubkey_out, size_t *spk_len_out) {
-    char params[256];
-    snprintf(params, sizeof(params), "\"%s\" true", txid);
-    char *result = regtest_exec(rt, "getrawtransaction", params);
-    if (!result) return 0;
-
-    cJSON *json = cJSON_Parse(result);
-    free(result);
-    if (!json) return 0;
-
-    cJSON *vouts = cJSON_GetObjectItem(json, "vout");
-    if (!vouts || !cJSON_IsArray(vouts)) {
-        cJSON_Delete(json);
-        return 0;
-    }
-
-    cJSON *vout_obj = cJSON_GetArrayItem(vouts, (int)vout);
-    if (!vout_obj) {
-        cJSON_Delete(json);
-        return 0;
-    }
-
+/* Parse a vout object from getrawtransaction or gettransaction decoded output. */
+static int parse_vout_obj(cJSON *vout_obj,
+                           uint64_t *amount_sats_out,
+                           unsigned char *scriptpubkey_out, size_t *spk_len_out) {
     cJSON *value = cJSON_GetObjectItem(vout_obj, "value");
     if (value && cJSON_IsNumber(value))
         *amount_sats_out = (uint64_t)(value->valuedouble * 100000000.0 + 0.5);
@@ -248,7 +272,57 @@ int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
                 *spk_len_out = (size_t)decoded;
         }
     }
-
-    cJSON_Delete(json);
     return 1;
+}
+
+int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
+                          uint64_t *amount_sats_out,
+                          unsigned char *scriptpubkey_out, size_t *spk_len_out) {
+    char params[256];
+    cJSON *json = NULL;
+    cJSON *vouts = NULL;
+
+    /* Try getrawtransaction first (works with -txindex or for mempool txs) */
+    snprintf(params, sizeof(params), "\"%s\" true", txid);
+    char *result = regtest_exec(rt, "getrawtransaction", params);
+    if (result) {
+        json = cJSON_Parse(result);
+        free(result);
+        if (json) {
+            vouts = cJSON_GetObjectItem(json, "vout");
+            if (vouts && cJSON_IsArray(vouts)) {
+                cJSON *vout_obj = cJSON_GetArrayItem(vouts, (int)vout);
+                if (vout_obj) {
+                    int ok = parse_vout_obj(vout_obj, amount_sats_out,
+                                             scriptpubkey_out, spk_len_out);
+                    cJSON_Delete(json);
+                    return ok;
+                }
+            }
+            cJSON_Delete(json);
+            json = NULL;
+        }
+    }
+
+    /* Fallback: gettransaction with decode (wallet txs, no -txindex needed) */
+    snprintf(params, sizeof(params), "\"%s\" true true", txid);
+    result = regtest_exec(rt, "gettransaction", params);
+    if (!result) return 0;
+
+    json = cJSON_Parse(result);
+    free(result);
+    if (!json) return 0;
+
+    cJSON *decoded = cJSON_GetObjectItem(json, "decoded");
+    if (!decoded) { cJSON_Delete(json); return 0; }
+
+    vouts = cJSON_GetObjectItem(decoded, "vout");
+    if (!vouts || !cJSON_IsArray(vouts)) { cJSON_Delete(json); return 0; }
+
+    cJSON *vout_obj = cJSON_GetArrayItem(vouts, (int)vout);
+    if (!vout_obj) { cJSON_Delete(json); return 0; }
+
+    int ok = parse_vout_obj(vout_obj, amount_sats_out, scriptpubkey_out, spk_len_out);
+    cJSON_Delete(json);
+    return ok;
 }

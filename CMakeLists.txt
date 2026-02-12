@@ -38,6 +38,7 @@ add_library(superscalar
     src/musig.c
     src/regtest.c
     src/util.c
+    src/factory.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -51,8 +52,10 @@ add_executable(test_superscalar
     tests/test_musig.c
     tests/test_tx_builder.c
     tests/test_regtest.c
+    tests/test_factory.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(test_superscalar PRIVATE superscalar)
 enable_testing()
 add_test(NAME unit_tests COMMAND test_superscalar --unit)

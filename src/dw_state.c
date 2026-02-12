@@ -7,8 +7,8 @@ void dw_layer_init(dw_layer_t *layer, uint16_t step_blocks, uint32_t max_states)
 }
 
 uint16_t dw_delay_for_state(const dw_layer_config_t *cfg, uint32_t state_index) {
-    /* delay = step_blocks * (max_states - state_index) */
-    return cfg->step_blocks * (cfg->max_states - state_index);
+    /* delay = step * (max_states - 1 - index), so newest state has delay=0 */
+    return cfg->step_blocks * (cfg->max_states - 1 - state_index);
 }
 
 uint32_t dw_nsequence_for_state(const dw_layer_config_t *cfg, uint32_t state_index) {
