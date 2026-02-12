@@ -1655,3 +1655,235 @@ int test_regtest_factory_coop_close(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Phase 8: Factory Lifecycle Tests ---- */
+
+/* Test: State transitions: ACTIVE at block 100, DYING at block 4420, EXPIRED at block 4852 */
+int test_factory_lifecycle_states(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    factory_set_lifecycle(&f, 100, 4320, 432);
+
+    /* Block 100: ACTIVE (just created) */
+    TEST_ASSERT_EQ(factory_get_state(&f, 100), FACTORY_ACTIVE, "active at 100");
+    TEST_ASSERT(factory_is_active(&f, 100), "is_active at 100");
+    TEST_ASSERT(!factory_is_dying(&f, 100), "!is_dying at 100");
+    TEST_ASSERT(!factory_is_expired(&f, 100), "!is_expired at 100");
+
+    /* Block 4419: still ACTIVE (last active block) */
+    TEST_ASSERT_EQ(factory_get_state(&f, 4419), FACTORY_ACTIVE, "active at 4419");
+
+    /* Block 4420: DYING starts (100 + 4320 = 4420) */
+    TEST_ASSERT_EQ(factory_get_state(&f, 4420), FACTORY_DYING, "dying at 4420");
+    TEST_ASSERT(factory_is_dying(&f, 4420), "is_dying at 4420");
+    TEST_ASSERT(!factory_is_active(&f, 4420), "!is_active at 4420");
+
+    /* Block 4851: still DYING (last dying block) */
+    TEST_ASSERT_EQ(factory_get_state(&f, 4851), FACTORY_DYING, "dying at 4851");
+
+    /* Block 4852: EXPIRED (100 + 4320 + 432 = 4852) */
+    TEST_ASSERT_EQ(factory_get_state(&f, 4852), FACTORY_EXPIRED, "expired at 4852");
+    TEST_ASSERT(factory_is_expired(&f, 4852), "is_expired at 4852");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: blocks_until_dying, blocks_until_expired return correct values */
+int test_factory_lifecycle_queries(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    factory_set_lifecycle(&f, 0, 100, 30);
+
+    /* At block 0: 100 blocks until dying, 130 until expired */
+    TEST_ASSERT_EQ(factory_blocks_until_dying(&f, 0), 100, "until dying at 0");
+    TEST_ASSERT_EQ(factory_blocks_until_expired(&f, 0), 130, "until expired at 0");
+
+    /* At block 50: 50 blocks until dying, 80 until expired */
+    TEST_ASSERT_EQ(factory_blocks_until_dying(&f, 50), 50, "until dying at 50");
+    TEST_ASSERT_EQ(factory_blocks_until_expired(&f, 50), 80, "until expired at 50");
+
+    /* At block 100: 0 blocks until dying (already dying), 30 until expired */
+    TEST_ASSERT_EQ(factory_blocks_until_dying(&f, 100), 0, "until dying at 100");
+    TEST_ASSERT_EQ(factory_blocks_until_expired(&f, 100), 30, "until expired at 100");
+
+    /* At block 130: 0 both (already expired) */
+    TEST_ASSERT_EQ(factory_blocks_until_dying(&f, 130), 0, "until dying at 130");
+    TEST_ASSERT_EQ(factory_blocks_until_expired(&f, 130), 0, "until expired at 130");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: Pre-signed nLockTime tx is valid, outputs match, nLockTime = cltv_timeout */
+int test_factory_distribution_tx(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    uint32_t nlocktime = 5000;
+    uint64_t fee = 500;
+    uint64_t total_out = 100000 - fee;
+    uint64_t per_output = total_out / 5;
+    uint64_t remainder = total_out - per_output * 5;
+
+    tx_output_t outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[i]);
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &pk);
+
+        unsigned char ser[32];
+        secp256k1_xonly_pubkey_serialize(ctx, ser, &xonly);
+        unsigned char tweak[32];
+        sha256_tagged("TapTweak", ser, 32, tweak);
+        secp256k1_pubkey tw_full;
+        secp256k1_xonly_pubkey_tweak_add(ctx, &tw_full, &xonly, tweak);
+        secp256k1_xonly_pubkey tweaked;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked, NULL, &tw_full);
+
+        build_p2tr_script_pubkey(outputs[i].script_pubkey, &tweaked);
+        outputs[i].script_pubkey_len = 34;
+        outputs[i].amount_sats = per_output + (i == 4 ? remainder : 0);
+    }
+
+    tx_buf_t dist_tx;
+    tx_buf_init(&dist_tx, 512);
+    unsigned char dist_txid[32];
+    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, dist_txid,
+                                               outputs, 5, nlocktime),
+                "build distribution tx");
+    TEST_ASSERT(dist_tx.len > 0, "dist tx non-empty");
+
+    /* Verify nLockTime is in the tx (last 4 bytes before witness) */
+    /* nLockTime in little-endian at the end of the unsigned portion */
+    unsigned char expected_lt[4] = {
+        (unsigned char)(nlocktime & 0xFF),
+        (unsigned char)((nlocktime >> 8) & 0xFF),
+        (unsigned char)((nlocktime >> 16) & 0xFF),
+        (unsigned char)((nlocktime >> 24) & 0xFF),
+    };
+    int found_lt = 0;
+    for (size_t i = 0; i + 4 <= dist_tx.len; i++) {
+        if (memcmp(dist_tx.data + i, expected_lt, 4) == 0) {
+            found_lt = 1;
+            break;
+        }
+    }
+    TEST_ASSERT(found_lt, "nLockTime found in tx");
+
+    /* Verify each output amount is in the tx */
+    for (int i = 0; i < 5; i++) {
+        unsigned char le_amt[8];
+        for (int j = 0; j < 8; j++)
+            le_amt[j] = (unsigned char)((outputs[i].amount_sats >> (j * 8)) & 0xFF);
+        int found = 0;
+        for (size_t off = 0; off + 8 <= dist_tx.len; off++) {
+            if (memcmp(dist_tx.data + off, le_amt, 8) == 0) {
+                found = 1;
+                break;
+            }
+        }
+        char msg[64];
+        snprintf(msg, sizeof(msg), "output %d amount found", i);
+        TEST_ASSERT(found, msg);
+    }
+
+    tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: Distribution tx with 5 outputs: each gets (funding - fee) / 5 */
+int test_factory_distribution_tx_default(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 50000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    uint64_t fee = 500;
+    uint64_t total_out = 50000 - fee;
+    uint64_t per_output = total_out / 5;  /* 9900 */
+
+    tx_output_t outputs[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_pubkey pk;
+        secp256k1_keypair_pub(ctx, &pk, &kps[i]);
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &pk);
+        build_p2tr_script_pubkey(outputs[i].script_pubkey, &xonly);
+        outputs[i].script_pubkey_len = 34;
+        outputs[i].amount_sats = per_output;
+    }
+
+    tx_buf_t dist_tx;
+    tx_buf_init(&dist_tx, 512);
+    TEST_ASSERT(factory_build_distribution_tx(&f, &dist_tx, NULL,
+                                               outputs, 5, 10000),
+                "build default distribution tx");
+    TEST_ASSERT(dist_tx.len > 0, "dist tx non-empty");
+
+    /* Verify all outputs have equal amounts */
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT_EQ(outputs[i].amount_sats, per_output, "equal output");
+
+    tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

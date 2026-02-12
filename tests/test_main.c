@@ -124,6 +124,30 @@ extern int test_channel_cooperative_close(void);
 extern int test_regtest_factory_coop_close(void);
 extern int test_regtest_channel_coop_close(void);
 
+/* Phase 8: Adaptor signatures + PTLC */
+extern int test_adaptor_round_trip(void);
+extern int test_adaptor_pre_sig_invalid(void);
+extern int test_adaptor_taproot(void);
+extern int test_ptlc_key_turnover(void);
+extern int test_ptlc_lsp_sockpuppet(void);
+extern int test_ptlc_factory_coop_close_after_turnover(void);
+extern int test_regtest_ptlc_turnover(void);
+
+/* Phase 8: Factory lifecycle + distribution tx */
+extern int test_factory_lifecycle_states(void);
+extern int test_factory_lifecycle_queries(void);
+extern int test_factory_distribution_tx(void);
+extern int test_factory_distribution_tx_default(void);
+
+/* Phase 8: Ladder manager */
+extern int test_ladder_create_factories(void);
+extern int test_ladder_state_transitions(void);
+extern int test_ladder_key_turnover_close(void);
+extern int test_ladder_overlapping(void);
+extern int test_regtest_ladder_lifecycle(void);
+extern int test_regtest_ladder_ptlc_migration(void);
+extern int test_regtest_ladder_distribution_fallback(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -208,6 +232,28 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_cooperative_close);
     RUN_TEST(test_factory_cooperative_close_balances);
     RUN_TEST(test_channel_cooperative_close);
+
+    printf("\n=== Adaptor Signatures (Phase 8a) ===\n");
+    RUN_TEST(test_adaptor_round_trip);
+    RUN_TEST(test_adaptor_pre_sig_invalid);
+    RUN_TEST(test_adaptor_taproot);
+
+    printf("\n=== PTLC Key Turnover (Phase 8b) ===\n");
+    RUN_TEST(test_ptlc_key_turnover);
+    RUN_TEST(test_ptlc_lsp_sockpuppet);
+    RUN_TEST(test_ptlc_factory_coop_close_after_turnover);
+
+    printf("\n=== Factory Lifecycle (Phase 8c) ===\n");
+    RUN_TEST(test_factory_lifecycle_states);
+    RUN_TEST(test_factory_lifecycle_queries);
+    RUN_TEST(test_factory_distribution_tx);
+    RUN_TEST(test_factory_distribution_tx_default);
+
+    printf("\n=== Ladder Manager (Phase 8d) ===\n");
+    RUN_TEST(test_ladder_create_factories);
+    RUN_TEST(test_ladder_state_transitions);
+    RUN_TEST(test_ladder_key_turnover_close);
+    RUN_TEST(test_ladder_overlapping);
 }
 
 static void run_regtest_tests(void) {
@@ -225,6 +271,12 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_htlc_timeout);
     RUN_TEST(test_regtest_factory_coop_close);
     RUN_TEST(test_regtest_channel_coop_close);
+
+    printf("\n=== Regtest Phase 8 ===\n");
+    RUN_TEST(test_regtest_ptlc_turnover);
+    RUN_TEST(test_regtest_ladder_lifecycle);
+    RUN_TEST(test_regtest_ladder_ptlc_migration);
+    RUN_TEST(test_regtest_ladder_distribution_fallback);
 }
 
 int main(int argc, char *argv[]) {
@@ -239,7 +291,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-7)\n");
+    printf("SuperScalar Test Suite (Phase 1-8)\n");
     printf("==================================\n");
 
     if (run_unit) run_unit_tests();

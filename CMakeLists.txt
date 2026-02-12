@@ -42,6 +42,8 @@ add_library(superscalar
     src/tapscript.c
     src/shachain.c
     src/channel.c
+    src/adaptor.c
+    src/ladder.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -59,6 +61,8 @@ add_executable(test_superscalar
     tests/test_tapscript.c
     tests/test_shachain.c
     tests/test_channel.c
+    tests/test_adaptor.c
+    tests/test_ladder.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

@@ -26,7 +26,7 @@ Dependencies (auto-fetched via CMake FetchContent):
 
 ## Test
 
-72 tests (60 unit + 12 regtest integration).
+90 tests (74 unit + 16 regtest integration).
 
 ```bash
 # unit tests (no bitcoind needed)
@@ -52,6 +52,8 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | `factory` | factory.c | Factory tree: build, sign, advance, timeout-sig-tree outputs, cooperative close |
 | `shachain` | shachain.c | BOLT #3 shachain algorithm, compact storage, epoch-to-index mapping |
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
+| `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover protocol |
+| `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, key turnover tracking, migration |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
 
@@ -173,10 +175,34 @@ Commitment TX (held by each party):
 - Arbitrary output distribution with negotiated balances
 - Regtest: factory coop close + channel coop close after balance shift
 
-### Future: Phase 8 — Laddering
-- PTLC key turnover (adaptor signatures, scalar = client private key)
-- Factory lifecycle (30-day active + 3-day dying)
-- Rolling factory creation with client migration
+### Phase 8a: Adaptor Signatures
+- MuSig2 adaptor signature wrappers (adapt, extract, nonce parity)
+- Pre-signatures that require a secret scalar to become valid Schnorr signatures
+- Taproot-compatible adaptor signatures (key-path with tweak)
+
+### Phase 8b: PTLC Key Turnover
+- Atomic key reveal: client adapts pre-signature with private key, LSP extracts it
+- LSP "sockpuppet" signing: uses extracted key to sign as departed client
+- Factory cooperative close using extracted keys (all clients departed)
+- Regtest: fund factory, PTLC key turnover, LSP coop-closes with extracted keys
+
+### Phase 8c: Factory Lifecycle
+- State machine: ACTIVE (30 days) -> DYING (3 days) -> EXPIRED
+- Block-height queries: blocks until dying, blocks until expired
+- Distribution transaction (inverted timelock default): pre-signed nLockTime tx defaults funds to clients after CLTV timeout
+- Regtest: distribution tx rejected before timeout, accepted after mining past nLockTime
+
+### Phase 8d: Ladder Manager
+- Multi-factory orchestration with overlapping lifecycles
+- Per-client key turnover tracking and departure recording
+- Cooperative close construction using extracted keys for all departed clients
+- Regtest: full migration demo (fund F1 -> PTLC exit -> close F1 -> fund F2)
+- Regtest: distribution tx fallback when clients don't exit
+
+### Future: Proof of Concept
+- Wire protocol (BOLT-like message framing between LSP and clients)
+- Persistent state storage (factory trees, channel state, shachain secrets)
+- Signet/testnet deployment with real network latency
 - CTV upgrade path (replace N-of-N emulation with covenant)
 
 ## License

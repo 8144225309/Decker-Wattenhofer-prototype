@@ -18,6 +18,13 @@
 
 typedef enum { NODE_KICKOFF, NODE_STATE } factory_node_type_t;
 
+/* Factory lifecycle states (Phase 8) */
+typedef enum {
+    FACTORY_ACTIVE,     /* Normal operation */
+    FACTORY_DYING,      /* Migration window, no new liquidity purchases */
+    FACTORY_EXPIRED,    /* CLTV timeout reached */
+} factory_state_t;
+
 typedef struct {
     factory_node_type_t type;
 
@@ -100,6 +107,11 @@ typedef struct {
     /* Shachain for L-output invalidation */
     unsigned char shachain_seed[32];
     int has_shachain;
+
+    /* Lifecycle (Phase 8) */
+    uint32_t created_block;        /* block height when funding confirmed */
+    uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
+    uint32_t dying_blocks;         /* duration of dying period (default: 432 = 3*144) */
 } factory_t;
 
 void factory_init(factory_t *f, secp256k1_context *ctx,
@@ -163,5 +175,28 @@ int factory_session_set_partial_sig(factory_t *f, size_t node_idx,
 
 /* Complete signing: aggregate partial sigs, finalize witness for all nodes. */
 int factory_sessions_complete(factory_t *f);
+
+/* --- Factory lifecycle (Phase 8) --- */
+
+void factory_set_lifecycle(factory_t *f, uint32_t created_block,
+                           uint32_t active_blocks, uint32_t dying_blocks);
+
+factory_state_t factory_get_state(const factory_t *f, uint32_t current_block);
+int factory_is_active(const factory_t *f, uint32_t current_block);
+int factory_is_dying(const factory_t *f, uint32_t current_block);
+int factory_is_expired(const factory_t *f, uint32_t current_block);
+uint32_t factory_blocks_until_dying(const factory_t *f, uint32_t current_block);
+uint32_t factory_blocks_until_expired(const factory_t *f, uint32_t current_block);
+
+/* Pre-sign a distribution tx at factory creation time.
+   nLockTime = cltv_timeout, outputs = per-client settlement amounts.
+   This is the "inverted timelock default": if nobody acts, clients get money. */
+int factory_build_distribution_tx(
+    factory_t *f,
+    tx_buf_t *dist_tx_out,
+    unsigned char *txid_out32,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nlocktime);
 
 #endif /* SUPERSCALAR_FACTORY_H */

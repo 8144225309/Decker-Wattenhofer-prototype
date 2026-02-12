@@ -777,6 +777,112 @@ int factory_build_cooperative_close(
     return 1;
 }
 
+/* --- Factory lifecycle (Phase 8) --- */
+
+void factory_set_lifecycle(factory_t *f, uint32_t created_block,
+                           uint32_t active_blocks, uint32_t dying_blocks) {
+    f->created_block = created_block;
+    f->active_blocks = active_blocks;
+    f->dying_blocks = dying_blocks;
+}
+
+factory_state_t factory_get_state(const factory_t *f, uint32_t current_block) {
+    if (f->active_blocks == 0)
+        return FACTORY_EXPIRED;  /* not configured */
+
+    uint32_t dying_start = f->created_block + f->active_blocks;
+    uint32_t expired_start = dying_start + f->dying_blocks;
+
+    if (current_block < dying_start)
+        return FACTORY_ACTIVE;
+    if (current_block < expired_start)
+        return FACTORY_DYING;
+    return FACTORY_EXPIRED;
+}
+
+int factory_is_active(const factory_t *f, uint32_t current_block) {
+    return factory_get_state(f, current_block) == FACTORY_ACTIVE;
+}
+
+int factory_is_dying(const factory_t *f, uint32_t current_block) {
+    return factory_get_state(f, current_block) == FACTORY_DYING;
+}
+
+int factory_is_expired(const factory_t *f, uint32_t current_block) {
+    return factory_get_state(f, current_block) == FACTORY_EXPIRED;
+}
+
+uint32_t factory_blocks_until_dying(const factory_t *f, uint32_t current_block) {
+    uint32_t dying_start = f->created_block + f->active_blocks;
+    if (current_block >= dying_start)
+        return 0;
+    return dying_start - current_block;
+}
+
+uint32_t factory_blocks_until_expired(const factory_t *f, uint32_t current_block) {
+    uint32_t expired_start = f->created_block + f->active_blocks + f->dying_blocks;
+    if (current_block >= expired_start)
+        return 0;
+    return expired_start - current_block;
+}
+
+int factory_build_distribution_tx(
+    factory_t *f,
+    tx_buf_t *dist_tx_out,
+    unsigned char *txid_out32,
+    const tx_output_t *outputs,
+    size_t n_outputs,
+    uint32_t nlocktime)
+{
+    /* Build unsigned tx with nLockTime spending the funding UTXO.
+       nSequence = 0xFFFFFFFE to enable nLockTime. */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 256);
+    unsigned char display_txid[32];
+
+    if (!build_unsigned_tx_with_locktime(&unsigned_tx,
+                                          txid_out32 ? display_txid : NULL,
+                                          f->funding_txid, f->funding_vout,
+                                          0xFFFFFFFEu, nlocktime,
+                                          outputs, n_outputs)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    if (txid_out32) {
+        memcpy(txid_out32, display_txid, 32);
+        reverse_bytes(txid_out32, 32);
+    }
+
+    /* Compute BIP-341 key-path sighash */
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                  0, f->funding_spk, f->funding_spk_len,
+                                  f->funding_amount_sats, 0xFFFFFFFEu)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* Sign with N-of-N MuSig (same aggregate key as kickoff_root) */
+    musig_keyagg_t keyagg_copy = f->nodes[0].keyagg;
+    unsigned char sig64[64];
+    if (!musig_sign_taproot(f->ctx, sig64, sighash, f->keypairs,
+                             f->n_participants, &keyagg_copy, NULL)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    /* Finalize */
+    if (!finalize_signed_tx(dist_tx_out, unsigned_tx.data, unsigned_tx.len,
+                              sig64)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    tx_buf_free(&unsigned_tx);
+    return 1;
+}
+
 void factory_free(factory_t *f) {
     for (size_t i = 0; i < f->n_nodes; i++) {
         tx_buf_free(&f->nodes[i].unsigned_tx);
