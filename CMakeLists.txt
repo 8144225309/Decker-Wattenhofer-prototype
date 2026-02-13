@@ -31,6 +31,9 @@ FetchContent_Declare(cjson
 )
 FetchContent_MakeAvailable(cjson)
 
+# --- SQLite3 (system library) ---
+find_package(SQLite3 REQUIRED)
+
 # --- Main library ---
 add_library(superscalar
     src/dw_state.c
@@ -48,11 +51,14 @@ add_library(superscalar
     src/lsp.c
     src/client.c
     src/lsp_channels.c
+    src/report.c
+    src/persist.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(superscalar PRIVATE ${cjson_SOURCE_DIR})
-target_link_libraries(superscalar PUBLIC secp256k1 cjson)
+target_include_directories(superscalar PUBLIC ${SQLite3_INCLUDE_DIRS})
+target_link_libraries(superscalar PUBLIC secp256k1 cjson SQLite::SQLite3)
 
 # --- Tests ---
 add_executable(test_superscalar
@@ -69,6 +75,7 @@ add_executable(test_superscalar
     tests/test_ladder.c
     tests/test_wire.c
     tests/test_channels.c
+    tests/test_persist.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

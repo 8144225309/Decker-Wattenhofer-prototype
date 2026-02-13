@@ -28,6 +28,7 @@
 #define MSG_UPDATE_FULFILL_HTLC 0x34
 #define MSG_UPDATE_FAIL_HTLC   0x35
 #define MSG_CLOSE_REQUEST      0x36
+#define MSG_CHANNEL_NONCES     0x37   /* batch of pubnonces for channel signing */
 
 #define MSG_ERROR              0xFF
 
@@ -131,10 +132,11 @@ cJSON *wire_build_update_add_htlc(uint64_t htlc_id, uint64_t amount_msat,
                                     const unsigned char *payment_hash32,
                                     uint32_t cltv_expiry);
 
-/* Both: COMMITMENT_SIGNED {channel_id, commitment_number, sig} */
+/* Both: COMMITMENT_SIGNED {channel_id, commitment_number, partial_sig, nonce_index} */
 cJSON *wire_build_commitment_signed(uint32_t channel_id,
                                       uint64_t commitment_number,
-                                      const unsigned char *sig64);
+                                      const unsigned char *partial_sig32,
+                                      uint32_t nonce_index);
 
 /* Both: REVOKE_AND_ACK {channel_id, revocation_secret, next_per_commitment_point} */
 cJSON *wire_build_revoke_and_ack(uint32_t channel_id,
@@ -152,6 +154,11 @@ cJSON *wire_build_update_fail_htlc(uint64_t htlc_id, const char *reason);
 /* Client → LSP: CLOSE_REQUEST {} */
 cJSON *wire_build_close_request(void);
 
+/* Both: CHANNEL_NONCES {channel_id, pubnonces: ["hex"...]} */
+cJSON *wire_build_channel_nonces(uint32_t channel_id,
+                                   const unsigned char pubnonces[][66],
+                                   size_t count);
+
 /* --- Channel operation message parsers (Phase 10) --- */
 
 int wire_parse_channel_ready(const cJSON *json, uint32_t *channel_id,
@@ -165,7 +172,8 @@ int wire_parse_update_add_htlc(const cJSON *json, uint64_t *htlc_id,
 
 int wire_parse_commitment_signed(const cJSON *json, uint32_t *channel_id,
                                    uint64_t *commitment_number,
-                                   unsigned char *sig64);
+                                   unsigned char *partial_sig32,
+                                   uint32_t *nonce_index);
 
 int wire_parse_revoke_and_ack(const cJSON *json, uint32_t *channel_id,
                                 unsigned char *revocation_secret32,
@@ -176,6 +184,10 @@ int wire_parse_update_fulfill_htlc(const cJSON *json, uint64_t *htlc_id,
 
 int wire_parse_update_fail_htlc(const cJSON *json, uint64_t *htlc_id,
                                   char *reason, size_t reason_len);
+
+int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
+                                unsigned char pubnonces_out[][66],
+                                size_t max_nonces, size_t *count_out);
 
 /* --- Bundle parsing --- */
 

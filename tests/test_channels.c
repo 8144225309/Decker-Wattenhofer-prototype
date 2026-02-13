@@ -83,20 +83,22 @@ int test_channel_msg_round_trip(void) {
         cJSON_Delete(msg);
     }
 
-    /* COMMITMENT_SIGNED */
+    /* COMMITMENT_SIGNED (Phase 12: partial_sig32 + nonce_index) */
     {
-        unsigned char sig[64];
-        memset(sig, 0xCC, 64);
-        cJSON *msg = wire_build_commitment_signed(1, 5, sig);
+        unsigned char psig[32];
+        memset(psig, 0xCC, 32);
+        cJSON *msg = wire_build_commitment_signed(1, 5, psig, 42);
         uint32_t ch_id;
         uint64_t commit_num;
-        unsigned char parsed_sig[64];
+        unsigned char parsed_psig[32];
+        uint32_t parsed_nonce_idx;
         TEST_ASSERT(wire_parse_commitment_signed(msg, &ch_id, &commit_num,
-                                                    parsed_sig),
+                                                    parsed_psig, &parsed_nonce_idx),
                     "parse commitment_signed");
         TEST_ASSERT_EQ(ch_id, 1, "channel_id");
         TEST_ASSERT_EQ(commit_num, 5, "commitment_number");
-        TEST_ASSERT(memcmp(sig, parsed_sig, 64) == 0, "sig");
+        TEST_ASSERT(memcmp(psig, parsed_psig, 32) == 0, "partial_sig");
+        TEST_ASSERT_EQ(parsed_nonce_idx, 42, "nonce_index");
         cJSON_Delete(msg);
     }
 
@@ -117,6 +119,28 @@ int test_channel_msg_round_trip(void) {
         TEST_ASSERT(memcmp(secret, parsed_secret, 32) == 0, "revocation_secret");
         cJSON_Delete(msg);
         secp256k1_context_destroy(ctx);
+    }
+
+    /* CHANNEL_NONCES (Phase 12) */
+    {
+        unsigned char nonces[3][66];
+        memset(nonces[0], 0xAA, 66);
+        memset(nonces[1], 0xBB, 66);
+        memset(nonces[2], 0xCC, 66);
+        cJSON *msg = wire_build_channel_nonces(7,
+            (const unsigned char (*)[66])nonces, 3);
+        uint32_t ch_id;
+        unsigned char parsed_nonces[16][66];
+        size_t parsed_count;
+        TEST_ASSERT(wire_parse_channel_nonces(msg, &ch_id, parsed_nonces,
+                                                16, &parsed_count),
+                    "parse channel_nonces");
+        TEST_ASSERT_EQ(ch_id, 7, "channel_id");
+        TEST_ASSERT_EQ(parsed_count, 3, "nonce_count");
+        TEST_ASSERT(memcmp(nonces[0], parsed_nonces[0], 66) == 0, "nonce[0]");
+        TEST_ASSERT(memcmp(nonces[1], parsed_nonces[1], 66) == 0, "nonce[1]");
+        TEST_ASSERT(memcmp(nonces[2], parsed_nonces[2], 66) == 0, "nonce[2]");
+        cJSON_Delete(msg);
     }
 
     /* UPDATE_FULFILL_HTLC */

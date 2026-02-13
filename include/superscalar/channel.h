@@ -74,6 +74,16 @@ typedef struct {
 
     /* Config */
     uint32_t to_self_delay;
+
+    /* MuSig2 signer index: 0 or 1 in the canonical 2-of-2 keyagg order.
+       Needed for distributed signing (Phase 12). */
+    int local_funding_signer_idx;
+
+    /* Nonce pools for commitment signing (Phase 12) */
+    musig_nonce_pool_t  local_nonce_pool;
+    unsigned char       remote_pubnonces_ser[MUSIG_NONCE_POOL_MAX][66];
+    size_t              remote_nonce_count;
+    size_t              remote_nonce_next;
 } channel_t;
 
 /* --- Key derivation (BOLT #3) --- */
@@ -142,6 +152,33 @@ int channel_sign_commitment(const channel_t *ch,
                               tx_buf_t *signed_tx_out,
                               const tx_buf_t *unsigned_tx,
                               const secp256k1_keypair *remote_keypair);
+
+/* --- Distributed commitment signing (Phase 12) --- */
+
+/* Initialize nonce pool for channel commitment signing.
+   Generates 'count' nonce pairs and stores in ch->local_nonce_pool. */
+int channel_init_nonce_pool(channel_t *ch, size_t count);
+
+/* Store peer's serialized pubnonces (received via MSG_CHANNEL_NONCES). */
+int channel_set_remote_pubnonces(channel_t *ch,
+                                   const unsigned char pubnonces[][66],
+                                   size_t count);
+
+/* Create partial sig for current commitment tx.
+   Draws next nonce from local pool, uses peer's pubnonce at same index.
+   Returns partial_sig (32 bytes serialized) and nonce_index used. */
+int channel_create_commitment_partial_sig(
+    channel_t *ch,
+    unsigned char *partial_sig32_out,
+    uint32_t *nonce_index_out);
+
+/* Verify peer's partial sig and aggregate into full 64-byte Schnorr sig.
+   Uses nonce at peer_nonce_index from both pools. */
+int channel_verify_and_aggregate_commitment_sig(
+    channel_t *ch,
+    const unsigned char *peer_partial_sig32,
+    uint32_t peer_nonce_index,
+    unsigned char *full_sig64_out);
 
 /* --- Revocation + Penalty --- */
 

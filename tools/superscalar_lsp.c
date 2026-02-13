@@ -2,6 +2,8 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/regtest.h"
+#include "superscalar/report.h"
+#include "superscalar/persist.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -34,6 +36,8 @@ static void usage(const char *prog) {
         "  --step-blocks N     DW step blocks (default 10)\n"
         "  --seckey HEX        LSP secret key (32-byte hex, default: deterministic)\n"
         "  --payments N        Number of HTLC payments to process (default 0)\n"
+        "  --report PATH       Write diagnostic JSON report to PATH\n"
+        "  --db PATH           SQLite database for persistence (default: none)\n"
         "  --regtest           Use regtest (required)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
@@ -119,6 +123,102 @@ static int ensure_funded(regtest_t *rt, const char *mine_addr) {
     return 0;
 }
 
+/* Report all factory tree nodes */
+static void report_factory_tree(report_t *rpt, secp256k1_context *ctx,
+                                 const factory_t *f) {
+    static const char *type_names[] = { "kickoff", "state" };
+
+    report_begin_array(rpt, "nodes");
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *node = &f->nodes[i];
+        report_begin_section(rpt, NULL);
+
+        report_add_uint(rpt, "index", i);
+        report_add_string(rpt, "type",
+                          node->type <= NODE_STATE ? type_names[node->type] : "unknown");
+        report_add_uint(rpt, "n_signers", node->n_signers);
+
+        report_begin_array(rpt, "signer_indices");
+        for (size_t s = 0; s < node->n_signers; s++)
+            report_add_uint(rpt, NULL, node->signer_indices[s]);
+        report_end_array(rpt);
+
+        report_add_int(rpt, "parent_index", node->parent_index);
+        report_add_uint(rpt, "parent_vout", node->parent_vout);
+        report_add_int(rpt, "dw_layer_index", node->dw_layer_index);
+        report_add_uint(rpt, "nsequence", node->nsequence);
+        report_add_uint(rpt, "input_amount", node->input_amount);
+        report_add_bool(rpt, "has_taptree", node->has_taptree);
+
+        /* Aggregate pubkey */
+        {
+            unsigned char xonly_ser[32];
+            secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->keyagg.agg_pubkey);
+            report_add_hex(rpt, "agg_pubkey", xonly_ser, 32);
+        }
+
+        /* Tweaked pubkey */
+        {
+            unsigned char xonly_ser[32];
+            secp256k1_xonly_pubkey_serialize(ctx, xonly_ser, &node->tweaked_pubkey);
+            report_add_hex(rpt, "tweaked_pubkey", xonly_ser, 32);
+        }
+
+        if (node->has_taptree)
+            report_add_hex(rpt, "merkle_root", node->merkle_root, 32);
+
+        report_add_hex(rpt, "spending_spk", node->spending_spk, 34);
+
+        /* Outputs */
+        report_begin_array(rpt, "outputs");
+        for (size_t o = 0; o < node->n_outputs; o++) {
+            report_begin_section(rpt, NULL);
+            report_add_uint(rpt, "amount_sats", node->outputs[o].amount_sats);
+            report_add_hex(rpt, "script_pubkey",
+                           node->outputs[o].script_pubkey,
+                           node->outputs[o].script_pubkey_len);
+            report_end_section(rpt);
+        }
+        report_end_array(rpt);
+
+        /* Transaction data */
+        if (node->is_built) {
+            report_add_hex(rpt, "unsigned_tx",
+                           node->unsigned_tx.data, node->unsigned_tx.len);
+            unsigned char display_txid[32];
+            memcpy(display_txid, node->txid, 32);
+            reverse_bytes(display_txid, 32);
+            report_add_hex(rpt, "txid", display_txid, 32);
+        }
+        if (node->is_signed) {
+            report_add_hex(rpt, "signed_tx",
+                           node->signed_tx.data, node->signed_tx.len);
+        }
+
+        report_end_section(rpt);
+    }
+    report_end_array(rpt);
+}
+
+/* Report channel state */
+static void report_channel_state(report_t *rpt, const char *label,
+                                  const lsp_channel_mgr_t *mgr) {
+    report_begin_section(rpt, label);
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        char key[16];
+        snprintf(key, sizeof(key), "channel_%zu", c);
+        report_begin_section(rpt, key);
+        const channel_t *ch = &mgr->entries[c].channel;
+        report_add_uint(rpt, "channel_id", mgr->entries[c].channel_id);
+        report_add_uint(rpt, "local_amount", ch->local_amount);
+        report_add_uint(rpt, "remote_amount", ch->remote_amount);
+        report_add_uint(rpt, "commitment_number", ch->commitment_number);
+        report_add_uint(rpt, "n_htlcs", ch->n_htlcs);
+        report_end_section(rpt);
+    }
+    report_end_section(rpt);
+}
+
 int main(int argc, char *argv[]) {
     int port = 9735;
     int regtest = 0;
@@ -127,6 +227,8 @@ int main(int argc, char *argv[]) {
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
     const char *seckey_hex = NULL;
+    const char *report_path = NULL;
+    const char *db_path = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -141,6 +243,10 @@ int main(int argc, char *argv[]) {
             seckey_hex = argv[++i];
         else if (strcmp(argv[i], "--payments") == 0 && i + 1 < argc)
             n_payments = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
+            report_path = argv[++i];
+        else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
+            db_path = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
             regtest = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -157,6 +263,29 @@ int main(int argc, char *argv[]) {
     if (n_clients < 1 || n_clients > LSP_MAX_CLIENTS) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
+    }
+
+    /* Initialize diagnostic report */
+    report_t rpt;
+    if (!report_init(&rpt, report_path)) {
+        fprintf(stderr, "Error: cannot open report file: %s\n", report_path);
+        return 1;
+    }
+    report_add_string(&rpt, "role", "lsp");
+    report_add_uint(&rpt, "n_clients", (uint64_t)n_clients);
+    report_add_uint(&rpt, "funding_sats", funding_sats);
+
+    /* Initialize persistence (optional) */
+    persist_t db;
+    int use_db = 0;
+    if (db_path) {
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "Error: cannot open database: %s\n", db_path);
+            report_close(&rpt);
+            return 1;
+        }
+        use_db = 1;
+        printf("LSP: persistence enabled (%s)\n", db_path);
     }
 
     /* Create LSP keypair */
@@ -208,6 +337,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("LSP: all %d clients connected\n", n_clients);
+
+    /* Report: participants */
+    report_begin_section(&rpt, "participants");
+    report_add_pubkey(&rpt, "lsp", ctx, &lsp.lsp_pubkey);
+    report_begin_array(&rpt, "clients");
+    for (size_t i = 0; i < lsp.n_clients; i++)
+        report_add_pubkey(&rpt, NULL, ctx, &lsp.client_pubkeys[i]);
+    report_end_array(&rpt);
+    report_end_section(&rpt);
+    report_flush(&rpt);
 
     if (g_shutdown) {
         lsp_abort_ceremony(&lsp, "LSP shutting down");
@@ -310,6 +449,16 @@ int main(int argc, char *argv[]) {
     printf("LSP: funding vout=%u, amount=%llu sats\n",
            funding_vout, (unsigned long long)funding_amount);
 
+    /* Report: funding */
+    report_begin_section(&rpt, "funding");
+    report_add_string(&rpt, "txid", funding_txid_hex);
+    report_add_uint(&rpt, "vout", funding_vout);
+    report_add_uint(&rpt, "amount_sats", funding_amount);
+    report_add_hex(&rpt, "script_pubkey", fund_spk, 34);
+    report_add_string(&rpt, "address", fund_addr);
+    report_end_section(&rpt);
+    report_flush(&rpt);
+
     /* === Phase 4: Run factory creation ceremony === */
     if (g_shutdown) {
         lsp_abort_ceremony(&lsp, "LSP shutting down");
@@ -329,6 +478,22 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp.factory.n_nodes);
+
+    /* Persist factory */
+    if (use_db) {
+        if (!persist_save_factory(&db, &lsp.factory, ctx, 0))
+            fprintf(stderr, "LSP: warning: failed to persist factory\n");
+    }
+
+    /* Report: factory tree */
+    report_begin_section(&rpt, "factory");
+    report_add_uint(&rpt, "n_nodes", lsp.factory.n_nodes);
+    report_add_uint(&rpt, "n_participants", lsp.factory.n_participants);
+    report_add_uint(&rpt, "step_blocks", lsp.factory.step_blocks);
+    report_add_uint(&rpt, "fee_per_tx", lsp.factory.fee_per_tx);
+    report_factory_tree(&rpt, ctx, &lsp.factory);
+    report_end_section(&rpt);
+    report_flush(&rpt);
 
     /* === Phase 4b: Channel Operations === */
     lsp_channel_mgr_t mgr;
@@ -351,6 +516,16 @@ int main(int argc, char *argv[]) {
         printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
                n_payments, n_payments * 2);
 
+        /* Persist initial channel state */
+        if (use_db) {
+            for (size_t c = 0; c < mgr.n_channels; c++)
+                persist_save_channel(&db, &mgr.entries[c].channel, 0, (uint32_t)c);
+        }
+
+        /* Report: channel init */
+        report_channel_state(&rpt, "channels_initial", &mgr);
+        report_flush(&rpt);
+
         if (!lsp_channels_run_event_loop(&mgr, &lsp, (size_t)(n_payments * 2))) {
             fprintf(stderr, "LSP: event loop failed\n");
             lsp_cleanup(&lsp);
@@ -360,6 +535,19 @@ int main(int argc, char *argv[]) {
         }
         channels_active = 1;
         printf("LSP: all %d payments processed\n", n_payments);
+
+        /* Persist updated channel balances */
+        if (use_db) {
+            for (size_t c = 0; c < mgr.n_channels; c++) {
+                const channel_t *ch = &mgr.entries[c].channel;
+                persist_update_channel_balance(&db, (uint32_t)c,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+        }
+
+        /* Report: channel state after payments */
+        report_channel_state(&rpt, "channels_after_payments", &mgr);
+        report_flush(&rpt);
     }
 
     /* === Phase 5: Cooperative close === */
@@ -405,6 +593,19 @@ int main(int argc, char *argv[]) {
     for (size_t i = 0; i < (size_t)n_clients; i++)
         printf("  Client %zu: %llu sats\n", i, (unsigned long long)close_outputs[i + 1].amount_sats);
 
+    /* Report: close outputs */
+    report_begin_section(&rpt, "close");
+    report_begin_array(&rpt, "outputs");
+    for (size_t i = 0; i < n_close_outputs; i++) {
+        report_begin_section(&rpt, NULL);
+        report_add_uint(&rpt, "amount_sats", close_outputs[i].amount_sats);
+        report_add_hex(&rpt, "script_pubkey",
+                       close_outputs[i].script_pubkey,
+                       close_outputs[i].script_pubkey_len);
+        report_end_section(&rpt);
+    }
+    report_end_array(&rpt);
+
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
 
@@ -441,6 +642,16 @@ int main(int argc, char *argv[]) {
     printf("LSP: cooperative close confirmed! txid: %s\n", close_txid);
     printf("LSP: SUCCESS — factory created and closed with %d clients\n", n_clients);
 
+    /* Report: close confirmation */
+    report_add_string(&rpt, "close_txid", close_txid);
+    report_add_uint(&rpt, "confirmations", (uint64_t)conf);
+    report_end_section(&rpt);  /* end "close" section */
+
+    report_add_string(&rpt, "result", "success");
+    report_close(&rpt);
+
+    if (use_db)
+        persist_close(&db);
     lsp_cleanup(&lsp);
     memset(lsp_seckey, 0, 32);
     secp256k1_context_destroy(ctx);

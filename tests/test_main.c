@@ -165,6 +165,15 @@ extern int test_channel_wire_framing(void);
 extern int test_regtest_intra_factory_payment(void);
 extern int test_regtest_multi_payment(void);
 
+/* Phase 13: Persistence (SQLite) */
+extern int test_persist_open_close(void);
+extern int test_persist_channel_round_trip(void);
+extern int test_persist_revocation_round_trip(void);
+extern int test_persist_htlc_round_trip(void);
+extern int test_persist_factory_round_trip(void);
+extern int test_persist_nonce_pool_round_trip(void);
+extern int test_persist_multi_channel(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -285,6 +294,15 @@ static void run_unit_tests(void) {
     RUN_TEST(test_channel_msg_round_trip);
     RUN_TEST(test_lsp_channel_init);
     RUN_TEST(test_channel_wire_framing);
+
+    printf("\n=== Persistence (Phase 13) ===\n");
+    RUN_TEST(test_persist_open_close);
+    RUN_TEST(test_persist_channel_round_trip);
+    RUN_TEST(test_persist_revocation_round_trip);
+    RUN_TEST(test_persist_htlc_round_trip);
+    RUN_TEST(test_persist_factory_round_trip);
+    RUN_TEST(test_persist_nonce_pool_round_trip);
+    RUN_TEST(test_persist_multi_channel);
 }
 
 static void run_regtest_tests(void) {

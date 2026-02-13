@@ -167,14 +167,22 @@ int client_handle_commitment_signed(int fd, channel_t *ch,
                                       const wire_msg_t *msg) {
     uint32_t channel_id;
     uint64_t commitment_number;
-    unsigned char sig[64];
+    unsigned char partial_sig32[32];
+    uint32_t nonce_index;
 
     if (!wire_parse_commitment_signed(msg->json, &channel_id,
-                                        &commitment_number, sig))
+                                        &commitment_number, partial_sig32,
+                                        &nonce_index))
         return 0;
 
-    /* In a real implementation, verify the commitment signature.
-       For PoC, we just advance state and send REVOKE_AND_ACK. */
+    /* Phase 12: Verify LSP's partial sig and aggregate into full sig.
+       The client now holds a valid, broadcastable commitment tx. */
+    unsigned char full_sig64[64];
+    if (!channel_verify_and_aggregate_commitment_sig(ch, partial_sig32,
+                                                       nonce_index, full_sig64)) {
+        fprintf(stderr, "Client: commitment sig verification/aggregation failed\n");
+        return 0;
+    }
 
     /* Get revocation secret for the old commitment */
     unsigned char rev_secret[32];
@@ -551,6 +559,68 @@ int client_run_with_channels(secp256k1_context *ctx,
             fprintf(stderr, "Client %u: channel init failed\n", my_index);
             goto fail;
         }
+
+        /* Phase 12: Nonce exchange for commitment signing */
+        /* Receive LSP's pubnonces */
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
+            msg.msg_type != MSG_CHANNEL_NONCES) {
+            fprintf(stderr, "Client %u: expected CHANNEL_NONCES from LSP\n", my_index);
+            if (msg.json) cJSON_Delete(msg.json);
+            goto fail;
+        }
+        {
+            uint32_t nonce_ch_id;
+            unsigned char lsp_nonces[MUSIG_NONCE_POOL_MAX][66];
+            size_t lsp_nonce_count;
+            if (!wire_parse_channel_nonces(msg.json, &nonce_ch_id,
+                                             lsp_nonces, MUSIG_NONCE_POOL_MAX,
+                                             &lsp_nonce_count)) {
+                fprintf(stderr, "Client %u: failed to parse LSP nonces\n", my_index);
+                cJSON_Delete(msg.json);
+                goto fail;
+            }
+            cJSON_Delete(msg.json);
+
+            /* Initialize client's nonce pool */
+            if (!channel_init_nonce_pool(&channel, lsp_nonce_count)) {
+                fprintf(stderr, "Client %u: nonce pool init failed\n", my_index);
+                goto fail;
+            }
+
+            /* Send client's pubnonces back to LSP */
+            size_t my_nonce_count = channel.local_nonce_pool.count;
+            unsigned char (*my_pubnonces_ser)[66] =
+                (unsigned char (*)[66])calloc(my_nonce_count, 66);
+            if (!my_pubnonces_ser) {
+                fprintf(stderr, "Client %u: alloc failed\n", my_index);
+                goto fail;
+            }
+            for (size_t i = 0; i < my_nonce_count; i++) {
+                musig_pubnonce_serialize(ctx,
+                    my_pubnonces_ser[i],
+                    &channel.local_nonce_pool.nonces[i].pubnonce);
+            }
+
+            cJSON *nonce_reply = wire_build_channel_nonces(
+                channel_id,
+                (const unsigned char (*)[66])my_pubnonces_ser,
+                my_nonce_count);
+            if (!wire_send(fd, MSG_CHANNEL_NONCES, nonce_reply)) {
+                fprintf(stderr, "Client %u: send CHANNEL_NONCES failed\n", my_index);
+                cJSON_Delete(nonce_reply);
+                free(my_pubnonces_ser);
+                goto fail;
+            }
+            cJSON_Delete(nonce_reply);
+            free(my_pubnonces_ser);
+
+            /* Store LSP's pubnonces */
+            channel_set_remote_pubnonces(&channel,
+                (const unsigned char (*)[66])lsp_nonces, lsp_nonce_count);
+        }
+
+        printf("Client %u: nonce exchange complete (%zu nonces)\n",
+               my_index, channel.remote_nonce_count);
 
         /* Call the channel callback */
         channel_cb(fd, &channel, my_index, ctx, user_data);

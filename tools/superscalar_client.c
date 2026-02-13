@@ -1,6 +1,8 @@
 #include "superscalar/client.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
+#include "superscalar/report.h"
+#include "superscalar/persist.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -9,6 +11,7 @@
 #include "cJSON.h"
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 
 #define MAX_ACTIONS 16
@@ -173,6 +176,9 @@ static void usage(const char *prog) {
         "  --host HOST                       LSP host (default 127.0.0.1)\n"
         "  --send DEST:AMOUNT:PREIMAGE_HEX   Send payment (can repeat)\n"
         "  --recv PREIMAGE_HEX               Receive payment (can repeat)\n"
+        "  --channels                        Expect channel phase (for when LSP uses --payments)\n"
+        "  --report PATH                     Write diagnostic JSON report to PATH\n"
+        "  --db PATH                         SQLite database for persistence (default: none)\n"
         "  --help                            Show this help\n",
         prog);
 }
@@ -181,6 +187,9 @@ int main(int argc, char *argv[]) {
     const char *seckey_hex = NULL;
     int port = 9735;
     const char *host = "127.0.0.1";
+    int expect_channels = 0;
+    const char *report_path = NULL;
+    const char *db_path = NULL;
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -192,6 +201,12 @@ int main(int argc, char *argv[]) {
             port = atoi(argv[++i]);
         else if (strcmp(argv[i], "--host") == 0 && i + 1 < argc)
             host = argv[++i];
+        else if (strcmp(argv[i], "--channels") == 0)
+            expect_channels = 1;
+        else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
+            report_path = argv[++i];
+        else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
+            db_path = argv[++i];
         else if (strcmp(argv[i], "--send") == 0 && i + 1 < argc) {
             if (n_actions >= MAX_ACTIONS) {
                 fprintf(stderr, "Too many actions (max %d)\n", MAX_ACTIONS);
@@ -252,6 +267,18 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
+    /* Initialize diagnostic report */
+    report_t rpt;
+    if (!report_init(&rpt, report_path)) {
+        fprintf(stderr, "Error: cannot open report file: %s\n", report_path);
+        return 1;
+    }
+    report_add_string(&rpt, "role", "client");
+    report_add_string(&rpt, "host", host);
+    report_add_uint(&rpt, "port", (uint64_t)port);
+    report_add_uint(&rpt, "n_actions", n_actions);
+    report_add_bool(&rpt, "expect_channels", expect_channels);
+
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
 
@@ -259,18 +286,64 @@ int main(int argc, char *argv[]) {
     if (!secp256k1_keypair_create(ctx, &kp, seckey)) {
         fprintf(stderr, "Invalid secret key\n");
         memset(seckey, 0, 32);
+        report_close(&rpt);
         return 1;
+    }
+
+    /* Report: client pubkey */
+    {
+        secp256k1_pubkey pk;
+        int ok_pk = secp256k1_keypair_pub(ctx, &pk, &kp);
+        if (ok_pk)
+            report_add_pubkey(&rpt, "pubkey", ctx, &pk);
     }
     memset(seckey, 0, 32);
 
-    int ok;
+    /* Report: scripted actions */
     if (n_actions > 0) {
+        report_begin_array(&rpt, "actions");
+        for (size_t i = 0; i < n_actions; i++) {
+            report_begin_section(&rpt, NULL);
+            report_add_string(&rpt, "type",
+                              actions[i].type == ACTION_SEND ? "send" : "recv");
+            if (actions[i].type == ACTION_SEND) {
+                report_add_uint(&rpt, "dest_client", actions[i].dest_client);
+                report_add_uint(&rpt, "amount_sats", actions[i].amount_sats);
+            }
+            report_add_hex(&rpt, "payment_hash", actions[i].payment_hash, 32);
+            report_end_section(&rpt);
+        }
+        report_end_array(&rpt);
+    }
+    report_flush(&rpt);
+
+    /* Initialize persistence (optional) */
+    persist_t db;
+    int use_db = 0;
+    if (db_path) {
+        if (!persist_open(&db, db_path)) {
+            fprintf(stderr, "Error: cannot open database: %s\n", db_path);
+            secp256k1_context_destroy(ctx);
+            report_close(&rpt);
+            return 1;
+        }
+        use_db = 1;
+        printf("Client: persistence enabled (%s)\n", db_path);
+    }
+
+    int ok;
+    if (n_actions > 0 || expect_channels) {
         multi_payment_data_t data = { actions, n_actions, 0 };
         ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data);
     } else {
         ok = client_run_ceremony(ctx, &kp, host, port);
     }
 
+    report_add_string(&rpt, "result", ok ? "success" : "failure");
+    report_close(&rpt);
+
+    if (use_db)
+        persist_close(&db);
     secp256k1_context_destroy(ctx);
     return ok ? 0 : 1;
 }

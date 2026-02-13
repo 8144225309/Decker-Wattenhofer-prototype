@@ -360,11 +360,13 @@ cJSON *wire_build_update_add_htlc(uint64_t htlc_id, uint64_t amount_msat,
 
 cJSON *wire_build_commitment_signed(uint32_t channel_id,
                                       uint64_t commitment_number,
-                                      const unsigned char *sig64) {
+                                      const unsigned char *partial_sig32,
+                                      uint32_t nonce_index) {
     cJSON *j = cJSON_CreateObject();
     cJSON_AddNumberToObject(j, "channel_id", channel_id);
     cJSON_AddNumberToObject(j, "commitment_number", (double)commitment_number);
-    wire_json_add_hex(j, "sig", sig64, 64);
+    wire_json_add_hex(j, "partial_sig", partial_sig32, 32);
+    cJSON_AddNumberToObject(j, "nonce_index", nonce_index);
     return j;
 }
 
@@ -400,6 +402,21 @@ cJSON *wire_build_update_fail_htlc(uint64_t htlc_id, const char *reason) {
 
 cJSON *wire_build_close_request(void) {
     return cJSON_CreateObject();
+}
+
+cJSON *wire_build_channel_nonces(uint32_t channel_id,
+                                   const unsigned char pubnonces[][66],
+                                   size_t count) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "channel_id", channel_id);
+    cJSON *arr = cJSON_CreateArray();
+    for (size_t i = 0; i < count; i++) {
+        char hex[133];
+        hex_encode(pubnonces[i], 66, hex);
+        cJSON_AddItemToArray(arr, cJSON_CreateString(hex));
+    }
+    cJSON_AddItemToObject(j, "pubnonces", arr);
+    return j;
 }
 
 /* --- Channel operation message parsers (Phase 10) --- */
@@ -439,15 +456,19 @@ int wire_parse_update_add_htlc(const cJSON *json, uint64_t *htlc_id,
 
 int wire_parse_commitment_signed(const cJSON *json, uint32_t *channel_id,
                                    uint64_t *commitment_number,
-                                   unsigned char *sig64) {
+                                   unsigned char *partial_sig32,
+                                   uint32_t *nonce_index) {
     cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
     cJSON *cn = cJSON_GetObjectItem(json, "commitment_number");
-    if (!ci || !cJSON_IsNumber(ci) || !cn || !cJSON_IsNumber(cn))
+    cJSON *ni = cJSON_GetObjectItem(json, "nonce_index");
+    if (!ci || !cJSON_IsNumber(ci) || !cn || !cJSON_IsNumber(cn) ||
+        !ni || !cJSON_IsNumber(ni))
         return 0;
-    if (wire_json_get_hex(json, "sig", sig64, 64) != 64)
+    if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32)
         return 0;
     *channel_id = (uint32_t)ci->valuedouble;
     *commitment_number = (uint64_t)cn->valuedouble;
+    *nonce_index = (uint32_t)ni->valuedouble;
     return 1;
 }
 
@@ -491,6 +512,27 @@ int wire_parse_update_fail_htlc(const cJSON *json, uint64_t *htlc_id,
             reason[0] = '\0';
         }
     }
+    return 1;
+}
+
+int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
+                                unsigned char pubnonces_out[][66],
+                                size_t max_nonces, size_t *count_out) {
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
+    cJSON *arr = cJSON_GetObjectItem(json, "pubnonces");
+    if (!ci || !cJSON_IsNumber(ci) || !arr || !cJSON_IsArray(arr))
+        return 0;
+    *channel_id = (uint32_t)ci->valuedouble;
+    size_t count = 0;
+    cJSON *item;
+    cJSON_ArrayForEach(item, arr) {
+        if (count >= max_nonces) break;
+        if (!cJSON_IsString(item)) continue;
+        if (hex_decode(item->valuestring, pubnonces_out[count], 66) != 66)
+            continue;
+        count++;
+    }
+    *count_out = count;
     return 1;
 }
 

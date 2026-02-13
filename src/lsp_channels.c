@@ -171,6 +171,10 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         memset(delayed_secret, 0, 32);
         memset(revocation_secret, 0, 32);
         memset(htlc_secret, 0, 32);
+
+        /* Initialize nonce pool for commitment signing (Phase 12) */
+        if (!channel_init_nonce_pool(&entry->channel, MUSIG_NONCE_POOL_MAX))
+            return 0;
     }
 
     return 1;
@@ -181,6 +185,8 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     for (size_t c = 0; c < mgr->n_channels; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
+
+        /* Send CHANNEL_READY */
         cJSON *msg = wire_build_channel_ready(
             entry->channel_id,
             entry->channel.local_amount * 1000,   /* sats → msat */
@@ -191,6 +197,59 @@ int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
             return 0;
         }
         cJSON_Delete(msg);
+
+        /* Phase 12: Send nonce pool pubnonces to client */
+        {
+            channel_t *ch = &entry->channel;
+            size_t nonce_count = ch->local_nonce_pool.count;
+            unsigned char (*pubnonces_ser)[66] =
+                (unsigned char (*)[66])calloc(nonce_count, 66);
+            if (!pubnonces_ser) return 0;
+
+            for (size_t i = 0; i < nonce_count; i++) {
+                musig_pubnonce_serialize(mgr->ctx,
+                    pubnonces_ser[i], &ch->local_nonce_pool.nonces[i].pubnonce);
+            }
+
+            cJSON *nonce_msg = wire_build_channel_nonces(
+                entry->channel_id, (const unsigned char (*)[66])pubnonces_ser,
+                nonce_count);
+            if (!wire_send(lsp->client_fds[c], MSG_CHANNEL_NONCES, nonce_msg)) {
+                fprintf(stderr, "LSP: failed to send CHANNEL_NONCES to client %zu\n", c);
+                cJSON_Delete(nonce_msg);
+                free(pubnonces_ser);
+                return 0;
+            }
+            cJSON_Delete(nonce_msg);
+            free(pubnonces_ser);
+        }
+
+        /* Wait for client's nonces */
+        {
+            wire_msg_t nonce_resp;
+            if (!wire_recv(lsp->client_fds[c], &nonce_resp) ||
+                nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
+                fprintf(stderr, "LSP: expected CHANNEL_NONCES from client %zu\n", c);
+                if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
+                return 0;
+            }
+
+            uint32_t resp_ch_id;
+            unsigned char client_nonces[MUSIG_NONCE_POOL_MAX][66];
+            size_t client_nonce_count;
+            if (!wire_parse_channel_nonces(nonce_resp.json, &resp_ch_id,
+                                             client_nonces, MUSIG_NONCE_POOL_MAX,
+                                             &client_nonce_count)) {
+                fprintf(stderr, "LSP: failed to parse client nonces\n");
+                cJSON_Delete(nonce_resp.json);
+                return 0;
+            }
+            cJSON_Delete(nonce_resp.json);
+
+            channel_set_remote_pubnonces(&entry->channel,
+                (const unsigned char (*)[66])client_nonces, client_nonce_count);
+        }
+
         entry->ready = 1;
     }
     return 1;
@@ -227,12 +286,17 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;  /* not a protocol error, just a payment failure */
     }
 
-    /* Send COMMITMENT_SIGNED to sender */
+    /* Send COMMITMENT_SIGNED to sender (real partial sig) */
     {
-        unsigned char dummy_sig[64] = {0};  /* simplified: no real sig for PoC */
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+            fprintf(stderr, "LSP: create partial sig failed for sender %zu\n", sender_idx);
+            return 0;
+        }
         cJSON *cs = wire_build_commitment_signed(
             mgr->entries[sender_idx].channel_id,
-            sender_ch->commitment_number, dummy_sig);
+            sender_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[sender_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
             return 0;
@@ -296,12 +360,17 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(fwd);
     }
 
-    /* Send COMMITMENT_SIGNED to dest */
+    /* Send COMMITMENT_SIGNED to dest (real partial sig) */
     {
-        unsigned char dummy_sig[64] = {0};
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx)) {
+            fprintf(stderr, "LSP: create partial sig failed for dest %zu\n", dest_idx);
+            return 0;
+        }
         cJSON *cs = wire_build_commitment_signed(
             mgr->entries[dest_idx].channel_id,
-            dest_ch->commitment_number, dummy_sig);
+            dest_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
             return 0;
@@ -353,12 +422,17 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    /* Send COMMITMENT_SIGNED to this client */
+    /* Send COMMITMENT_SIGNED to this client (real partial sig) */
     {
-        unsigned char dummy_sig[64] = {0};
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(ch, psig32, &nonce_idx)) {
+            fprintf(stderr, "LSP: create partial sig failed for client %zu\n", client_idx);
+            return 0;
+        }
         cJSON *cs = wire_build_commitment_signed(
             mgr->entries[client_idx].channel_id,
-            ch->commitment_number, dummy_sig);
+            ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[client_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
             return 0;
@@ -411,13 +485,20 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             wire_send(lsp->client_fds[s], MSG_UPDATE_FULFILL_HTLC, fwd);
             cJSON_Delete(fwd);
 
-            /* Send COMMITMENT_SIGNED */
-            unsigned char dummy_sig[64] = {0};
-            cJSON *cs = wire_build_commitment_signed(
-                mgr->entries[s].channel_id,
-                sender_ch->commitment_number, dummy_sig);
-            wire_send(lsp->client_fds[s], MSG_COMMITMENT_SIGNED, cs);
-            cJSON_Delete(cs);
+            /* Send COMMITMENT_SIGNED (real partial sig) */
+            {
+                unsigned char psig32[32];
+                uint32_t nonce_idx;
+                if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx)) {
+                    fprintf(stderr, "LSP: create partial sig failed for back-propagation to %zu\n", s);
+                    continue;
+                }
+                cJSON *cs = wire_build_commitment_signed(
+                    mgr->entries[s].channel_id,
+                    sender_ch->commitment_number, psig32, nonce_idx);
+                wire_send(lsp->client_fds[s], MSG_COMMITMENT_SIGNED, cs);
+                cJSON_Delete(cs);
+            }
 
             /* Wait for REVOKE_AND_ACK */
             wire_msg_t ack_msg;

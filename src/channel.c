@@ -198,10 +198,52 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
                                     local_funding_secret32))
         return 0;
 
-    /* MuSig key aggregation: order = [local, remote] */
-    secp256k1_pubkey pks[2] = { *local_funding_pubkey, *remote_funding_pubkey };
-    if (!musig_aggregate_keys(ctx, &ch->funding_keyagg, pks, 2))
-        return 0;
+    /* MuSig key aggregation: try both orderings and pick the one matching
+       funding_spk. This ensures the channel's keyagg matches the factory's
+       key ordering regardless of which side (LSP or client) we are. */
+    {
+        int ordering_found = 0;
+        secp256k1_pubkey orderings[2][2] = {
+            { *local_funding_pubkey, *remote_funding_pubkey },
+            { *remote_funding_pubkey, *local_funding_pubkey }
+        };
+
+        for (int order = 0; order < 2 && !ordering_found; order++) {
+            musig_keyagg_t ka;
+            if (!musig_aggregate_keys(ctx, &ka, orderings[order], 2))
+                continue;
+
+            /* Compute taproot-tweaked P2TR SPK from this keyagg */
+            unsigned char internal_ser[32];
+            secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+            unsigned char twk[32];
+            sha256_tagged("TapTweak", internal_ser, 32, twk);
+
+            secp256k1_pubkey tweaked_full;
+            if (!secp256k1_xonly_pubkey_tweak_add(ctx, &tweaked_full,
+                                                    &ka.agg_pubkey, twk))
+                continue;
+            secp256k1_xonly_pubkey tweaked_xonly;
+            secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL,
+                                                &tweaked_full);
+            unsigned char test_spk[34];
+            build_p2tr_script_pubkey(test_spk, &tweaked_xonly);
+
+            if (funding_spk_len == 34 && memcmp(test_spk, funding_spk, 34) == 0) {
+                ch->funding_keyagg = ka;
+                ch->local_funding_signer_idx = (order == 0) ? 0 : 1;
+                ordering_found = 1;
+            }
+        }
+
+        if (!ordering_found) {
+            /* Fallback: use [local, remote] (for tests not using factory SPKs) */
+            secp256k1_pubkey pks[2] = { *local_funding_pubkey, *remote_funding_pubkey };
+            if (!musig_aggregate_keys(ctx, &ch->funding_keyagg, pks, 2))
+                return 0;
+            ch->local_funding_signer_idx = 0;
+        }
+    }
 
     memcpy(ch->funding_txid, funding_txid, 32);
     ch->funding_vout = funding_vout;
@@ -434,10 +476,16 @@ int channel_sign_commitment(const channel_t *ch,
                                   ch->funding_amount, 0xFFFFFFFE))
         return 0;
 
-    /* Sign with MuSig2 (all-local for testing) */
+    /* Sign with MuSig2 (all-local for testing).
+       Keypair ordering must match the keyagg ordering. */
     secp256k1_keypair kps[2];
-    kps[0] = ch->local_funding_keypair;
-    kps[1] = *remote_keypair;
+    if (ch->local_funding_signer_idx == 0) {
+        kps[0] = ch->local_funding_keypair;
+        kps[1] = *remote_keypair;
+    } else {
+        kps[0] = *remote_keypair;
+        kps[1] = ch->local_funding_keypair;
+    }
 
     musig_keyagg_t keyagg_copy = ch->funding_keyagg;
     unsigned char sig64[64];
@@ -602,6 +650,193 @@ int channel_build_penalty_tx(const channel_t *ch,
     return 1;
 }
 
+/* ---- Distributed commitment signing (Phase 12) ---- */
+
+int channel_init_nonce_pool(channel_t *ch, size_t count) {
+    unsigned char seckey[32];
+    memcpy(seckey, ch->local_funding_secret, 32);
+    secp256k1_pubkey pk;
+    secp256k1_ec_pubkey_create(ch->ctx, &pk, seckey);
+    int ok = musig_nonce_pool_generate(ch->ctx, &ch->local_nonce_pool,
+                                         count, seckey, &pk,
+                                         &ch->funding_keyagg.cache);
+    memset(seckey, 0, 32);
+    ch->remote_nonce_count = 0;
+    ch->remote_nonce_next = 0;
+    return ok;
+}
+
+int channel_set_remote_pubnonces(channel_t *ch,
+                                   const unsigned char pubnonces[][66],
+                                   size_t count) {
+    if (count > MUSIG_NONCE_POOL_MAX) count = MUSIG_NONCE_POOL_MAX;
+    for (size_t i = 0; i < count; i++)
+        memcpy(ch->remote_pubnonces_ser[i], pubnonces[i], 66);
+    ch->remote_nonce_count = count;
+    ch->remote_nonce_next = 0;
+    return 1;
+}
+
+int channel_create_commitment_partial_sig(
+    channel_t *ch,
+    unsigned char *partial_sig32_out,
+    uint32_t *nonce_index_out)
+{
+    /* 1. Determine nonce index = remote_nonce_next (consumed in order) */
+    uint32_t nidx = (uint32_t)ch->remote_nonce_next;
+    if (nidx >= ch->remote_nonce_count) return 0;
+
+    /* 2. Build commitment tx and compute sighash */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                  0, ch->funding_spk, ch->funding_spk_len,
+                                  ch->funding_amount, 0xFFFFFFFE)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    /* 3. Draw local nonce */
+    secp256k1_musig_secnonce *my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_nonce_pool_next(&ch->local_nonce_pool, &my_secnonce, &my_pubnonce))
+        return 0;
+
+    /* 4. Parse peer's pubnonce at this index */
+    secp256k1_musig_pubnonce peer_pubnonce;
+    if (!musig_pubnonce_parse(ch->ctx, &peer_pubnonce,
+                               ch->remote_pubnonces_ser[nidx]))
+        return 0;
+
+    /* 5. Set up MuSig2 signing session (2-of-2) */
+    musig_signing_session_t session;
+    musig_session_init(&session, &ch->funding_keyagg, 2);
+
+    /* Place nonces in correct signer order */
+    if (ch->local_funding_signer_idx == 0) {
+        musig_session_set_pubnonce(&session, 0, &my_pubnonce);
+        musig_session_set_pubnonce(&session, 1, &peer_pubnonce);
+    } else {
+        musig_session_set_pubnonce(&session, 0, &peer_pubnonce);
+        musig_session_set_pubnonce(&session, 1, &my_pubnonce);
+    }
+
+    /* Finalize with key-path-only taproot tweak (merkle_root = NULL) */
+    if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, NULL, NULL))
+        return 0;
+
+    /* 6. Create partial sig */
+    secp256k1_musig_partial_sig psig;
+    if (!musig_create_partial_sig(ch->ctx, &psig, my_secnonce,
+                                    &ch->local_funding_keypair, &session))
+        return 0;
+
+    /* 7. Serialize */
+    if (!musig_partial_sig_serialize(ch->ctx, partial_sig32_out, &psig))
+        return 0;
+
+    *nonce_index_out = nidx;
+    ch->remote_nonce_next++;
+    return 1;
+}
+
+int channel_verify_and_aggregate_commitment_sig(
+    channel_t *ch,
+    const unsigned char *peer_partial_sig32,
+    uint32_t peer_nonce_index,
+    unsigned char *full_sig64_out)
+{
+    /* 1. Build commitment tx and compute sighash */
+    tx_buf_t unsigned_tx;
+    tx_buf_init(&unsigned_tx, 512);
+    unsigned char txid[32];
+    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+
+    unsigned char sighash[32];
+    if (!compute_taproot_sighash(sighash, unsigned_tx.data, unsigned_tx.len,
+                                  0, ch->funding_spk, ch->funding_spk_len,
+                                  ch->funding_amount, 0xFFFFFFFE)) {
+        tx_buf_free(&unsigned_tx);
+        return 0;
+    }
+    tx_buf_free(&unsigned_tx);
+
+    /* 2. Draw local nonce at peer_nonce_index.
+       We consume nonces in order, so this should be our next nonce. */
+    secp256k1_musig_secnonce *my_secnonce;
+    secp256k1_musig_pubnonce my_pubnonce;
+    if (!musig_nonce_pool_next(&ch->local_nonce_pool, &my_secnonce, &my_pubnonce))
+        return 0;
+
+    /* 3. Parse peer's pubnonce at peer_nonce_index */
+    if (peer_nonce_index >= ch->remote_nonce_count) return 0;
+    secp256k1_musig_pubnonce peer_pubnonce;
+    if (!musig_pubnonce_parse(ch->ctx, &peer_pubnonce,
+                               ch->remote_pubnonces_ser[peer_nonce_index]))
+        return 0;
+
+    /* 4. Set up MuSig2 signing session */
+    musig_signing_session_t session;
+    musig_session_init(&session, &ch->funding_keyagg, 2);
+
+    int peer_signer_idx = 1 - ch->local_funding_signer_idx;
+
+    if (ch->local_funding_signer_idx == 0) {
+        musig_session_set_pubnonce(&session, 0, &my_pubnonce);
+        musig_session_set_pubnonce(&session, 1, &peer_pubnonce);
+    } else {
+        musig_session_set_pubnonce(&session, 0, &peer_pubnonce);
+        musig_session_set_pubnonce(&session, 1, &my_pubnonce);
+    }
+
+    if (!musig_session_finalize_nonces(ch->ctx, &session, sighash, NULL, NULL))
+        return 0;
+
+    /* 5. Parse peer's partial sig */
+    secp256k1_musig_partial_sig peer_psig;
+    if (!musig_partial_sig_parse(ch->ctx, &peer_psig, peer_partial_sig32))
+        return 0;
+
+    /* 6. Verify peer's partial sig */
+    secp256k1_pubkey peer_pubkey = ch->remote_funding_pubkey;
+    if (!musig_verify_partial_sig(ch->ctx, &peer_psig, &peer_pubnonce,
+                                    &peer_pubkey, &session))
+        return 0;
+
+    /* 7. Create our own partial sig */
+    secp256k1_musig_partial_sig my_psig;
+    if (!musig_create_partial_sig(ch->ctx, &my_psig, my_secnonce,
+                                    &ch->local_funding_keypair, &session))
+        return 0;
+
+    /* 8. Aggregate both partial sigs in correct order */
+    secp256k1_musig_partial_sig sigs[2];
+    if (ch->local_funding_signer_idx == 0) {
+        sigs[0] = my_psig;
+        sigs[1] = peer_psig;
+    } else {
+        sigs[0] = peer_psig;
+        sigs[1] = my_psig;
+    }
+
+    if (!musig_aggregate_partial_sigs(ch->ctx, full_sig64_out, &session, sigs, 2))
+        return 0;
+
+    ch->remote_nonce_next++;
+    return 1;
+}
+
 /* ---- HTLC basepoints ---- */
 
 void channel_set_local_htlc_basepoint(channel_t *ch,
@@ -746,8 +981,13 @@ int channel_build_cooperative_close_tx(
 
     /* 3. Sign with 2-of-2 MuSig (same pattern as channel_sign_commitment) */
     secp256k1_keypair kps[2];
-    kps[0] = ch->local_funding_keypair;
-    kps[1] = *remote_keypair;
+    if (ch->local_funding_signer_idx == 0) {
+        kps[0] = ch->local_funding_keypair;
+        kps[1] = *remote_keypair;
+    } else {
+        kps[0] = *remote_keypair;
+        kps[1] = ch->local_funding_keypair;
+    }
 
     musig_keyagg_t keyagg_copy = ch->funding_keyagg;
     unsigned char sig64[64];
