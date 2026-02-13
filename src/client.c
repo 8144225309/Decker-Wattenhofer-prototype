@@ -211,6 +211,10 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
                            cltv_expiry, &new_id))
         return 0;
 
+    /* Override locally-assigned ID with the wire htlc_id so that when we
+       send FULFILL_HTLC back, we reference the LSP's ID for this HTLC. */
+    ch->htlcs[ch->n_htlcs - 1].id = htlc_id;
+
     return 1;
 }
 

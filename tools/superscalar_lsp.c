@@ -1,4 +1,5 @@
 #include "superscalar/lsp.h"
+#include "superscalar/lsp_channels.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/regtest.h"
 #include <stdio.h>
@@ -32,6 +33,7 @@ static void usage(const char *prog) {
         "  --amount SATS       Funding amount in satoshis (default 100000)\n"
         "  --step-blocks N     DW step blocks (default 10)\n"
         "  --seckey HEX        LSP secret key (32-byte hex, default: deterministic)\n"
+        "  --payments N        Number of HTLC payments to process (default 0)\n"
         "  --regtest           Use regtest (required)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
@@ -121,6 +123,7 @@ int main(int argc, char *argv[]) {
     int port = 9735;
     int regtest = 0;
     int n_clients = 4;
+    int n_payments = 0;
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
     const char *seckey_hex = NULL;
@@ -136,6 +139,8 @@ int main(int argc, char *argv[]) {
             step_blocks = (uint16_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--seckey") == 0 && i + 1 < argc)
             seckey_hex = argv[++i];
+        else if (strcmp(argv[i], "--payments") == 0 && i + 1 < argc)
+            n_payments = atoi(argv[++i]);
         else if (strcmp(argv[i], "--regtest") == 0)
             regtest = 1;
         else if (strcmp(argv[i], "--help") == 0) {
@@ -175,7 +180,7 @@ int main(int argc, char *argv[]) {
         memset(lsp_seckey, 0, 32);
         return 1;
     }
-    memset(lsp_seckey, 0, 32);
+    /* Note: lsp_seckey zeroed at cleanup — needed for lsp_channels_init() */
 
     /* Initialize regtest */
     regtest_t rt;
@@ -325,31 +330,85 @@ int main(int argc, char *argv[]) {
     }
     printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp.factory.n_nodes);
 
+    /* === Phase 4b: Channel Operations === */
+    lsp_channel_mgr_t mgr;
+    int channels_active = 0;
+    if (n_payments > 0) {
+        if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
+            fprintf(stderr, "LSP: channel init failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        if (!lsp_channels_send_ready(&mgr, &lsp)) {
+            fprintf(stderr, "LSP: send CHANNEL_READY failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
+               n_payments, n_payments * 2);
+
+        if (!lsp_channels_run_event_loop(&mgr, &lsp, (size_t)(n_payments * 2))) {
+            fprintf(stderr, "LSP: event loop failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        channels_active = 1;
+        printf("LSP: all %d payments processed\n", n_payments);
+    }
+
     /* === Phase 5: Cooperative close === */
     if (g_shutdown) {
         lsp_abort_ceremony(&lsp, "LSP shutting down");
         lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);
         return 1;
     }
     printf("LSP: starting cooperative close...\n");
 
-    uint64_t close_total = funding_amount - 500;  /* fee */
-    uint64_t per_party = close_total / n_total;
-
     tx_output_t close_outputs[FACTORY_MAX_SIGNERS];
-    for (size_t i = 0; i < n_total; i++) {
-        close_outputs[i].amount_sats = per_party;
-        memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
-        close_outputs[i].script_pubkey_len = 34;
+    size_t n_close_outputs;
+
+    if (channels_active) {
+        n_close_outputs = lsp_channels_build_close_outputs(&mgr, &lsp.factory,
+                                                            close_outputs, 500);
+        if (n_close_outputs == 0) {
+            fprintf(stderr, "LSP: build close outputs failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    } else {
+        /* No payments — equal split (original behavior) */
+        uint64_t close_total = funding_amount - 500;  /* fee */
+        uint64_t per_party = close_total / n_total;
+        for (size_t i = 0; i < n_total; i++) {
+            close_outputs[i].amount_sats = per_party;
+            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+            close_outputs[i].script_pubkey_len = 34;
+        }
+        /* Give remainder to last output */
+        close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+        n_close_outputs = n_total;
     }
-    /* Give remainder to last output */
-    close_outputs[n_total - 1].amount_sats = close_total - per_party * (n_total - 1);
+
+    /* Print final balances */
+    printf("LSP: Close outputs:\n");
+    printf("  LSP:      %llu sats\n", (unsigned long long)close_outputs[0].amount_sats);
+    for (size_t i = 0; i < (size_t)n_clients; i++)
+        printf("  Client %zu: %llu sats\n", i, (unsigned long long)close_outputs[i + 1].amount_sats);
 
     tx_buf_t close_tx;
     tx_buf_init(&close_tx, 512);
 
-    if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_total)) {
+    if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, n_close_outputs)) {
         fprintf(stderr, "LSP: cooperative close failed\n");
         tx_buf_free(&close_tx);
         lsp_cleanup(&lsp);
@@ -383,6 +442,7 @@ int main(int argc, char *argv[]) {
     printf("LSP: SUCCESS — factory created and closed with %d clients\n", n_clients);
 
     lsp_cleanup(&lsp);
+    memset(lsp_seckey, 0, 32);
     secp256k1_context_destroy(ctx);
     return 0;
 }

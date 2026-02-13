@@ -488,13 +488,15 @@ size_t lsp_channels_build_close_outputs(const lsp_channel_mgr_t *mgr,
                                          uint64_t close_fee) {
     if (!mgr || !factory || !outputs) return 0;
 
-    /* Output 0: LSP gets sum of all local_amounts minus close_fee */
-    uint64_t lsp_total = 0;
+    /* Output 0: LSP gets factory_funding - sum(client_remotes) - close_fee.
+       In a cooperative close that bypasses the tree, the LSP recovers the
+       tree transaction fees (funding_amount - sum_of_leaf_outputs). */
+    uint64_t client_total = 0;
     for (size_t c = 0; c < mgr->n_channels; c++)
-        lsp_total += mgr->entries[c].channel.local_amount;
+        client_total += mgr->entries[c].channel.remote_amount;
 
-    if (lsp_total < close_fee) return 0;
-    lsp_total -= close_fee;
+    if (factory->funding_amount_sats < client_total + close_fee) return 0;
+    uint64_t lsp_total = factory->funding_amount_sats - client_total - close_fee;
 
     outputs[0].amount_sats = lsp_total;
     memcpy(outputs[0].script_pubkey, factory->funding_spk, factory->funding_spk_len);
