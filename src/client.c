@@ -1,0 +1,730 @@
+#include "superscalar/client.h"
+#include "superscalar/wire.h"
+#include "superscalar/factory.h"
+#include "superscalar/musig.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+extern void hex_encode(const unsigned char *data, size_t len, char *out);
+extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+extern void reverse_bytes(unsigned char *data, size_t len);
+extern void sha256(const unsigned char *, size_t, unsigned char *);
+
+/* Returns 1 if message is MSG_ERROR (and prints it), 0 otherwise */
+static int check_msg_error(const wire_msg_t *msg) {
+    if (msg->msg_type == MSG_ERROR) {
+        cJSON *m = cJSON_GetObjectItem(msg->json, "message");
+        fprintf(stderr, "Client: LSP error: %s\n",
+                (m && cJSON_IsString(m)) ? m->valuestring : "(unknown)");
+        return 1;
+    }
+    return 0;
+}
+
+/* Initialize a client-side channel from factory leaf outputs.
+   Mirrors the LSP's lsp_channels_init logic. */
+static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
+                                 const factory_t *factory,
+                                 const secp256k1_keypair *keypair,
+                                 uint32_t my_index) {
+    /* Map client index to leaf output */
+    size_t client_idx = (size_t)(my_index - 1);  /* my_index is 1-based */
+    size_t node_idx;
+    uint32_t vout;
+    if (client_idx < 2) {
+        node_idx = 4;
+        vout = (uint32_t)client_idx;
+    } else {
+        node_idx = 5;
+        vout = (uint32_t)(client_idx - 2);
+    }
+
+    const factory_node_t *state_node = &factory->nodes[node_idx];
+    if (vout >= state_node->n_outputs) return 0;
+
+    const unsigned char *funding_txid = state_node->txid;
+    uint64_t funding_amount = state_node->outputs[vout].amount_sats;
+    const unsigned char *funding_spk = state_node->outputs[vout].script_pubkey;
+    size_t funding_spk_len = state_node->outputs[vout].script_pubkey_len;
+
+    /* Client is "local", LSP is "remote" (from client's perspective) */
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    unsigned char my_seckey[32];
+    secp256k1_keypair_sec(ctx, my_seckey, keypair);
+
+    /* LSP pubkey (participant 0) */
+    const secp256k1_pubkey *lsp_pubkey = &factory->pubkeys[0];
+
+    uint64_t local_amount = funding_amount / 2;
+    uint64_t remote_amount = funding_amount - local_amount;
+
+    /* From client perspective: local = client, remote = LSP.
+       But channel balances should match LSP's view. The LSP has:
+         lsp.local_amount = funding/2, lsp.remote_amount = funding - funding/2
+       Client should have the mirror:
+         client.local_amount = funding - funding/2 (= lsp.remote_amount)
+         client.remote_amount = funding/2 (= lsp.local_amount) */
+
+    if (!channel_init(ch, ctx, my_seckey, &my_pubkey, lsp_pubkey,
+                       funding_txid, vout, funding_amount,
+                       funding_spk, funding_spk_len,
+                       remote_amount,   /* client's local = LSP's remote */
+                       local_amount,    /* client's remote = LSP's local */
+                       CHANNEL_DEFAULT_CSV_DELAY)) {
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Set up basepoints using same deterministic scheme as LSP expects.
+       Client's "local" basepoints come from the client pubkey.
+       Client's "remote" basepoints come from the LSP's derivation. */
+
+    /* Client local basepoints (from client pubkey — same scheme LSP uses for "remote") */
+    unsigned char client_pk_ser[33];
+    size_t pk_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, client_pk_ser, &pk_len, &my_pubkey,
+                                   SECP256K1_EC_COMPRESSED);
+    unsigned char pay_sec[32], delay_sec[32], revoc_sec[32], htlc_sec[32];
+    {
+        unsigned char buf[33 + 16];
+        memcpy(buf, client_pk_ser, 33);
+        memcpy(buf + 33, "payment\0", 8); sha256(buf, 41, pay_sec);
+        memcpy(buf + 33, "delayed\0", 8); sha256(buf, 41, delay_sec);
+        memcpy(buf + 33, "revocatn", 8); sha256(buf, 41, revoc_sec);
+        memcpy(buf + 33, "htlcbase", 8); sha256(buf, 41, htlc_sec);
+    }
+    channel_set_local_basepoints(ch, pay_sec, delay_sec, revoc_sec);
+    channel_set_local_htlc_basepoint(ch, htlc_sec);
+
+    /* Client remote basepoints (LSP's derivation from lsp_seckey + client_idx).
+       We don't know the LSP's secret key, but we can derive the same public keys.
+       The LSP derives from SHA256(lsp_seckey || tag || client_idx).
+       We don't have lsp_seckey, so we compute public keys from the LSP's pubkey
+       using the same scheme the LSP uses.
+
+       PROBLEM: We can't derive the same secret keys as the LSP.
+       SOLUTION: For PoC, we don't actually need to verify commitment signatures
+       (we use dummy sigs). The basepoints are only needed for penalty enforcement
+       which isn't exercised in this PoC. Set them to dummy values derived from
+       the LSP pubkey so the structure is valid. */
+    unsigned char lsp_pk_ser[33];
+    pk_len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, lsp_pk_ser, &pk_len, lsp_pubkey,
+                                   SECP256K1_EC_COMPRESSED);
+    unsigned char rpay[32], rdelay[32], rrevoc[32], rhtlc[32];
+    {
+        unsigned char buf[33 + 16];
+        memcpy(buf, lsp_pk_ser, 33);
+        memcpy(buf + 33, "payment\0", 8); sha256(buf, 41, rpay);
+        memcpy(buf + 33, "delayed\0", 8); sha256(buf, 41, rdelay);
+        memcpy(buf + 33, "revocatn", 8); sha256(buf, 41, rrevoc);
+        memcpy(buf + 33, "htlcbase", 8); sha256(buf, 41, rhtlc);
+    }
+    secp256k1_pubkey rpay_pk, rdelay_pk, rrevoc_pk, rhtlc_pk;
+    secp256k1_ec_pubkey_create(ctx, &rpay_pk, rpay);
+    secp256k1_ec_pubkey_create(ctx, &rdelay_pk, rdelay);
+    secp256k1_ec_pubkey_create(ctx, &rrevoc_pk, rrevoc);
+    secp256k1_ec_pubkey_create(ctx, &rhtlc_pk, rhtlc);
+    channel_set_remote_basepoints(ch, &rpay_pk, &rdelay_pk, &rrevoc_pk);
+    channel_set_remote_htlc_basepoint(ch, &rhtlc_pk);
+
+    /* Shachain seed (client side) */
+    unsigned char seed[32];
+    {
+        unsigned char buf[33];
+        memcpy(buf, client_pk_ser, 33);
+        sha256(buf, 33, seed);
+    }
+    channel_set_shachain_seed(ch, seed);
+
+    memset(my_seckey, 0, 32);
+    memset(pay_sec, 0, 32);
+    memset(delay_sec, 0, 32);
+    memset(revoc_sec, 0, 32);
+    memset(htlc_sec, 0, 32);
+    return 1;
+}
+
+/* --- Channel message handlers --- */
+
+int client_send_payment(int fd, uint64_t amount_sats,
+                         const unsigned char *payment_hash32,
+                         uint32_t cltv_expiry, uint32_t dest_client) {
+    cJSON *msg = wire_build_update_add_htlc(0, amount_sats * 1000,
+                                              payment_hash32, cltv_expiry);
+    /* Add dest_client extension field */
+    cJSON_AddNumberToObject(msg, "dest_client", dest_client);
+    int ok = wire_send(fd, MSG_UPDATE_ADD_HTLC, msg);
+    cJSON_Delete(msg);
+    return ok;
+}
+
+int client_handle_commitment_signed(int fd, channel_t *ch,
+                                      secp256k1_context *ctx,
+                                      const wire_msg_t *msg) {
+    uint32_t channel_id;
+    uint64_t commitment_number;
+    unsigned char sig[64];
+
+    if (!wire_parse_commitment_signed(msg->json, &channel_id,
+                                        &commitment_number, sig))
+        return 0;
+
+    /* In a real implementation, verify the commitment signature.
+       For PoC, we just advance state and send REVOKE_AND_ACK. */
+
+    /* Get revocation secret for the old commitment */
+    unsigned char rev_secret[32];
+    if (ch->commitment_number > 0) {
+        channel_get_revocation_secret(ch, ch->commitment_number - 1, rev_secret);
+    } else {
+        memset(rev_secret, 0, 32);
+    }
+
+    /* Get next per-commitment point */
+    secp256k1_pubkey next_pcp;
+    channel_get_per_commitment_point(ch, ch->commitment_number + 1, &next_pcp);
+
+    cJSON *ack = wire_build_revoke_and_ack(channel_id, rev_secret, ctx, &next_pcp);
+    int ok = wire_send(fd, MSG_REVOKE_AND_ACK, ack);
+    cJSON_Delete(ack);
+    memset(rev_secret, 0, 32);
+    return ok;
+}
+
+int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
+    uint64_t htlc_id, amount_msat;
+    unsigned char payment_hash[32];
+    uint32_t cltv_expiry;
+
+    if (!wire_parse_update_add_htlc(msg->json, &htlc_id, &amount_msat,
+                                      payment_hash, &cltv_expiry))
+        return 0;
+
+    uint64_t amount_sats = amount_msat / 1000;
+    uint64_t new_id;
+    /* From client's perspective, LSP offered this HTLC to us = received HTLC */
+    if (!channel_add_htlc(ch, HTLC_RECEIVED, amount_sats, payment_hash,
+                           cltv_expiry, &new_id))
+        return 0;
+
+    return 1;
+}
+
+int client_fulfill_payment(int fd, channel_t *ch,
+                             uint64_t htlc_id,
+                             const unsigned char *preimage32) {
+    /* Fulfill locally */
+    if (!channel_fulfill_htlc(ch, htlc_id, preimage32))
+        return 0;
+
+    /* Send FULFILL_HTLC to LSP */
+    cJSON *msg = wire_build_update_fulfill_htlc(htlc_id, preimage32);
+    int ok = wire_send(fd, MSG_UPDATE_FULFILL_HTLC, msg);
+    cJSON_Delete(msg);
+    return ok;
+}
+
+/* --- Main ceremony (factory creation + optional channels + close) --- */
+
+int client_run_with_channels(secp256k1_context *ctx,
+                              const secp256k1_keypair *keypair,
+                              const char *host, int port,
+                              client_channel_cb_t channel_cb,
+                              void *user_data) {
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    /* Connect to LSP */
+    int fd = wire_connect(host, port);
+    if (fd < 0) {
+        fprintf(stderr, "Client: connect failed\n");
+        return 0;
+    }
+
+    /* Send HELLO */
+    cJSON *hello = wire_build_hello(ctx, &my_pubkey);
+    if (!wire_send(fd, MSG_HELLO, hello)) {
+        fprintf(stderr, "Client: send HELLO failed\n");
+        cJSON_Delete(hello);
+        wire_close(fd);
+        return 0;
+    }
+    cJSON_Delete(hello);
+
+    /* Receive HELLO_ACK */
+    wire_msg_t msg;
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_HELLO_ACK) {
+        fprintf(stderr, "Client: expected HELLO_ACK\n");
+        if (msg.json) cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+
+    cJSON *pi_item = cJSON_GetObjectItem(msg.json, "participant_index");
+    cJSON *all_pk_arr = cJSON_GetObjectItem(msg.json, "all_pubkeys");
+    if (!pi_item || !cJSON_IsNumber(pi_item) ||
+        !all_pk_arr || !cJSON_IsArray(all_pk_arr)) {
+        fprintf(stderr, "Client: malformed HELLO_ACK\n");
+        cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+    uint32_t my_index = (uint32_t)pi_item->valuedouble;
+    size_t n_participants = (size_t)cJSON_GetArraySize(all_pk_arr);
+    if (n_participants < 2 || n_participants > FACTORY_MAX_SIGNERS) {
+        fprintf(stderr, "Client: bad participant count %zu\n", n_participants);
+        cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+
+    secp256k1_pubkey all_pubkeys[FACTORY_MAX_SIGNERS];
+    for (size_t i = 0; i < n_participants; i++) {
+        cJSON *pk_hex = cJSON_GetArrayItem(all_pk_arr, (int)i);
+        if (!pk_hex || !cJSON_IsString(pk_hex)) {
+            fprintf(stderr, "Client: bad pubkey entry %zu\n", i);
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            return 0;
+        }
+        unsigned char pk_buf[33];
+        if (hex_decode(pk_hex->valuestring, pk_buf, 33) != 33 ||
+            !secp256k1_ec_pubkey_parse(ctx, &all_pubkeys[i], pk_buf, 33)) {
+            fprintf(stderr, "Client: invalid pubkey %zu\n", i);
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            return 0;
+        }
+    }
+    cJSON_Delete(msg.json);
+
+    /* Receive FACTORY_PROPOSE */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_PROPOSE) {
+        fprintf(stderr, "Client: expected FACTORY_PROPOSE\n");
+        if (msg.json) cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+
+    /* Parse proposal */
+    {
+        cJSON *fv = cJSON_GetObjectItem(msg.json, "funding_vout");
+        cJSON *fa = cJSON_GetObjectItem(msg.json, "funding_amount");
+        cJSON *sb = cJSON_GetObjectItem(msg.json, "step_blocks");
+        cJSON *sp = cJSON_GetObjectItem(msg.json, "states_per_layer");
+        cJSON *ct = cJSON_GetObjectItem(msg.json, "cltv_timeout");
+        cJSON *fp = cJSON_GetObjectItem(msg.json, "fee_per_tx");
+        if (!fv || !cJSON_IsNumber(fv) || !fa || !cJSON_IsNumber(fa) ||
+            !sb || !cJSON_IsNumber(sb) || !sp || !cJSON_IsNumber(sp) ||
+            !ct || !cJSON_IsNumber(ct) || !fp || !cJSON_IsNumber(fp)) {
+            fprintf(stderr, "Client: malformed FACTORY_PROPOSE\n");
+            cJSON_Delete(msg.json);
+            wire_close(fd);
+            return 0;
+        }
+    }
+
+    unsigned char funding_txid[32];
+    wire_json_get_hex(msg.json, "funding_txid", funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+    uint32_t funding_vout = (uint32_t)cJSON_GetObjectItem(msg.json, "funding_vout")->valuedouble;
+    uint64_t funding_amount = (uint64_t)cJSON_GetObjectItem(msg.json, "funding_amount")->valuedouble;
+    unsigned char funding_spk[34];
+    size_t spk_len = (size_t)wire_json_get_hex(msg.json, "funding_spk", funding_spk, 34);
+    uint16_t step_blocks = (uint16_t)cJSON_GetObjectItem(msg.json, "step_blocks")->valuedouble;
+    uint32_t states_per_layer = (uint32_t)cJSON_GetObjectItem(msg.json, "states_per_layer")->valuedouble;
+    uint32_t cltv_timeout = (uint32_t)cJSON_GetObjectItem(msg.json, "cltv_timeout")->valuedouble;
+    uint64_t fee_per_tx = (uint64_t)cJSON_GetObjectItem(msg.json, "fee_per_tx")->valuedouble;
+    cJSON_Delete(msg.json);
+
+    /* Build factory locally */
+    factory_t factory;
+    factory_init_from_pubkeys(&factory, ctx, all_pubkeys, n_participants,
+                              step_blocks, states_per_layer);
+    factory.cltv_timeout = cltv_timeout;
+    factory.fee_per_tx = fee_per_tx;
+    factory_set_funding(&factory, funding_txid, funding_vout, funding_amount,
+                        funding_spk, spk_len);
+
+    if (!factory_build_tree(&factory)) {
+        fprintf(stderr, "Client: factory_build_tree failed\n");
+        factory_free(&factory);
+        wire_close(fd);
+        return 0;
+    }
+
+    /* Initialize signing sessions */
+    if (!factory_sessions_init(&factory)) {
+        fprintf(stderr, "Client: factory_sessions_init failed\n");
+        factory_free(&factory);
+        wire_close(fd);
+        return 0;
+    }
+
+    /* Generate nonces */
+    unsigned char my_seckey[32];
+    secp256k1_keypair_sec(ctx, my_seckey, keypair);
+
+    size_t my_node_count = 0;
+    for (size_t i = 0; i < factory.n_nodes; i++) {
+        if (factory_find_signer_slot(&factory, i, my_index) >= 0)
+            my_node_count++;
+    }
+
+    secp256k1_musig_secnonce *my_secnonces =
+        (secp256k1_musig_secnonce *)calloc(my_node_count,
+                                            sizeof(secp256k1_musig_secnonce));
+    wire_bundle_entry_t *nonce_entries =
+        (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+
+    if (my_node_count > 0 && (!my_secnonces || !nonce_entries)) {
+        fprintf(stderr, "Client: alloc failed\n");
+        free(my_secnonces);
+        free(nonce_entries);
+        factory_free(&factory);
+        wire_close(fd);
+        return 0;
+    }
+
+    size_t nonce_count = 0;
+    for (size_t i = 0; i < factory.n_nodes; i++) {
+        int slot = factory_find_signer_slot(&factory, i, my_index);
+        if (slot < 0) continue;
+
+        secp256k1_musig_pubnonce pubnonce;
+        if (!musig_generate_nonce(ctx, &my_secnonces[nonce_count], &pubnonce,
+                                   my_seckey, &my_pubkey,
+                                   &factory.nodes[i].keyagg.cache)) {
+            fprintf(stderr, "Client: nonce gen failed node %zu\n", i);
+            goto fail;
+        }
+
+        unsigned char nonce_ser[66];
+        musig_pubnonce_serialize(ctx, nonce_ser, &pubnonce);
+
+        nonce_entries[nonce_count].node_idx = (uint32_t)i;
+        nonce_entries[nonce_count].signer_slot = (uint32_t)slot;
+        memcpy(nonce_entries[nonce_count].data, nonce_ser, 66);
+        nonce_entries[nonce_count].data_len = 66;
+        nonce_count++;
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Send NONCE_BUNDLE */
+    {
+        cJSON *bundle = wire_build_nonce_bundle(nonce_entries, nonce_count);
+        if (!wire_send(fd, MSG_NONCE_BUNDLE, bundle)) {
+            fprintf(stderr, "Client: send NONCE_BUNDLE failed\n");
+            cJSON_Delete(bundle);
+            goto fail;
+        }
+        cJSON_Delete(bundle);
+    }
+
+    /* Receive ALL_NONCES */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_ALL_NONCES) {
+        fprintf(stderr, "Client: expected ALL_NONCES\n");
+        if (msg.json) cJSON_Delete(msg.json);
+        goto fail;
+    }
+
+    if (!factory_sessions_init(&factory)) {
+        fprintf(stderr, "Client: re-init sessions failed\n");
+        cJSON_Delete(msg.json);
+        goto fail;
+    }
+
+    {
+        cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
+        wire_bundle_entry_t all_entries[256];
+        size_t n_all = wire_parse_bundle(nonces_arr, all_entries, 256, 66);
+
+        for (size_t e = 0; e < n_all; e++) {
+            secp256k1_musig_pubnonce pn;
+            if (!musig_pubnonce_parse(ctx, &pn, all_entries[e].data)) {
+                fprintf(stderr, "Client: bad pubnonce in ALL_NONCES\n");
+                cJSON_Delete(msg.json);
+                goto fail;
+            }
+            if (!factory_session_set_nonce(&factory, all_entries[e].node_idx,
+                                            all_entries[e].signer_slot, &pn)) {
+                fprintf(stderr, "Client: set nonce failed node %u slot %u\n",
+                        all_entries[e].node_idx, all_entries[e].signer_slot);
+                cJSON_Delete(msg.json);
+                goto fail;
+            }
+        }
+    }
+    cJSON_Delete(msg.json);
+
+    /* Finalize nonces */
+    if (!factory_sessions_finalize(&factory)) {
+        fprintf(stderr, "Client: factory_sessions_finalize failed\n");
+        goto fail;
+    }
+
+    /* Create partial sigs */
+    {
+        wire_bundle_entry_t *psig_entries =
+            (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+        if (my_node_count > 0 && !psig_entries) {
+            fprintf(stderr, "Client: alloc failed\n");
+            goto fail;
+        }
+        size_t psig_count = 0;
+
+        size_t secnonce_idx = 0;
+        for (size_t i = 0; i < factory.n_nodes; i++) {
+            int slot = factory_find_signer_slot(&factory, i, my_index);
+            if (slot < 0) continue;
+
+            secp256k1_musig_partial_sig psig;
+            if (!musig_create_partial_sig(ctx, &psig, &my_secnonces[secnonce_idx],
+                                           keypair, &factory.nodes[i].signing_session)) {
+                fprintf(stderr, "Client: partial sig failed node %zu\n", i);
+                free(psig_entries);
+                goto fail;
+            }
+
+            unsigned char psig_ser[32];
+            musig_partial_sig_serialize(ctx, psig_ser, &psig);
+
+            psig_entries[psig_count].node_idx = (uint32_t)i;
+            psig_entries[psig_count].signer_slot = (uint32_t)slot;
+            memcpy(psig_entries[psig_count].data, psig_ser, 32);
+            psig_entries[psig_count].data_len = 32;
+            psig_count++;
+            secnonce_idx++;
+        }
+
+        cJSON *bundle = wire_build_psig_bundle(psig_entries, psig_count);
+        if (!wire_send(fd, MSG_PSIG_BUNDLE, bundle)) {
+            fprintf(stderr, "Client: send PSIG_BUNDLE failed\n");
+            cJSON_Delete(bundle);
+            free(psig_entries);
+            goto fail;
+        }
+        cJSON_Delete(bundle);
+        free(psig_entries);
+    }
+
+    /* Receive FACTORY_READY */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
+        fprintf(stderr, "Client: expected FACTORY_READY\n");
+        if (msg.json) cJSON_Delete(msg.json);
+        goto fail;
+    }
+    cJSON_Delete(msg.json);
+
+    printf("Client %u: factory creation complete!\n", my_index);
+
+    /* === Channel Operations Phase === */
+    if (channel_cb) {
+        /* Receive CHANNEL_READY */
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
+            msg.msg_type != MSG_CHANNEL_READY) {
+            fprintf(stderr, "Client %u: expected CHANNEL_READY\n", my_index);
+            if (msg.json) cJSON_Delete(msg.json);
+            goto fail;
+        }
+
+        uint32_t channel_id;
+        uint64_t bal_local, bal_remote;
+        wire_parse_channel_ready(msg.json, &channel_id, &bal_local, &bal_remote);
+        cJSON_Delete(msg.json);
+
+        printf("Client %u: channel %u ready (local=%llu msat, remote=%llu msat)\n",
+               my_index, channel_id,
+               (unsigned long long)bal_local, (unsigned long long)bal_remote);
+
+        /* Initialize client-side channel */
+        channel_t channel;
+        if (!client_init_channel(&channel, ctx, &factory, keypair, my_index)) {
+            fprintf(stderr, "Client %u: channel init failed\n", my_index);
+            goto fail;
+        }
+
+        /* Call the channel callback */
+        channel_cb(fd, &channel, my_index, ctx, user_data);
+    }
+
+    /* === Cooperative Close Ceremony === */
+
+    /* Receive CLOSE_PROPOSE */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_CLOSE_PROPOSE) {
+        fprintf(stderr, "Client: expected CLOSE_PROPOSE\n");
+        if (msg.json) cJSON_Delete(msg.json);
+        goto fail;
+    }
+
+    {
+        cJSON *outputs_arr = cJSON_GetObjectItem(msg.json, "outputs");
+        if (!outputs_arr || !cJSON_IsArray(outputs_arr)) {
+            fprintf(stderr, "Client: malformed CLOSE_PROPOSE\n");
+            cJSON_Delete(msg.json);
+            goto fail;
+        }
+        size_t n_outputs = (size_t)cJSON_GetArraySize(outputs_arr);
+        if (n_outputs == 0 || n_outputs > 32) {
+            fprintf(stderr, "Client: bad output count %zu\n", n_outputs);
+            cJSON_Delete(msg.json);
+            goto fail;
+        }
+        tx_output_t *close_outputs = (tx_output_t *)calloc(n_outputs, sizeof(tx_output_t));
+        if (!close_outputs) {
+            fprintf(stderr, "Client: alloc failed\n");
+            cJSON_Delete(msg.json);
+            goto fail;
+        }
+
+        for (size_t i = 0; i < n_outputs; i++) {
+            cJSON *item = cJSON_GetArrayItem(outputs_arr, (int)i);
+            cJSON *amt = item ? cJSON_GetObjectItem(item, "amount") : NULL;
+            if (!amt || !cJSON_IsNumber(amt)) {
+                fprintf(stderr, "Client: bad close output %zu\n", i);
+                free(close_outputs);
+                cJSON_Delete(msg.json);
+                goto fail;
+            }
+            close_outputs[i].amount_sats = (uint64_t)amt->valuedouble;
+            close_outputs[i].script_pubkey_len = (size_t)wire_json_get_hex(
+                item, "spk", close_outputs[i].script_pubkey, 34);
+        }
+        cJSON_Delete(msg.json);
+
+        tx_buf_t close_unsigned;
+        tx_buf_init(&close_unsigned, 256);
+        unsigned char close_sighash[32];
+
+        if (!factory_build_cooperative_close_unsigned(&factory, &close_unsigned,
+                                                       close_sighash,
+                                                       close_outputs, n_outputs)) {
+            fprintf(stderr, "Client: build close unsigned failed\n");
+            tx_buf_free(&close_unsigned);
+            free(close_outputs);
+            goto fail;
+        }
+        free(close_outputs);
+
+        musig_keyagg_t close_keyagg = factory.nodes[0].keyagg;
+        musig_signing_session_t close_session;
+        musig_session_init(&close_session, &close_keyagg, n_participants);
+
+        secp256k1_musig_secnonce close_secnonce;
+        secp256k1_musig_pubnonce close_pubnonce;
+
+        unsigned char close_seckey[32];
+        secp256k1_keypair_sec(ctx, close_seckey, keypair);
+        if (!musig_generate_nonce(ctx, &close_secnonce, &close_pubnonce,
+                                   close_seckey, &my_pubkey, &close_keyagg.cache)) {
+            fprintf(stderr, "Client: close nonce gen failed\n");
+            memset(close_seckey, 0, 32);
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+        memset(close_seckey, 0, 32);
+
+        unsigned char nonce_ser[66];
+        musig_pubnonce_serialize(ctx, nonce_ser, &close_pubnonce);
+        cJSON *nonce_msg = wire_build_close_nonce(nonce_ser);
+        if (!wire_send(fd, MSG_CLOSE_NONCE, nonce_msg)) {
+            fprintf(stderr, "Client: send CLOSE_NONCE failed\n");
+            cJSON_Delete(nonce_msg);
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+        cJSON_Delete(nonce_msg);
+
+        /* Receive CLOSE_ALL_NONCES */
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_CLOSE_ALL_NONCES) {
+            fprintf(stderr, "Client: expected CLOSE_ALL_NONCES\n");
+            if (msg.json) cJSON_Delete(msg.json);
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+
+        {
+            cJSON *nonces_arr2 = cJSON_GetObjectItem(msg.json, "nonces");
+            if (!nonces_arr2 || !cJSON_IsArray(nonces_arr2)) {
+                fprintf(stderr, "Client: malformed CLOSE_ALL_NONCES\n");
+                cJSON_Delete(msg.json);
+                tx_buf_free(&close_unsigned);
+                goto fail;
+            }
+            size_t n_nonces = (size_t)cJSON_GetArraySize(nonces_arr2);
+            for (size_t i = 0; i < n_nonces; i++) {
+                cJSON *hex_item = cJSON_GetArrayItem(nonces_arr2, (int)i);
+                if (!hex_item || !cJSON_IsString(hex_item)) continue;
+                unsigned char nbuf[66];
+                if (hex_decode(hex_item->valuestring, nbuf, 66) != 66) continue;
+                secp256k1_musig_pubnonce pn;
+                if (!musig_pubnonce_parse(ctx, &pn, nbuf)) continue;
+                musig_session_set_pubnonce(&close_session, i, &pn);
+            }
+        }
+        cJSON_Delete(msg.json);
+
+        if (!musig_session_finalize_nonces(ctx, &close_session, close_sighash, NULL, NULL)) {
+            fprintf(stderr, "Client: close session finalize failed\n");
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+
+        secp256k1_musig_partial_sig close_psig;
+        if (!musig_create_partial_sig(ctx, &close_psig, &close_secnonce,
+                                       keypair, &close_session)) {
+            fprintf(stderr, "Client: close partial sig failed\n");
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+
+        unsigned char psig_ser[32];
+        musig_partial_sig_serialize(ctx, psig_ser, &close_psig);
+
+        cJSON *psig_msg = wire_build_close_psig(psig_ser);
+        if (!wire_send(fd, MSG_CLOSE_PSIG, psig_msg)) {
+            fprintf(stderr, "Client: send CLOSE_PSIG failed\n");
+            cJSON_Delete(psig_msg);
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+        cJSON_Delete(psig_msg);
+
+        /* Receive CLOSE_DONE */
+        if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_CLOSE_DONE) {
+            fprintf(stderr, "Client: expected CLOSE_DONE\n");
+            if (msg.json) cJSON_Delete(msg.json);
+            tx_buf_free(&close_unsigned);
+            goto fail;
+        }
+        cJSON_Delete(msg.json);
+
+        tx_buf_free(&close_unsigned);
+    }
+
+    printf("Client %u: cooperative close complete!\n", my_index);
+
+    free(my_secnonces);
+    free(nonce_entries);
+    factory_free(&factory);
+    wire_close(fd);
+    return 1;
+
+fail:
+    memset(my_secnonces, 0, my_node_count * sizeof(secp256k1_musig_secnonce));
+    free(my_secnonces);
+    free(nonce_entries);
+    factory_free(&factory);
+    wire_close(fd);
+    return 0;
+}
+
+int client_run_ceremony(secp256k1_context *ctx,
+                        const secp256k1_keypair *keypair,
+                        const char *host, int port) {
+    return client_run_with_channels(ctx, keypair, host, port, NULL, NULL);
+}

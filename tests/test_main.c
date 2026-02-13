@@ -148,6 +148,23 @@ extern int test_regtest_ladder_lifecycle(void);
 extern int test_regtest_ladder_ptlc_migration(void);
 extern int test_regtest_ladder_distribution_fallback(void);
 
+/* Phase 9: Wire protocol */
+extern int test_wire_pubkey_only_factory(void);
+extern int test_wire_framing(void);
+extern int test_wire_crypto_serialization(void);
+extern int test_wire_nonce_bundle(void);
+extern int test_wire_psig_bundle(void);
+extern int test_wire_close_unsigned(void);
+extern int test_wire_distributed_signing(void);
+extern int test_regtest_wire_factory(void);
+
+/* Phase 10: Channel operations over wire */
+extern int test_channel_msg_round_trip(void);
+extern int test_lsp_channel_init(void);
+extern int test_channel_wire_framing(void);
+extern int test_regtest_intra_factory_payment(void);
+extern int test_regtest_multi_payment(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -254,6 +271,20 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ladder_state_transitions);
     RUN_TEST(test_ladder_key_turnover_close);
     RUN_TEST(test_ladder_overlapping);
+
+    printf("\n=== Wire Protocol (Phase 9) ===\n");
+    RUN_TEST(test_wire_pubkey_only_factory);
+    RUN_TEST(test_wire_framing);
+    RUN_TEST(test_wire_crypto_serialization);
+    RUN_TEST(test_wire_nonce_bundle);
+    RUN_TEST(test_wire_psig_bundle);
+    RUN_TEST(test_wire_close_unsigned);
+    RUN_TEST(test_wire_distributed_signing);
+
+    printf("\n=== Channel Operations (Phase 10) ===\n");
+    RUN_TEST(test_channel_msg_round_trip);
+    RUN_TEST(test_lsp_channel_init);
+    RUN_TEST(test_channel_wire_framing);
 }
 
 static void run_regtest_tests(void) {
@@ -277,6 +308,13 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_ladder_lifecycle);
     RUN_TEST(test_regtest_ladder_ptlc_migration);
     RUN_TEST(test_regtest_ladder_distribution_fallback);
+
+    printf("\n=== Regtest Phase 9 (Wire Protocol) ===\n");
+    RUN_TEST(test_regtest_wire_factory);
+
+    printf("\n=== Regtest Phase 10 (Channel Operations) ===\n");
+    RUN_TEST(test_regtest_intra_factory_payment);
+    RUN_TEST(test_regtest_multi_payment);
 }
 
 int main(int argc, char *argv[]) {
@@ -291,7 +329,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-8)\n");
+    printf("SuperScalar Test Suite (Phase 1-10)\n");
     printf("==================================\n");
 
     if (run_unit) run_unit_tests();

@@ -118,6 +118,13 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
                   const secp256k1_keypair *keypairs, size_t n_participants,
                   uint16_t step_blocks, uint32_t states_per_layer);
 
+/* Initialize factory from pubkeys only (no keypairs).
+   Used by clients who know all participants' pubkeys but only their own secret key.
+   The keypairs array is zeroed — signing requires the split-round API. */
+void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
+                               const secp256k1_pubkey *pubkeys, size_t n_participants,
+                               uint16_t step_blocks, uint32_t states_per_layer);
+
 void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
@@ -149,6 +156,15 @@ int factory_build_cooperative_close(
     factory_t *f,
     tx_buf_t *close_tx_out,
     unsigned char *txid_out32,   /* can be NULL */
+    const tx_output_t *outputs,
+    size_t n_outputs);
+
+/* Build unsigned cooperative close tx + compute its sighash.
+   Used for distributed signing: each party signs their partial sig separately. */
+int factory_build_cooperative_close_unsigned(
+    factory_t *f,
+    tx_buf_t *unsigned_tx_out,
+    unsigned char *sighash_out32,
     const tx_output_t *outputs,
     size_t n_outputs);
 

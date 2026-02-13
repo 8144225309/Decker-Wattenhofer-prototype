@@ -13,7 +13,7 @@ A Bitcoin channel factory protocol combining:
 
 No consensus changes or soft forks required. Runs on Bitcoin today.
 
-## Build (WSL)
+## Build
 
 ```
 cd superscalar && mkdir -p build && cd build
@@ -26,7 +26,7 @@ Dependencies (auto-fetched via CMake FetchContent):
 
 ## Test
 
-90 tests (74 unit + 16 regtest integration).
+103 tests (85 unit + 18 regtest integration).
 
 ```bash
 # unit tests (no bitcoind needed)
@@ -54,6 +54,10 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover protocol |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, key turnover tracking, migration |
+| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 20 message types |
+| `lsp` | lsp.c | LSP server: accept clients, factory creation ceremony, cooperative close |
+| `client` | client.c | Client: connect to LSP, factory ceremony, channel operations, close |
+| `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
 
@@ -199,11 +203,27 @@ Commitment TX (held by each party):
 - Regtest: full migration demo (fund F1 -> PTLC exit -> close F1 -> fund F2)
 - Regtest: distribution tx fallback when clients don't exit
 
-### Future: Proof of Concept
-- Wire protocol (BOLT-like message framing between LSP and clients)
-- Persistent state storage (factory trees, channel state, shachain secrets)
-- Signet/testnet deployment with real network latency
-- CTV upgrade path (replace N-of-N emulation with covenant)
+### Phase 9: Wire Protocol
+- TCP transport with length-prefixed JSON message framing
+- 20 message types: HELLO handshake, factory creation, channel operations, cooperative close
+- LSP + N client architecture with HELLO/HELLO_ACK handshake
+- Factory creation over wire: 3 round-trips (PROPOSE → NONCES → PSIGS → READY)
+- Cooperative close over wire: 2 round-trips on funding output's N+1 key
+- Standalone binaries: `superscalar_lsp` and `superscalar_client`
+- Regtest: full TCP factory creation + cooperative close with forked client processes
+
+### Phase 10: Channel Operations + PoC Hardening
+- 7 channel wire message types: CHANNEL_READY, ADD_HTLC, COMMITMENT_SIGNED, REVOKE_AND_ACK, FULFILL_HTLC, FAIL_HTLC, CLOSE_REQUEST
+- LSP channel manager with HTLC forwarding (sender → LSP → recipient)
+- Client channel handlers with callback-based session loop
+- Full HTLC payment round-trip: ADD_HTLC → COMMIT_SIGNED → REVOKE_AND_ACK → FULFILL
+- Multi-payment support: scripted action sequences (SEND/RECV) per client
+- Select()-based LSP event loop handling messages from any client
+- Balance-aware cooperative close: outputs reflect actual channel balances after payments
+- Multi-payment regtest test: 4 circular payments (A→B→C→D→A), balance verification, on-chain close output verification
+- Input validation, network hardening, memory safety, graceful shutdown
+- Standalone LSP/client binaries with CLI argument parsing
+- 103/103 tests pass (85 unit + 18 regtest)
 
 ## License
 

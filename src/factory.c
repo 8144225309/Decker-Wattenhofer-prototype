@@ -358,6 +358,23 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
     dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
 }
 
+void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
+                               const secp256k1_pubkey *pubkeys, size_t n_participants,
+                               uint16_t step_blocks, uint32_t states_per_layer) {
+    memset(f, 0, sizeof(*f));
+    f->ctx = ctx;
+    f->n_participants = n_participants;
+    f->step_blocks = step_blocks;
+    f->states_per_layer = states_per_layer;
+    f->fee_per_tx = 500;
+
+    for (size_t i = 0; i < n_participants; i++)
+        f->pubkeys[i] = pubkeys[i];
+    /* keypairs left zeroed — signing requires split-round API */
+
+    dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
+}
+
 void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
@@ -774,6 +791,29 @@ int factory_build_cooperative_close(
     }
 
     tx_buf_free(&unsigned_tx);
+    return 1;
+}
+
+int factory_build_cooperative_close_unsigned(
+    factory_t *f,
+    tx_buf_t *unsigned_tx_out,
+    unsigned char *sighash_out32,
+    const tx_output_t *outputs,
+    size_t n_outputs)
+{
+    unsigned char display_txid[32];
+    if (!build_unsigned_tx(unsigned_tx_out, display_txid,
+                            f->funding_txid, f->funding_vout,
+                            0xFFFFFFFEu,
+                            outputs, n_outputs))
+        return 0;
+
+    if (!compute_taproot_sighash(sighash_out32,
+                                  unsigned_tx_out->data, unsigned_tx_out->len,
+                                  0, f->funding_spk, f->funding_spk_len,
+                                  f->funding_amount_sats, 0xFFFFFFFEu))
+        return 0;
+
     return 1;
 }
 

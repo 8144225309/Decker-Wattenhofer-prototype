@@ -44,6 +44,10 @@ add_library(superscalar
     src/channel.c
     src/adaptor.c
     src/ladder.c
+    src/wire.c
+    src/lsp.c
+    src/client.c
+    src/lsp_channels.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -63,6 +67,8 @@ add_executable(test_superscalar
     tests/test_channel.c
     tests/test_adaptor.c
     tests/test_ladder.c
+    tests/test_wire.c
+    tests/test_channels.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
@@ -70,3 +76,15 @@ target_link_libraries(test_superscalar PRIVATE superscalar)
 enable_testing()
 add_test(NAME unit_tests COMMAND test_superscalar --unit)
 add_test(NAME regtest_tests COMMAND test_superscalar --regtest)
+
+# --- Executables ---
+add_executable(superscalar_lsp tools/superscalar_lsp.c)
+target_include_directories(superscalar_lsp PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(superscalar_lsp PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(superscalar_lsp PRIVATE superscalar)
+
+add_executable(superscalar_client_bin tools/superscalar_client.c)
+target_include_directories(superscalar_client_bin PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(superscalar_client_bin PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(superscalar_client_bin PRIVATE superscalar)
+set_target_properties(superscalar_client_bin PROPERTIES OUTPUT_NAME superscalar_client)
