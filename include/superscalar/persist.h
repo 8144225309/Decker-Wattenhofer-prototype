@@ -91,4 +91,25 @@ int persist_load_nonce_pool(persist_t *p, uint32_t channel_id,
                               size_t *data_len_out,
                               size_t *next_index_out);
 
+/* --- Old commitment tracking (watchtower) --- */
+
+/* Save an old commitment for watchtower monitoring. */
+int persist_save_old_commitment(persist_t *p, uint32_t channel_id,
+                                  uint64_t commit_num,
+                                  const unsigned char *txid32,
+                                  uint32_t to_local_vout,
+                                  uint64_t to_local_amount,
+                                  const unsigned char *to_local_spk,
+                                  size_t spk_len);
+
+/* Load old commitments for a channel. Returns count loaded. */
+size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
+                                      uint64_t *commit_nums,
+                                      unsigned char (*txids)[32],
+                                      uint32_t *vouts,
+                                      uint64_t *amounts,
+                                      unsigned char (*spks)[34],
+                                      size_t *spk_lens,
+                                      size_t max_entries);
+
 #endif /* SUPERSCALAR_PERSIST_H */

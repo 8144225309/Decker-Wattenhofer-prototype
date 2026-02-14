@@ -374,3 +374,38 @@ int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
 
     return 0;
 }
+
+int regtest_get_raw_tx(regtest_t *rt, const char *txid,
+                         char *tx_hex_out, size_t max_len) {
+    if (!rt || !txid || !tx_hex_out || max_len == 0) return 0;
+
+    char params[256];
+    snprintf(params, sizeof(params), "\"%s\"", txid);
+    char *result = regtest_exec(rt, "getrawtransaction", params);
+    if (!result) return 0;
+
+    if (strstr(result, "error") != NULL) {
+        free(result);
+        return 0;
+    }
+
+    /* Trim whitespace/quotes */
+    char *start = result;
+    while (*start == '"' || *start == ' ' || *start == '\n') start++;
+    char *end = start + strlen(start) - 1;
+    while (end > start && (*end == '"' || *end == '\n' || *end == '\r' || *end == ' ')) {
+        *end = '\0';
+        end--;
+    }
+
+    size_t len = strlen(start);
+    if (len == 0 || len >= max_len) {
+        free(result);
+        return 0;
+    }
+
+    strncpy(tx_hex_out, start, max_len - 1);
+    tx_hex_out[max_len - 1] = '\0';
+    free(result);
+    return 1;
+}

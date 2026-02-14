@@ -24,9 +24,12 @@ Dependencies (auto-fetched via CMake FetchContent):
 - [secp256k1-zkp](https://github.com/BlockstreamResearch/secp256k1-zkp) — MuSig2, Schnorr signatures, extrakeys
 - [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing for bitcoin-cli output
 
+System dependency:
+- SQLite3 — persistence layer
+
 ## Test
 
-103 tests (85 unit + 18 regtest integration).
+134 tests (115 unit + 19 regtest integration).
 
 ```bash
 # unit tests (no bitcoind needed)
@@ -54,12 +57,16 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover protocol |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, key turnover tracking, migration |
-| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 20 message types |
+| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 36 message types |
 | `lsp` | lsp.c | LSP server: accept clients, factory creation ceremony, cooperative close |
 | `client` | client.c | Client: connect to LSP, factory ceremony, channel operations, close |
-| `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close |
+| `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close, watchtower |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
+| `persist` | persist.c | SQLite3 persistence: factories, channels, HTLCs, revocation secrets, nonce pools, old commitments |
+| `bridge` | bridge.c | CLN bridge daemon for Lightning Network connectivity |
+| `fee` | fee.c | Configurable fee estimation: penalty, HTLC, and factory tx fee computation |
+| `watchtower` | watchtower.c | Breach detection: monitors chain for revoked commitments, builds and broadcasts penalty txs |
 
 ## Architecture
 
@@ -128,6 +135,15 @@ Commitment TX (held by each party):
 - **Penalty**: Full channel balance to counterparty on breach
 - **HTLCs**: 2-leaf taproot trees (success + timeout paths, or revocation + claim)
 - **Cooperative close**: Single key-path spend bypassing commitment structure
+
+### Watchtower
+
+Monitors the blockchain for revoked commitment transactions:
+
+- Tracks old commitment txids after each `REVOKE_AND_ACK`
+- Polls chain every 5 seconds during daemon mode
+- On breach detection: builds penalty tx, broadcasts it, claims full channel balance
+- Persists watched commitments in SQLite for crash recovery
 
 ## Implementation Status
 
@@ -205,7 +221,7 @@ Commitment TX (held by each party):
 
 ### Phase 9: Wire Protocol
 - TCP transport with length-prefixed JSON message framing
-- 20 message types: HELLO handshake, factory creation, channel operations, cooperative close
+- 22 base message types: HELLO handshake, factory creation, channel operations, cooperative close
 - LSP + N client architecture with HELLO/HELLO_ACK handshake
 - Factory creation over wire: 3 round-trips (PROPOSE → NONCES → PSIGS → READY)
 - Cooperative close over wire: 2 round-trips on funding output's N+1 key
@@ -220,10 +236,54 @@ Commitment TX (held by each party):
 - Multi-payment support: scripted action sequences (SEND/RECV) per client
 - Select()-based LSP event loop handling messages from any client
 - Balance-aware cooperative close: outputs reflect actual channel balances after payments
-- Multi-payment regtest test: 4 circular payments (A→B→C→D→A), balance verification, on-chain close output verification
 - Input validation, network hardening, memory safety, graceful shutdown
 - Standalone LSP/client binaries with CLI argument parsing
-- 103/103 tests pass (85 unit + 18 regtest)
+
+### Phase 12: Real Commitment Signatures
+- MuSig2 partial signatures replace dummy signatures for commitment txs
+- Nonce pool management for distributed 2-of-2 signing
+
+### Phase 13: Persistence (SQLite)
+- 6 database tables: factories, factory_participants, channels, revocation_secrets, htlcs, nonce_pools
+- `--db PATH` flag on both LSP and client binaries
+- Full state round-trip: save and reload factory, channel, HTLC, and nonce pool state
+
+### Phase 14: CLN Bridge
+- Bridge daemon (`superscalar_bridge`) connecting SuperScalar to CLN
+- 8 MSG_BRIDGE_* wire messages (0x40-0x47) for HTLC forwarding
+- Invoice registry for routing inbound payments to correct client
+- CLN plugin (`tools/cln_plugin.py`) with htlc_accepted hook + superscalar-pay RPC
+
+### Phase 15: Daemon Mode
+- `--daemon` flag for long-lived LSP and client processes
+- Select()-based daemon loop with 5-second timeout and graceful shutdown
+- MSG_REGISTER_INVOICE (0x38): clients register payment hashes with LSP
+- Client auto-fulfillment of received HTLCs with preimage lookup
+
+### Phase 16: Client Reconnection
+- MSG_RECONNECT (0x48) + MSG_RECONNECT_ACK (0x49) wire messages
+- LSP daemon loop: listen socket in select(), pubkey-matched reconnection
+- Client reconnect from persisted state with nonce re-exchange
+- Retry loop with 5-second backoff on disconnect
+
+### Phase 17: Demo Polish
+- MSG_CREATE_INVOICE (0x4A) + MSG_INVOICE_CREATED (0x4B) wire messages
+- Client-side invoice store: random preimage → SHA256 → payment_hash
+- LSP-orchestrated client-to-client payments with real preimage validation
+- `--demo` flag: scripted 4-payment demo sequence with balance reporting
+
+### Phase 18: Watchtower + Fee Estimation
+- **Fee estimation module** (`fee.c`): configurable `--fee-rate` (sat/kvB), replaces all hardcoded 500-sat fees
+  - Penalty tx: ~152 vB, HTLC tx: ~180 vB, factory tx: ~50+43*n vB
+  - Integrated into channel.c (4 fee sites) and factory.c (tree build)
+- **Watchtower** (`watchtower.c`): breach detection and penalty enforcement
+  - Monitors chain for revoked commitment txids every 5s in daemon loop
+  - Builds and broadcasts penalty txs via `channel_build_penalty_tx()`
+  - Old commitment tracking persisted in `old_commitments` SQLite table
+  - Integrated into LSP daemon loop via `lsp_channel_mgr_t.watchtower`
+- **Persistence**: new `old_commitments` table (7th table) for watchtower state
+- **Regtest helper**: `regtest_get_raw_tx()` for tx hex retrieval
+- 134/134 tests pass (115 unit + 19 regtest)
 
 ## License
 

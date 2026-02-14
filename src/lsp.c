@@ -17,6 +17,7 @@ void lsp_init(lsp_t *lsp, secp256k1_context *ctx,
     lsp->port = port;
     lsp->expected_clients = expected_clients;
     lsp->listen_fd = -1;
+    lsp->bridge_fd = -1;
 
     for (size_t i = 0; i < LSP_MAX_CLIENTS; i++)
         lsp->client_fds[i] = -1;
@@ -37,6 +38,13 @@ int lsp_accept_clients(lsp_t *lsp) {
         int fd = wire_accept(lsp->listen_fd);
         if (fd < 0) {
             fprintf(stderr, "LSP: accept failed for client %zu\n", i);
+            goto accept_fail;
+        }
+
+        /* Encrypted transport handshake */
+        if (!wire_noise_handshake_responder(fd, lsp->ctx)) {
+            fprintf(stderr, "LSP: noise handshake failed for client %zu\n", i);
+            wire_close(fd);
             goto accept_fail;
         }
 
@@ -526,6 +534,53 @@ close_fail:
     return 0;
 }
 
+int lsp_accept_bridge(lsp_t *lsp) {
+    if (lsp->listen_fd < 0) {
+        lsp->listen_fd = wire_listen(NULL, lsp->port);
+        if (lsp->listen_fd < 0) {
+            fprintf(stderr, "LSP: listen failed on port %d for bridge\n", lsp->port);
+            return 0;
+        }
+    }
+
+    int fd = wire_accept(lsp->listen_fd);
+    if (fd < 0) {
+        fprintf(stderr, "LSP: accept failed for bridge\n");
+        return 0;
+    }
+
+    /* Encrypted transport handshake */
+    if (!wire_noise_handshake_responder(fd, lsp->ctx)) {
+        fprintf(stderr, "LSP: noise handshake failed for bridge\n");
+        wire_close(fd);
+        return 0;
+    }
+
+    /* Expect BRIDGE_HELLO */
+    wire_msg_t msg;
+    if (!wire_recv(fd, &msg) || msg.msg_type != MSG_BRIDGE_HELLO) {
+        fprintf(stderr, "LSP: expected BRIDGE_HELLO, got 0x%02x\n", msg.msg_type);
+        if (msg.json) cJSON_Delete(msg.json);
+        wire_close(fd);
+        return 0;
+    }
+    cJSON_Delete(msg.json);
+
+    /* Send BRIDGE_HELLO_ACK */
+    cJSON *ack = wire_build_bridge_hello_ack();
+    if (!wire_send(fd, MSG_BRIDGE_HELLO_ACK, ack)) {
+        fprintf(stderr, "LSP: failed to send BRIDGE_HELLO_ACK\n");
+        cJSON_Delete(ack);
+        wire_close(fd);
+        return 0;
+    }
+    cJSON_Delete(ack);
+
+    lsp->bridge_fd = fd;
+    printf("LSP: bridge connected (fd=%d)\n", fd);
+    return 1;
+}
+
 void lsp_abort_ceremony(lsp_t *lsp, const char *reason) {
     cJSON *err = wire_build_error(reason ? reason : "ceremony aborted");
     for (size_t i = 0; i < lsp->n_clients; i++) {
@@ -540,6 +595,10 @@ void lsp_cleanup(lsp_t *lsp) {
         if (lsp->client_fds[i] >= 0)
             wire_close(lsp->client_fds[i]);
         lsp->client_fds[i] = -1;
+    }
+    if (lsp->bridge_fd >= 0) {
+        wire_close(lsp->bridge_fd);
+        lsp->bridge_fd = -1;
     }
     if (lsp->listen_fd >= 0) {
         wire_close(lsp->listen_fd);

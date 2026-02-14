@@ -3,6 +3,8 @@
 #include <string.h>
 #include <stdlib.h>
 #include <sys/select.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 
@@ -45,6 +47,10 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     memset(mgr, 0, sizeof(*mgr));
     mgr->ctx = ctx;
     mgr->n_channels = n_clients;
+    mgr->bridge_fd = -1;
+    mgr->n_invoices = 0;
+    mgr->n_htlc_origins = 0;
+    mgr->next_request_id = 1;
 
     for (size_t c = 0; c < n_clients; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
@@ -325,10 +331,33 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         cJSON_Delete(ack_msg.json);
     }
 
-    /* Find destination client from payment_hash.
-       For intra-factory routing, we check all other clients' pending invoices.
-       Simplified: the ADD_HTLC includes a "dest_client" field (extension). */
+    /* Find destination: check dest_client field, then bolt11 for bridge routing */
     cJSON *dest_item = cJSON_GetObjectItem(json, "dest_client");
+    cJSON *bolt11_item = cJSON_GetObjectItem(json, "bolt11");
+
+    /* If bolt11 present and bridge connected, route outbound via bridge */
+    if ((!dest_item || !cJSON_IsNumber(dest_item)) &&
+        bolt11_item && cJSON_IsString(bolt11_item) && mgr->bridge_fd >= 0) {
+        uint64_t request_id = mgr->next_request_id++;
+        cJSON *pay = wire_build_bridge_send_pay(bolt11_item->valuestring,
+                                                  payment_hash, request_id);
+        int ok = wire_send(mgr->bridge_fd, MSG_BRIDGE_SEND_PAY, pay);
+        cJSON_Delete(pay);
+        if (!ok) return 0;
+
+        /* Track origin for when PAY_RESULT comes back */
+        lsp_channels_track_bridge_origin(mgr, payment_hash, 0);
+        /* Store request_id + sender info for back-propagation */
+        if (mgr->n_htlc_origins > 0) {
+            htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins - 1];
+            origin->request_id = request_id;
+            origin->sender_idx = sender_idx;
+            origin->sender_htlc_id = new_htlc_id;
+        }
+        printf("LSP: HTLC from client %zu routed to bridge (bolt11)\n", sender_idx);
+        return 1;
+    }
+
     if (!dest_item || !cJSON_IsNumber(dest_item)) {
         fprintf(stderr, "LSP: ADD_HTLC missing dest_client\n");
         return 0;
@@ -463,6 +492,19 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* Compute hash from preimage */
     sha256(preimage, 32, payment_hash);
 
+    /* Check if this HTLC originated from the bridge */
+    uint64_t bridge_htlc_id = lsp_channels_get_bridge_origin(mgr, payment_hash);
+    if (bridge_htlc_id > 0 && mgr->bridge_fd >= 0) {
+        /* Back-propagate to bridge instead of intra-factory */
+        cJSON *fulfill = wire_build_bridge_fulfill_htlc(payment_hash, preimage,
+                                                          bridge_htlc_id);
+        wire_send(mgr->bridge_fd, MSG_BRIDGE_FULFILL_HTLC, fulfill);
+        cJSON_Delete(fulfill);
+        printf("LSP: HTLC fulfilled via bridge (htlc_id=%llu)\n",
+               (unsigned long long)bridge_htlc_id);
+        return 1;
+    }
+
     for (size_t s = 0; s < mgr->n_channels; s++) {
         if (s == client_idx) continue;
         channel_t *sender_ch = &mgr->entries[s].channel;
@@ -547,6 +589,30 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
+    case MSG_REGISTER_INVOICE: {
+        unsigned char payment_hash[32];
+        uint64_t amount_msat;
+        size_t dest_client;
+        if (!wire_parse_register_invoice(msg->json, payment_hash,
+                                           &amount_msat, &dest_client))
+            return 0;
+        if (!lsp_channels_register_invoice(mgr, payment_hash,
+                                             dest_client, amount_msat)) {
+            fprintf(stderr, "LSP: register_invoice failed\n");
+            return 0;
+        }
+        /* Also forward to bridge if connected */
+        if (mgr->bridge_fd >= 0) {
+            cJSON *reg = wire_build_bridge_register(payment_hash, amount_msat,
+                                                      dest_client);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_REGISTER, reg);
+            cJSON_Delete(reg);
+        }
+        printf("LSP: registered invoice for client %zu (%llu msat)\n",
+               dest_client, (unsigned long long)amount_msat);
+        return 1;
+    }
+
     case MSG_CLOSE_REQUEST:
         printf("LSP: client %zu requested close\n", client_idx);
         return 1;  /* handled by caller */
@@ -556,6 +622,367 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 msg->msg_type, client_idx);
         return 0;
     }
+}
+
+/* --- Bridge support functions (Phase 14) --- */
+
+void lsp_channels_set_bridge(lsp_channel_mgr_t *mgr, int bridge_fd) {
+    mgr->bridge_fd = bridge_fd;
+}
+
+int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
+                                    const unsigned char *payment_hash32,
+                                    size_t dest_client, uint64_t amount_msat) {
+    if (mgr->n_invoices >= MAX_INVOICE_REGISTRY) return 0;
+    if (dest_client >= mgr->n_channels) return 0;
+
+    invoice_entry_t *inv = &mgr->invoices[mgr->n_invoices++];
+    memcpy(inv->payment_hash, payment_hash32, 32);
+    inv->dest_client = dest_client;
+    inv->amount_msat = amount_msat;
+    inv->bridge_htlc_id = 0;
+    inv->active = 1;
+    return 1;
+}
+
+int lsp_channels_lookup_invoice(lsp_channel_mgr_t *mgr,
+                                  const unsigned char *payment_hash32,
+                                  size_t *dest_client_out) {
+    for (size_t i = 0; i < mgr->n_invoices; i++) {
+        if (!mgr->invoices[i].active) continue;
+        if (memcmp(mgr->invoices[i].payment_hash, payment_hash32, 32) == 0) {
+            *dest_client_out = mgr->invoices[i].dest_client;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
+                                        const unsigned char *payment_hash32,
+                                        uint64_t bridge_htlc_id) {
+    if (mgr->n_htlc_origins >= MAX_HTLC_ORIGINS) return;
+    htlc_origin_t *origin = &mgr->htlc_origins[mgr->n_htlc_origins++];
+    memcpy(origin->payment_hash, payment_hash32, 32);
+    origin->bridge_htlc_id = bridge_htlc_id;
+    origin->active = 1;
+}
+
+uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
+                                          const unsigned char *payment_hash32) {
+    for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+        if (!mgr->htlc_origins[i].active) continue;
+        if (memcmp(mgr->htlc_origins[i].payment_hash, payment_hash32, 32) == 0) {
+            mgr->htlc_origins[i].active = 0;
+            return mgr->htlc_origins[i].bridge_htlc_id;
+        }
+    }
+    return 0;
+}
+
+int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                     const wire_msg_t *msg) {
+    if (!mgr || !lsp || !msg) return 0;
+
+    switch (msg->msg_type) {
+    case MSG_BRIDGE_ADD_HTLC: {
+        /* Inbound payment from LN via bridge */
+        unsigned char payment_hash[32];
+        uint64_t amount_msat, htlc_id;
+        uint32_t cltv_expiry;
+        if (!wire_parse_bridge_add_htlc(msg->json, payment_hash,
+                                          &amount_msat, &cltv_expiry, &htlc_id))
+            return 0;
+
+        /* Look up invoice to find dest_client */
+        size_t dest_idx;
+        if (!lsp_channels_lookup_invoice(mgr, payment_hash, &dest_idx)) {
+            /* Unknown payment hash — fail back to bridge */
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "unknown_payment_hash", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            printf("LSP: bridge HTLC unknown hash, failing back\n");
+            return 1;
+        }
+
+        uint64_t amount_sats = amount_msat / 1000;
+        if (amount_sats == 0) return 0;
+
+        channel_t *dest_ch = &mgr->entries[dest_idx].channel;
+
+        /* Add HTLC to destination's channel (offered from LSP) */
+        uint64_t dest_htlc_id;
+        if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
+                               payment_hash, cltv_expiry, &dest_htlc_id)) {
+            cJSON *fail = wire_build_bridge_fail_htlc(payment_hash,
+                "insufficient_funds", htlc_id);
+            wire_send(mgr->bridge_fd, MSG_BRIDGE_FAIL_HTLC, fail);
+            cJSON_Delete(fail);
+            return 1;
+        }
+
+        /* Track bridge origin for back-propagation */
+        lsp_channels_track_bridge_origin(mgr, payment_hash, htlc_id);
+
+        /* Forward ADD_HTLC to destination client */
+        cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
+                                                   payment_hash, cltv_expiry);
+        if (!wire_send(lsp->client_fds[dest_idx], MSG_UPDATE_ADD_HTLC, fwd)) {
+            cJSON_Delete(fwd);
+            return 0;
+        }
+        cJSON_Delete(fwd);
+
+        /* Send COMMITMENT_SIGNED to dest */
+        {
+            unsigned char psig32[32];
+            uint32_t nonce_idx;
+            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx))
+                return 0;
+            cJSON *cs = wire_build_commitment_signed(
+                mgr->entries[dest_idx].channel_id,
+                dest_ch->commitment_number, psig32, nonce_idx);
+            if (!wire_send(lsp->client_fds[dest_idx], MSG_COMMITMENT_SIGNED, cs)) {
+                cJSON_Delete(cs);
+                return 0;
+            }
+            cJSON_Delete(cs);
+        }
+
+        /* Wait for REVOKE_AND_ACK from dest */
+        {
+            wire_msg_t ack_msg;
+            if (!wire_recv(lsp->client_fds[dest_idx], &ack_msg) ||
+                ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+                if (ack_msg.json) cJSON_Delete(ack_msg.json);
+                return 0;
+            }
+            uint32_t ack_chan_id;
+            unsigned char rev_secret[32], next_point[33];
+            if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                            rev_secret, next_point)) {
+                channel_receive_revocation(dest_ch,
+                                            dest_ch->commitment_number - 1,
+                                            rev_secret);
+            }
+            cJSON_Delete(ack_msg.json);
+        }
+
+        printf("LSP: bridge HTLC forwarded to client %zu (%llu sats)\n",
+               dest_idx, (unsigned long long)amount_sats);
+        return 1;
+    }
+
+    case MSG_BRIDGE_PAY_RESULT: {
+        /* Outbound pay result from bridge */
+        uint64_t request_id;
+        int success;
+        unsigned char preimage[32];
+        if (!wire_parse_bridge_pay_result(msg->json, &request_id, &success,
+                                            preimage))
+            return 0;
+
+        printf("LSP: bridge pay result: request_id=%llu success=%d\n",
+               (unsigned long long)request_id, success);
+
+        /* Find the originating HTLC by request_id */
+        for (size_t i = 0; i < mgr->n_htlc_origins; i++) {
+            if (!mgr->htlc_origins[i].active) continue;
+            if (mgr->htlc_origins[i].request_id != request_id) continue;
+
+            size_t client_idx = mgr->htlc_origins[i].sender_idx;
+            uint64_t htlc_id = mgr->htlc_origins[i].sender_htlc_id;
+            mgr->htlc_origins[i].active = 0;
+
+            if (client_idx >= mgr->n_channels) break;
+            channel_t *ch = &mgr->entries[client_idx].channel;
+
+            if (success) {
+                /* Fulfill the HTLC on the client's channel */
+                channel_fulfill_htlc(ch, htlc_id, preimage);
+
+                cJSON *ful = wire_build_update_fulfill_htlc(htlc_id, preimage);
+                wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FULFILL_HTLC, ful);
+                cJSON_Delete(ful);
+
+                /* Sign commitment */
+                unsigned char psig[32];
+                uint32_t nonce_idx;
+                if (channel_create_commitment_partial_sig(ch, psig, &nonce_idx)) {
+                    cJSON *cs = wire_build_commitment_signed(
+                        mgr->entries[client_idx].channel_id,
+                        ch->commitment_number, psig, nonce_idx);
+                    wire_send(lsp->client_fds[client_idx], MSG_COMMITMENT_SIGNED, cs);
+                    cJSON_Delete(cs);
+                }
+
+                printf("LSP: bridge pay fulfilled for client %zu htlc %llu\n",
+                       client_idx, (unsigned long long)htlc_id);
+            } else {
+                /* Fail the HTLC */
+                channel_fail_htlc(ch, htlc_id);
+                cJSON *fail = wire_build_update_fail_htlc(htlc_id, "bridge_pay_failed");
+                wire_send(lsp->client_fds[client_idx], MSG_UPDATE_FAIL_HTLC, fail);
+                cJSON_Delete(fail);
+
+                printf("LSP: bridge pay failed for client %zu htlc %llu\n",
+                       client_idx, (unsigned long long)htlc_id);
+            }
+            break;
+        }
+        return 1;
+    }
+
+    default:
+        fprintf(stderr, "LSP: unexpected bridge msg 0x%02x\n", msg->msg_type);
+        return 0;
+    }
+}
+
+/* --- Reconnection (Phase 16) --- */
+
+int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd) {
+    if (!mgr || !lsp || new_fd < 0) return 0;
+
+    /* 1. Recv MSG_RECONNECT */
+    wire_msg_t msg;
+    if (!wire_recv(new_fd, &msg) || msg.msg_type != MSG_RECONNECT) {
+        fprintf(stderr, "LSP reconnect: expected MSG_RECONNECT, got 0x%02x\n",
+                msg.msg_type);
+        if (msg.json) cJSON_Delete(msg.json);
+        wire_close(new_fd);
+        return 0;
+    }
+
+    /* 2. Parse pubkey + commitment_number */
+    secp256k1_pubkey client_pk;
+    uint64_t commitment_number;
+    if (!wire_parse_reconnect(msg.json, mgr->ctx, &client_pk, &commitment_number)) {
+        fprintf(stderr, "LSP reconnect: failed to parse MSG_RECONNECT\n");
+        cJSON_Delete(msg.json);
+        wire_close(new_fd);
+        return 0;
+    }
+    cJSON_Delete(msg.json);
+
+    /* 3. Match pubkey against lsp->client_pubkeys[] to find client index */
+    int found = -1;
+    unsigned char client_ser[33], cmp_ser[33];
+    size_t len1 = 33, len2 = 33;
+    secp256k1_ec_pubkey_serialize(mgr->ctx, client_ser, &len1, &client_pk,
+                                   SECP256K1_EC_COMPRESSED);
+    for (size_t c = 0; c < lsp->n_clients; c++) {
+        len2 = 33;
+        secp256k1_ec_pubkey_serialize(mgr->ctx, cmp_ser, &len2,
+                                       &lsp->client_pubkeys[c],
+                                       SECP256K1_EC_COMPRESSED);
+        if (memcmp(client_ser, cmp_ser, 33) == 0) {
+            found = (int)c;
+            break;
+        }
+    }
+
+    if (found < 0) {
+        fprintf(stderr, "LSP reconnect: unknown pubkey\n");
+        wire_close(new_fd);
+        return 0;
+    }
+    size_t c = (size_t)found;
+
+    /* 4. Verify commitment_number matches */
+    channel_t *ch = &mgr->entries[c].channel;
+    if (commitment_number != ch->commitment_number) {
+        fprintf(stderr, "LSP reconnect: commitment_number mismatch "
+                "(client=%llu, lsp=%llu) for slot %zu\n",
+                (unsigned long long)commitment_number,
+                (unsigned long long)ch->commitment_number, c);
+        /* Proceed anyway for PoC — the ACK will tell client the LSP's state */
+    }
+
+    /* 5. Close old client_fds[c] if still open */
+    if (lsp->client_fds[c] >= 0) {
+        wire_close(lsp->client_fds[c]);
+    }
+
+    /* 6. Set new fd */
+    lsp->client_fds[c] = new_fd;
+
+    /* 7. Re-init nonce pool */
+    if (!channel_init_nonce_pool(ch, MUSIG_NONCE_POOL_MAX)) {
+        fprintf(stderr, "LSP reconnect: nonce pool init failed for slot %zu\n", c);
+        return 0;
+    }
+
+    /* 8. Exchange CHANNEL_NONCES (send LSP's, recv client's) */
+    {
+        size_t nonce_count = ch->local_nonce_pool.count;
+        unsigned char (*pubnonces_ser)[66] =
+            (unsigned char (*)[66])calloc(nonce_count, 66);
+        if (!pubnonces_ser) return 0;
+
+        for (size_t i = 0; i < nonce_count; i++) {
+            musig_pubnonce_serialize(mgr->ctx,
+                pubnonces_ser[i], &ch->local_nonce_pool.nonces[i].pubnonce);
+        }
+
+        cJSON *nonce_msg = wire_build_channel_nonces(
+            mgr->entries[c].channel_id, (const unsigned char (*)[66])pubnonces_ser,
+            nonce_count);
+        if (!wire_send(new_fd, MSG_CHANNEL_NONCES, nonce_msg)) {
+            fprintf(stderr, "LSP reconnect: send CHANNEL_NONCES failed\n");
+            cJSON_Delete(nonce_msg);
+            free(pubnonces_ser);
+            return 0;
+        }
+        cJSON_Delete(nonce_msg);
+        free(pubnonces_ser);
+    }
+
+    /* Recv client's nonces */
+    {
+        wire_msg_t nonce_resp;
+        if (!wire_recv(new_fd, &nonce_resp) ||
+            nonce_resp.msg_type != MSG_CHANNEL_NONCES) {
+            fprintf(stderr, "LSP reconnect: expected CHANNEL_NONCES from client\n");
+            if (nonce_resp.json) cJSON_Delete(nonce_resp.json);
+            return 0;
+        }
+
+        uint32_t resp_ch_id;
+        unsigned char client_nonces[MUSIG_NONCE_POOL_MAX][66];
+        size_t client_nonce_count;
+        if (!wire_parse_channel_nonces(nonce_resp.json, &resp_ch_id,
+                                         client_nonces, MUSIG_NONCE_POOL_MAX,
+                                         &client_nonce_count)) {
+            fprintf(stderr, "LSP reconnect: failed to parse client nonces\n");
+            cJSON_Delete(nonce_resp.json);
+            return 0;
+        }
+        cJSON_Delete(nonce_resp.json);
+
+        channel_set_remote_pubnonces(ch,
+            (const unsigned char (*)[66])client_nonces, client_nonce_count);
+    }
+
+    /* 9. Send MSG_RECONNECT_ACK */
+    {
+        cJSON *ack = wire_build_reconnect_ack(
+            mgr->entries[c].channel_id,
+            ch->local_amount * 1000,   /* sats → msat */
+            ch->remote_amount * 1000,
+            ch->commitment_number);
+        if (!wire_send(new_fd, MSG_RECONNECT_ACK, ack)) {
+            fprintf(stderr, "LSP reconnect: send RECONNECT_ACK failed\n");
+            cJSON_Delete(ack);
+            return 0;
+        }
+        cJSON_Delete(ack);
+    }
+
+    printf("LSP: client %zu reconnected (commitment=%llu)\n",
+           c, (unsigned long long)ch->commitment_number);
+    return 1;
 }
 
 lsp_channel_entry_t *lsp_channels_get(lsp_channel_mgr_t *mgr, size_t client_idx) {
@@ -619,6 +1046,12 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (cfd > max_fd) max_fd = cfd;
         }
 
+        /* Include bridge fd in select if connected */
+        if (mgr->bridge_fd >= 0) {
+            FD_SET(mgr->bridge_fd, &rfds);
+            if (mgr->bridge_fd > max_fd) max_fd = mgr->bridge_fd;
+        }
+
         struct timeval tv;
         tv.tv_sec = 30;
         tv.tv_usec = 0;
@@ -628,6 +1061,22 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             fprintf(stderr, "LSP event loop: select timeout/error (handled %zu/%zu)\n",
                     handled, expected_msgs);
             return 0;
+        }
+
+        /* Handle bridge messages */
+        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+            wire_msg_t msg;
+            if (!wire_recv(mgr->bridge_fd, &msg)) {
+                fprintf(stderr, "LSP event loop: bridge recv failed\n");
+                mgr->bridge_fd = -1;  /* bridge disconnected */
+            } else {
+                if (!lsp_channels_handle_bridge_msg(mgr, lsp, &msg)) {
+                    fprintf(stderr, "LSP event loop: bridge handle failed 0x%02x\n",
+                            msg.msg_type);
+                }
+                cJSON_Delete(msg.json);
+                handled++;
+            }
         }
 
         for (size_t c = 0; c < mgr->n_channels; c++) {
@@ -649,6 +1098,491 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             handled++;
         }
     }
+
+    return 1;
+}
+
+int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                   volatile sig_atomic_t *shutdown_flag) {
+    if (!mgr || !lsp || !shutdown_flag) return 0;
+
+    printf("LSP: daemon loop started (Ctrl+C to stop)\n");
+
+    while (!(*shutdown_flag)) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        int max_fd = -1;
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            int cfd = lsp->client_fds[c];
+            if (cfd < 0) continue;  /* skip disconnected clients */
+            FD_SET(cfd, &rfds);
+            if (cfd > max_fd) max_fd = cfd;
+        }
+
+        /* Include bridge fd in select if connected */
+        if (mgr->bridge_fd >= 0) {
+            FD_SET(mgr->bridge_fd, &rfds);
+            if (mgr->bridge_fd > max_fd) max_fd = mgr->bridge_fd;
+        }
+
+        /* Include listen_fd for reconnections (Phase 16) */
+        if (lsp->listen_fd >= 0) {
+            FD_SET(lsp->listen_fd, &rfds);
+            if (lsp->listen_fd > max_fd) max_fd = lsp->listen_fd;
+        }
+
+        if (max_fd < 0) {
+            /* No fds to watch — all clients disconnected, no listen socket */
+            struct timeval tv = { .tv_sec = 5, .tv_usec = 0 };
+            select(0, NULL, NULL, NULL, &tv);
+            continue;
+        }
+
+        struct timeval tv;
+        tv.tv_sec = 5;
+        tv.tv_usec = 0;
+
+        int ret = select(max_fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) {
+            /* EINTR from signal — check shutdown flag */
+            continue;
+        }
+        if (ret == 0) {
+            /* Timeout — run watchtower check if available */
+            if (mgr->watchtower)
+                watchtower_check(mgr->watchtower);
+            continue;
+        }
+
+        /* Handle new connections on listen_fd (Phase 16 reconnection) */
+        if (lsp->listen_fd >= 0 && FD_ISSET(lsp->listen_fd, &rfds)) {
+            int new_fd = wire_accept(lsp->listen_fd);
+            if (new_fd >= 0) {
+                if (!lsp_channels_handle_reconnect(mgr, lsp, new_fd)) {
+                    fprintf(stderr, "LSP daemon: reconnect handshake failed\n");
+                    /* new_fd already closed by handle_reconnect on failure */
+                }
+            }
+        }
+
+        /* Handle bridge messages */
+        if (mgr->bridge_fd >= 0 && FD_ISSET(mgr->bridge_fd, &rfds)) {
+            wire_msg_t msg;
+            if (!wire_recv(mgr->bridge_fd, &msg)) {
+                fprintf(stderr, "LSP daemon: bridge disconnected\n");
+                mgr->bridge_fd = -1;
+            } else {
+                if (!lsp_channels_handle_bridge_msg(mgr, lsp, &msg)) {
+                    fprintf(stderr, "LSP daemon: bridge handle failed 0x%02x\n",
+                            msg.msg_type);
+                }
+                cJSON_Delete(msg.json);
+            }
+        }
+
+        for (size_t c = 0; c < mgr->n_channels; c++) {
+            if (lsp->client_fds[c] < 0) continue;
+            if (!FD_ISSET(lsp->client_fds[c], &rfds)) continue;
+
+            wire_msg_t msg;
+            if (!wire_recv(lsp->client_fds[c], &msg)) {
+                fprintf(stderr, "LSP daemon: client %zu disconnected\n", c);
+                wire_close(lsp->client_fds[c]);
+                lsp->client_fds[c] = -1;
+                continue;
+            }
+
+            if (!lsp_channels_handle_msg(mgr, lsp, c, &msg)) {
+                fprintf(stderr, "LSP daemon: handle_msg failed for client %zu "
+                        "msg 0x%02x\n", c, msg.msg_type);
+            }
+            cJSON_Delete(msg.json);
+        }
+    }
+
+    printf("LSP: daemon loop stopped (shutdown requested)\n");
+    return 1;
+}
+
+/* --- Demo mode (Phase 17) --- */
+
+void lsp_channels_print_balances(const lsp_channel_mgr_t *mgr) {
+    if (!mgr) return;
+    printf("\n  Channel | Client | Local (sats) | Remote (sats)\n");
+    printf("  --------+--------+--------------+--------------\n");
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        const channel_t *ch = &mgr->entries[c].channel;
+        printf("    %zu     |   %zu    |  %10llu  |  %10llu\n",
+               c, c + 1,
+               (unsigned long long)ch->local_amount,
+               (unsigned long long)ch->remote_amount);
+    }
+    printf("\n");
+}
+
+/* Wait for a specific message type from a client fd, processing
+   MSG_REGISTER_INVOICE messages that may arrive before the expected one.
+   Returns 1 on success with msg filled, 0 on error. */
+static int wait_for_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                          int fd, uint8_t expected_type, wire_msg_t *msg,
+                          int timeout_sec) {
+    (void)lsp;
+    struct timeval start, now;
+    gettimeofday(&start, NULL);
+
+    while (1) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+
+        gettimeofday(&now, NULL);
+        int elapsed = (int)(now.tv_sec - start.tv_sec);
+        int remaining = timeout_sec - elapsed;
+        if (remaining <= 0) return 0;
+
+        struct timeval tv = { .tv_sec = remaining, .tv_usec = 0 };
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret <= 0) return 0;
+
+        if (!wire_recv(fd, msg)) return 0;
+
+        if (msg->msg_type == expected_type)
+            return 1;
+
+        /* Handle MSG_REGISTER_INVOICE that arrives before INVOICE_CREATED */
+        if (msg->msg_type == MSG_REGISTER_INVOICE) {
+            unsigned char ph[32];
+            uint64_t am;
+            size_t dc;
+            if (wire_parse_register_invoice(msg->json, ph, &am, &dc))
+                lsp_channels_register_invoice(mgr, ph, dc, am);
+            cJSON_Delete(msg->json);
+            msg->json = NULL;
+            continue;
+        }
+
+        /* Unexpected message — skip */
+        fprintf(stderr, "LSP demo: expected 0x%02x, got 0x%02x (skipping)\n",
+                expected_type, msg->msg_type);
+        cJSON_Delete(msg->json);
+        msg->json = NULL;
+    }
+}
+
+int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                    size_t from_client, size_t to_client,
+                                    uint64_t amount_sats) {
+    if (!mgr || !lsp) return 0;
+    if (from_client >= mgr->n_channels || to_client >= mgr->n_channels) return 0;
+    if (from_client == to_client) return 0;
+
+    uint64_t amount_msat = amount_sats * 1000;
+
+    /* 1. Send MSG_CREATE_INVOICE to receiving client */
+    {
+        cJSON *inv_req = wire_build_create_invoice(amount_msat);
+        if (!wire_send(lsp->client_fds[to_client], MSG_CREATE_INVOICE, inv_req)) {
+            cJSON_Delete(inv_req);
+            fprintf(stderr, "LSP demo: send CREATE_INVOICE failed\n");
+            return 0;
+        }
+        cJSON_Delete(inv_req);
+    }
+
+    /* 2. Wait for MSG_INVOICE_CREATED from receiver */
+    unsigned char payment_hash[32];
+    {
+        wire_msg_t inv_resp;
+        if (!wait_for_msg(mgr, lsp, lsp->client_fds[to_client],
+                            MSG_INVOICE_CREATED, &inv_resp, 10)) {
+            fprintf(stderr, "LSP demo: timeout waiting for INVOICE_CREATED\n");
+            return 0;
+        }
+        uint64_t resp_amount;
+        if (!wire_parse_invoice_created(inv_resp.json, payment_hash, &resp_amount)) {
+            cJSON_Delete(inv_resp.json);
+            fprintf(stderr, "LSP demo: bad INVOICE_CREATED\n");
+            return 0;
+        }
+        cJSON_Delete(inv_resp.json);
+    }
+
+    /* 3. Drain any pending MSG_REGISTER_INVOICE from receiver */
+    {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(lsp->client_fds[to_client], &rfds);
+        struct timeval tv = { .tv_sec = 0, .tv_usec = 200000 }; /* 200ms */
+        while (select(lsp->client_fds[to_client] + 1, &rfds, NULL, NULL, &tv) > 0) {
+            wire_msg_t drain_msg;
+            if (!wire_recv(lsp->client_fds[to_client], &drain_msg)) break;
+            if (drain_msg.msg_type == MSG_REGISTER_INVOICE) {
+                unsigned char ph[32];
+                uint64_t am;
+                size_t dc;
+                if (wire_parse_register_invoice(drain_msg.json, ph, &am, &dc))
+                    lsp_channels_register_invoice(mgr, ph, dc, am);
+            }
+            cJSON_Delete(drain_msg.json);
+            FD_ZERO(&rfds);
+            FD_SET(lsp->client_fds[to_client], &rfds);
+            tv.tv_sec = 0;
+            tv.tv_usec = 200000;
+        }
+    }
+
+    /* 4. Add HTLC on sender's channel (HTLC_RECEIVED from LSP perspective) */
+    channel_t *sender_ch = &mgr->entries[from_client].channel;
+    uint64_t sender_htlc_id;
+    if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
+                           payment_hash, 500, &sender_htlc_id)) {
+        fprintf(stderr, "LSP demo: add_htlc on sender failed\n");
+        return 0;
+    }
+
+    /* 5. Send ADD_HTLC + COMMITMENT_SIGNED to sender */
+    {
+        cJSON *add = wire_build_update_add_htlc(sender_htlc_id, amount_msat,
+                                                   payment_hash, 500);
+        /* Add dest_client field so sender knows where it's going */
+        cJSON_AddNumberToObject(add, "dest_client", (double)to_client);
+        if (!wire_send(lsp->client_fds[from_client], MSG_UPDATE_ADD_HTLC, add)) {
+            cJSON_Delete(add);
+            return 0;
+        }
+        cJSON_Delete(add);
+    }
+    {
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx))
+            return 0;
+        cJSON *cs = wire_build_commitment_signed(
+            mgr->entries[from_client].channel_id,
+            sender_ch->commitment_number, psig32, nonce_idx);
+        if (!wire_send(lsp->client_fds[from_client], MSG_COMMITMENT_SIGNED, cs)) {
+            cJSON_Delete(cs);
+            return 0;
+        }
+        cJSON_Delete(cs);
+    }
+
+    /* 6. Wait for REVOKE_AND_ACK from sender */
+    {
+        wire_msg_t ack_msg;
+        if (!wire_recv(lsp->client_fds[from_client], &ack_msg) ||
+            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+            if (ack_msg.json) cJSON_Delete(ack_msg.json);
+            fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from sender\n");
+            return 0;
+        }
+        uint32_t ack_chan_id;
+        unsigned char rev_secret[32], next_point[33];
+        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                        rev_secret, next_point)) {
+            channel_receive_revocation(sender_ch,
+                                        sender_ch->commitment_number - 1,
+                                        rev_secret);
+        }
+        cJSON_Delete(ack_msg.json);
+    }
+
+    /* 7. Forward HTLC to destination client */
+    channel_t *dest_ch = &mgr->entries[to_client].channel;
+    uint64_t dest_htlc_id;
+    if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
+                           payment_hash, 500, &dest_htlc_id)) {
+        fprintf(stderr, "LSP demo: forward add_htlc failed\n");
+        return 0;
+    }
+
+    {
+        cJSON *fwd = wire_build_update_add_htlc(dest_htlc_id, amount_msat,
+                                                   payment_hash, 500);
+        if (!wire_send(lsp->client_fds[to_client], MSG_UPDATE_ADD_HTLC, fwd)) {
+            cJSON_Delete(fwd);
+            return 0;
+        }
+        cJSON_Delete(fwd);
+    }
+    {
+        unsigned char psig32[32];
+        uint32_t nonce_idx;
+        if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx))
+            return 0;
+        cJSON *cs = wire_build_commitment_signed(
+            mgr->entries[to_client].channel_id,
+            dest_ch->commitment_number, psig32, nonce_idx);
+        if (!wire_send(lsp->client_fds[to_client], MSG_COMMITMENT_SIGNED, cs)) {
+            cJSON_Delete(cs);
+            return 0;
+        }
+        cJSON_Delete(cs);
+    }
+
+    /* 8. Wait for REVOKE_AND_ACK from dest */
+    {
+        wire_msg_t ack_msg;
+        if (!wire_recv(lsp->client_fds[to_client], &ack_msg) ||
+            ack_msg.msg_type != MSG_REVOKE_AND_ACK) {
+            if (ack_msg.json) cJSON_Delete(ack_msg.json);
+            fprintf(stderr, "LSP demo: expected REVOKE_AND_ACK from dest\n");
+            return 0;
+        }
+        uint32_t ack_chan_id;
+        unsigned char rev_secret[32], next_point[33];
+        if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
+                                        rev_secret, next_point)) {
+            channel_receive_revocation(dest_ch,
+                                        dest_ch->commitment_number - 1,
+                                        rev_secret);
+        }
+        cJSON_Delete(ack_msg.json);
+    }
+
+    /* 9. Wait for FULFILL_HTLC from dest (client fulfills with real preimage) */
+    {
+        wire_msg_t ful_msg;
+        if (!wire_recv(lsp->client_fds[to_client], &ful_msg) ||
+            ful_msg.msg_type != MSG_UPDATE_FULFILL_HTLC) {
+            if (ful_msg.json) cJSON_Delete(ful_msg.json);
+            fprintf(stderr, "LSP demo: expected FULFILL from dest\n");
+            return 0;
+        }
+        uint64_t ful_htlc_id;
+        unsigned char preimage[32];
+        if (!wire_parse_update_fulfill_htlc(ful_msg.json, &ful_htlc_id, preimage)) {
+            cJSON_Delete(ful_msg.json);
+            return 0;
+        }
+        cJSON_Delete(ful_msg.json);
+
+        /* Fulfill on dest channel */
+        channel_fulfill_htlc(dest_ch, ful_htlc_id, preimage);
+
+        /* Send COMMITMENT_SIGNED to dest */
+        {
+            unsigned char psig32[32];
+            uint32_t nonce_idx;
+            if (!channel_create_commitment_partial_sig(dest_ch, psig32, &nonce_idx))
+                return 0;
+            cJSON *cs = wire_build_commitment_signed(
+                mgr->entries[to_client].channel_id,
+                dest_ch->commitment_number, psig32, nonce_idx);
+            wire_send(lsp->client_fds[to_client], MSG_COMMITMENT_SIGNED, cs);
+            cJSON_Delete(cs);
+        }
+
+        /* Wait for REVOKE_AND_ACK from dest */
+        {
+            wire_msg_t ack;
+            if (wire_recv(lsp->client_fds[to_client], &ack) &&
+                ack.msg_type == MSG_REVOKE_AND_ACK) {
+                uint32_t ack_chan_id;
+                unsigned char rev_secret[32], next_point[33];
+                if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
+                                                rev_secret, next_point)) {
+                    channel_receive_revocation(dest_ch,
+                                                dest_ch->commitment_number - 1,
+                                                rev_secret);
+                }
+            }
+            if (ack.json) cJSON_Delete(ack.json);
+        }
+
+        /* 10. Back-propagate fulfill to sender */
+        channel_fulfill_htlc(sender_ch, sender_htlc_id, preimage);
+
+        cJSON *ful_fwd = wire_build_update_fulfill_htlc(sender_htlc_id, preimage);
+        wire_send(lsp->client_fds[from_client], MSG_UPDATE_FULFILL_HTLC, ful_fwd);
+        cJSON_Delete(ful_fwd);
+
+        /* Send COMMITMENT_SIGNED to sender */
+        {
+            unsigned char psig32[32];
+            uint32_t nonce_idx;
+            if (!channel_create_commitment_partial_sig(sender_ch, psig32, &nonce_idx))
+                return 0;
+            cJSON *cs = wire_build_commitment_signed(
+                mgr->entries[from_client].channel_id,
+                sender_ch->commitment_number, psig32, nonce_idx);
+            wire_send(lsp->client_fds[from_client], MSG_COMMITMENT_SIGNED, cs);
+            cJSON_Delete(cs);
+        }
+
+        /* Wait for REVOKE_AND_ACK from sender */
+        {
+            wire_msg_t ack;
+            if (wire_recv(lsp->client_fds[from_client], &ack) &&
+                ack.msg_type == MSG_REVOKE_AND_ACK) {
+                uint32_t ack_chan_id;
+                unsigned char rev_secret[32], next_point[33];
+                if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
+                                                rev_secret, next_point)) {
+                    channel_receive_revocation(sender_ch,
+                                                sender_ch->commitment_number - 1,
+                                                rev_secret);
+                }
+            }
+            if (ack.json) cJSON_Delete(ack.json);
+        }
+    }
+
+    printf("  Payment complete: client %zu -> client %zu (%llu sats)\n",
+           from_client + 1, to_client + 1, (unsigned long long)amount_sats);
+    return 1;
+}
+
+int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
+    if (!mgr || !lsp) return 0;
+
+    printf("\n");
+    printf("======================================================\n");
+    printf("  SuperScalar Factory Demo - Payment Sequence\n");
+    printf("======================================================\n");
+    printf("\n");
+
+    printf("Factory created with %zu channels (1 LSP + %zu clients)\n",
+           mgr->n_channels, mgr->n_channels);
+    printf("Initial balances:\n");
+    lsp_channels_print_balances(mgr);
+
+    /* Payment 1: Client 1 pays Client 2 */
+    printf("--- Payment 1: Client 1 -> Client 2 (10,000 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 0, 1, 10000)) {
+        fprintf(stderr, "LSP demo: payment 1 failed\n");
+        return 0;
+    }
+    lsp_channels_print_balances(mgr);
+
+    /* Payment 2: Client 3 pays Client 1 */
+    printf("--- Payment 2: Client 3 -> Client 1 (5,000 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 2, 0, 5000)) {
+        fprintf(stderr, "LSP demo: payment 2 failed\n");
+        return 0;
+    }
+    lsp_channels_print_balances(mgr);
+
+    /* Payment 3: Client 4 pays Client 3 */
+    printf("--- Payment 3: Client 4 -> Client 3 (7,500 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 3, 2, 7500)) {
+        fprintf(stderr, "LSP demo: payment 3 failed\n");
+        return 0;
+    }
+    lsp_channels_print_balances(mgr);
+
+    /* Payment 4: Client 2 pays Client 4 */
+    printf("--- Payment 4: Client 2 -> Client 4 (3,000 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 1, 3, 3000)) {
+        fprintf(stderr, "LSP demo: payment 4 failed\n");
+        return 0;
+    }
+
+    printf("\n");
+    printf("======================================================\n");
+    printf("  Demo Complete - Final Balances\n");
+    printf("======================================================\n");
+    lsp_channels_print_balances(mgr);
 
     return 1;
 }

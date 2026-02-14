@@ -2,6 +2,7 @@
 #define SUPERSCALAR_CLIENT_H
 
 #include "channel.h"
+#include "persist.h"
 #include "wire.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
@@ -19,11 +20,19 @@ int client_run_ceremony(secp256k1_context *ctx,
    channel: the client's channel with the LSP.
    my_index: participant index (1..N).
    ctx: secp256k1 context.
+   keypair: client's keypair (needed for close ceremony in daemon mode).
+   factory: the factory (needed for close ceremony in daemon mode).
+   n_participants: number of participants in the factory.
    user_data: opaque pointer for test harness.
-   Return 1 to continue, 0 to close. */
+   Return 1: caller runs close ceremony.
+   Return 0: error.
+   Return 2: callback already handled close, caller skips it. */
 typedef int (*client_channel_cb_t)(int fd, channel_t *channel,
                                     uint32_t my_index,
                                     secp256k1_context *ctx,
+                                    const secp256k1_keypair *keypair,
+                                    factory_t *factory,
+                                    size_t n_participants,
                                     void *user_data);
 
 /* Run the full ceremony with optional channel operations.
@@ -35,6 +44,28 @@ int client_run_with_channels(secp256k1_context *ctx,
                               const char *host, int port,
                               client_channel_cb_t channel_cb,
                               void *user_data);
+
+/* Perform the cooperative close ceremony on an already-received CLOSE_PROPOSE.
+   If initial_msg is non-NULL, it is the already-received CLOSE_PROPOSE message;
+   otherwise we recv it from the wire.
+   Returns 1 on success. */
+int client_do_close_ceremony(int fd, secp256k1_context *ctx,
+                               const secp256k1_keypair *keypair,
+                               const secp256k1_pubkey *my_pubkey,
+                               factory_t *factory,
+                               size_t n_participants,
+                               const wire_msg_t *initial_msg);
+
+/* Reconnect to LSP using persisted state from SQLite.
+   Loads factory + channel from DB, sends MSG_RECONNECT, receives
+   MSG_RECONNECT_ACK, re-exchanges nonces, then calls channel_cb.
+   Returns 1 on success. */
+int client_run_reconnect(secp256k1_context *ctx,
+                           const secp256k1_keypair *keypair,
+                           const char *host, int port,
+                           persist_t *db,
+                           client_channel_cb_t channel_cb,
+                           void *user_data);
 
 /* --- Client-side channel message handlers --- */
 

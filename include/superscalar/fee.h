@@ -1,0 +1,27 @@
+#ifndef SUPERSCALAR_FEE_H
+#define SUPERSCALAR_FEE_H
+
+#include <stdint.h>
+#include <stddef.h>
+
+typedef struct {
+    uint64_t fee_rate_sat_per_kvb;  /* sat/kilo-vbyte (matches Core's units) */
+    int use_estimatesmartfee;        /* if 1, try bitcoin-cli estimatesmartfee */
+} fee_estimator_t;
+
+/* Initialize with a default fee rate (1000 sat/kvB = 1 sat/vB). */
+void fee_init(fee_estimator_t *fe, uint64_t default_rate_sat_per_kvb);
+
+/* Estimate fee for a tx of given virtual size. Returns fee in sats. */
+uint64_t fee_estimate(const fee_estimator_t *fe, size_t vsize_bytes);
+
+/* Convenience: penalty tx is ~152 vB (1-in, 1-out, keypath schnorr). */
+uint64_t fee_for_penalty_tx(const fee_estimator_t *fe);
+
+/* Convenience: HTLC resolution tx is ~180 vB. */
+uint64_t fee_for_htlc_tx(const fee_estimator_t *fe);
+
+/* Convenience: factory tree tx (variable). */
+uint64_t fee_for_factory_tx(const fee_estimator_t *fe, size_t n_outputs);
+
+#endif /* SUPERSCALAR_FEE_H */

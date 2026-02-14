@@ -254,6 +254,7 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->local_amount = local_amount;
     ch->remote_amount = remote_amount;
     ch->to_self_delay = to_self_delay;
+    ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB */
     ch->commitment_number = 0;
 
     shachain_init(&ch->received_secrets);
@@ -603,8 +604,9 @@ int channel_build_penalty_tx(const channel_t *ch,
     secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
                                         &out_tweaked_full);
 
-    /* Fee: 500 sats */
-    uint64_t penalty_amount = to_local_amount > 500 ? to_local_amount - 500 : 0;
+    /* Fee: computed from fee rate (~152 vB penalty tx) */
+    uint64_t penalty_fee = (ch->fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    uint64_t penalty_amount = to_local_amount > penalty_fee ? to_local_amount - penalty_fee : 0;
 
     tx_output_t output;
     build_p2tr_script_pubkey(output.script_pubkey, &out_tweaked);
@@ -1133,7 +1135,8 @@ int channel_build_htlc_success_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
     secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
                                         &dest_tweaked_full);
 
-    uint64_t out_amount = htlc_amount > 500 ? htlc_amount - 500 : 0;
+    uint64_t htlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
+    uint64_t out_amount = htlc_amount > htlc_fee ? htlc_amount - htlc_fee : 0;
     tx_output_t output;
     build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
     output.script_pubkey_len = 34;
@@ -1270,7 +1273,8 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
     secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &dest_tweaked, NULL,
                                         &dest_tweaked_full);
 
-    uint64_t out_amount = htlc_amount > 500 ? htlc_amount - 500 : 0;
+    uint64_t htlc_fee = (ch->fee_rate_sat_per_kvb * 180 + 999) / 1000;
+    uint64_t out_amount = htlc_amount > htlc_fee ? htlc_amount - htlc_fee : 0;
     tx_output_t output;
     build_p2tr_script_pubkey(output.script_pubkey, &dest_tweaked);
     output.script_pubkey_len = 34;
@@ -1467,7 +1471,8 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
                                         &out_tweaked_full);
 
-    uint64_t penalty_amount = htlc_amount > 500 ? htlc_amount - 500 : 0;
+    uint64_t htlc_penalty_fee = (ch->fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    uint64_t penalty_amount = htlc_amount > htlc_penalty_fee ? htlc_amount - htlc_penalty_fee : 0;
 
     tx_output_t output;
     build_p2tr_script_pubkey(output.script_pubkey, &out_tweaked);

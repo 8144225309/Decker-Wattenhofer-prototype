@@ -174,6 +174,47 @@ extern int test_persist_factory_round_trip(void);
 extern int test_persist_nonce_pool_round_trip(void);
 extern int test_persist_multi_channel(void);
 
+/* Phase 14: CLN Bridge */
+extern int test_bridge_msg_round_trip(void);
+extern int test_bridge_hello_handshake(void);
+extern int test_bridge_invoice_registry(void);
+extern int test_bridge_inbound_flow(void);
+extern int test_bridge_outbound_flow(void);
+extern int test_bridge_unknown_hash(void);
+extern int test_lsp_bridge_accept(void);
+extern int test_lsp_inbound_via_bridge(void);
+
+/* Phase 15: Daemon mode */
+extern int test_register_invoice_wire(void);
+extern int test_daemon_event_loop(void);
+extern int test_client_daemon_autofulfill(void);
+
+/* Phase 16: Reconnection */
+extern int test_reconnect_wire(void);
+extern int test_reconnect_pubkey_match(void);
+extern int test_reconnect_nonce_reexchange(void);
+extern int test_client_persist_reload(void);
+
+/* Phase 17: Demo polish */
+extern int test_create_invoice_wire(void);
+extern int test_preimage_fulfills_htlc(void);
+extern int test_balance_reporting(void);
+
+/* Phase 18: Watchtower + Fees */
+extern int test_fee_init_default(void);
+extern int test_fee_penalty_tx(void);
+extern int test_fee_factory_tx(void);
+extern int test_watchtower_watch_and_check(void);
+extern int test_persist_old_commitments(void);
+extern int test_regtest_get_raw_tx_api(void);
+
+/* Phase 19: Encrypted Transport */
+extern int test_chacha20_poly1305_rfc7539(void);
+extern int test_hmac_sha256_rfc4231(void);
+extern int test_noise_handshake(void);
+extern int test_encrypted_wire_round_trip(void);
+extern int test_encrypted_tamper_reject(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -303,6 +344,47 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_factory_round_trip);
     RUN_TEST(test_persist_nonce_pool_round_trip);
     RUN_TEST(test_persist_multi_channel);
+
+    printf("\n=== CLN Bridge (Phase 14) ===\n");
+    RUN_TEST(test_bridge_msg_round_trip);
+    RUN_TEST(test_bridge_hello_handshake);
+    RUN_TEST(test_bridge_invoice_registry);
+    RUN_TEST(test_bridge_inbound_flow);
+    RUN_TEST(test_bridge_outbound_flow);
+    RUN_TEST(test_bridge_unknown_hash);
+    RUN_TEST(test_lsp_bridge_accept);
+    RUN_TEST(test_lsp_inbound_via_bridge);
+
+    printf("\n=== Daemon Mode (Phase 15) ===\n");
+    RUN_TEST(test_register_invoice_wire);
+    RUN_TEST(test_daemon_event_loop);
+    RUN_TEST(test_client_daemon_autofulfill);
+
+    printf("\n=== Reconnection (Phase 16) ===\n");
+    RUN_TEST(test_reconnect_wire);
+    RUN_TEST(test_reconnect_pubkey_match);
+    RUN_TEST(test_reconnect_nonce_reexchange);
+    RUN_TEST(test_client_persist_reload);
+
+    printf("\n=== Demo Polish (Phase 17) ===\n");
+    RUN_TEST(test_create_invoice_wire);
+    RUN_TEST(test_preimage_fulfills_htlc);
+    RUN_TEST(test_balance_reporting);
+
+    printf("\n=== Watchtower + Fees (Phase 18) ===\n");
+    RUN_TEST(test_fee_init_default);
+    RUN_TEST(test_fee_penalty_tx);
+    RUN_TEST(test_fee_factory_tx);
+    RUN_TEST(test_watchtower_watch_and_check);
+    RUN_TEST(test_persist_old_commitments);
+    RUN_TEST(test_regtest_get_raw_tx_api);
+
+    printf("\n=== Encrypted Transport (Phase 19) ===\n");
+    RUN_TEST(test_chacha20_poly1305_rfc7539);
+    RUN_TEST(test_hmac_sha256_rfc4231);
+    RUN_TEST(test_noise_handshake);
+    RUN_TEST(test_encrypted_wire_round_trip);
+    RUN_TEST(test_encrypted_tamper_reject);
 }
 
 static void run_regtest_tests(void) {
@@ -347,8 +429,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-10)\n");
-    printf("==================================\n");
+    printf("SuperScalar Test Suite (Phase 1-19)\n");
+    printf("===================================\n");
 
     if (run_unit) run_unit_tests();
     if (run_regtest) run_regtest_tests();

@@ -1,5 +1,7 @@
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
+#include "superscalar/noise.h"
+#include "superscalar/crypto_aead.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -70,7 +72,10 @@ int wire_connect(const char *host, int port) {
 }
 
 void wire_close(int fd) {
-    if (fd >= 0) close(fd);
+    if (fd >= 0) {
+        wire_clear_encryption(fd);
+        close(fd);
+    }
 }
 
 int wire_set_timeout(int fd, int timeout_sec) {
@@ -106,13 +111,64 @@ static int read_all(int fd, unsigned char *buf, size_t len) {
 
 /* --- Framing --- */
 
+/* Build 12-byte nonce from 8-byte LE counter: [4 zero bytes][8-byte LE seq] */
+static void make_nonce(unsigned char nonce[12], uint64_t seq) {
+    memset(nonce, 0, 4);
+    for (int i = 0; i < 8; i++) {
+        nonce[4 + i] = (unsigned char)(seq & 0xff);
+        seq >>= 8;
+    }
+}
+
 int wire_send(int fd, uint8_t msg_type, cJSON *json) {
     char *payload = cJSON_PrintUnformatted(json);
     if (!payload) return 0;
 
     uint32_t payload_len = (uint32_t)strlen(payload);
-    uint32_t frame_len = 1 + payload_len;  /* type byte + JSON */
+    uint32_t pt_len = 1 + payload_len;  /* type byte + JSON */
 
+    noise_state_t *ns = wire_get_encryption(fd);
+    if (ns) {
+        /* Encrypt: plaintext = [type][JSON] */
+        unsigned char *plaintext = (unsigned char *)malloc(pt_len);
+        if (!plaintext) { free(payload); return 0; }
+        plaintext[0] = msg_type;
+        memcpy(plaintext + 1, payload, payload_len);
+        free(payload);
+
+        unsigned char *ciphertext = (unsigned char *)malloc(pt_len);
+        unsigned char tag[16];
+        if (!ciphertext) { free(plaintext); return 0; }
+
+        unsigned char nonce[12];
+        make_nonce(nonce, ns->send_nonce);
+
+        if (!aead_encrypt(ciphertext, tag, plaintext, pt_len,
+                          NULL, 0, ns->send_key, nonce)) {
+            free(plaintext);
+            free(ciphertext);
+            return 0;
+        }
+        free(plaintext);
+        ns->send_nonce++;
+
+        /* Write: [4-byte len = pt_len + 16][ciphertext][tag] */
+        uint32_t frame_len = pt_len + 16;
+        unsigned char header[4];
+        header[0] = (unsigned char)(frame_len >> 24);
+        header[1] = (unsigned char)(frame_len >> 16);
+        header[2] = (unsigned char)(frame_len >> 8);
+        header[3] = (unsigned char)(frame_len);
+
+        int ok = write_all(fd, header, 4) &&
+                 write_all(fd, ciphertext, pt_len) &&
+                 write_all(fd, tag, 16);
+        free(ciphertext);
+        return ok;
+    }
+
+    /* Plaintext path (no encryption) */
+    uint32_t frame_len = pt_len;
     unsigned char header[5];
     header[0] = (unsigned char)(frame_len >> 24);
     header[1] = (unsigned char)(frame_len >> 16);
@@ -127,7 +183,7 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
 }
 
 int wire_recv(int fd, wire_msg_t *msg) {
-    unsigned char header[5];
+    unsigned char header[4];
     if (!read_all(fd, header, 4)) return 0;
 
     uint32_t frame_len = ((uint32_t)header[0] << 24) |
@@ -136,8 +192,54 @@ int wire_recv(int fd, wire_msg_t *msg) {
                           ((uint32_t)header[3]);
     if (frame_len < 1 || frame_len > WIRE_MAX_FRAME_SIZE) return 0;
 
-    if (!read_all(fd, &header[4], 1)) return 0;
-    msg->msg_type = header[4];
+    noise_state_t *ns = wire_get_encryption(fd);
+    if (ns) {
+        /* Encrypted: frame_len includes 16-byte tag */
+        if (frame_len < 17) return 0;  /* at least 1 byte pt + 16 tag */
+        uint32_t ct_len = frame_len - 16;
+
+        unsigned char *ct_and_tag = (unsigned char *)malloc(frame_len);
+        if (!ct_and_tag) return 0;
+        if (!read_all(fd, ct_and_tag, frame_len)) {
+            free(ct_and_tag);
+            return 0;
+        }
+
+        unsigned char *ciphertext = ct_and_tag;
+        unsigned char *tag = ct_and_tag + ct_len;
+
+        unsigned char *plaintext = (unsigned char *)malloc(ct_len);
+        if (!plaintext) { free(ct_and_tag); return 0; }
+
+        unsigned char nonce[12];
+        make_nonce(nonce, ns->recv_nonce);
+
+        if (!aead_decrypt(plaintext, ciphertext, ct_len, tag,
+                          NULL, 0, ns->recv_key, nonce)) {
+            free(ct_and_tag);
+            free(plaintext);
+            return 0;
+        }
+        free(ct_and_tag);
+        ns->recv_nonce++;
+
+        msg->msg_type = plaintext[0];
+        uint32_t json_len = ct_len - 1;
+        char *buf = (char *)malloc(json_len + 1);
+        if (!buf) { free(plaintext); return 0; }
+        memcpy(buf, plaintext + 1, json_len);
+        buf[json_len] = '\0';
+        free(plaintext);
+
+        msg->json = cJSON_Parse(buf);
+        free(buf);
+        return msg->json ? 1 : 0;
+    }
+
+    /* Plaintext path */
+    unsigned char type_byte;
+    if (!read_all(fd, &type_byte, 1)) return 0;
+    msg->msg_type = type_byte;
 
     uint32_t json_len = frame_len - 1;
     char *buf = (char *)malloc(json_len + 1);
@@ -536,6 +638,293 @@ int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
     return 1;
 }
 
+/* --- Bridge message builders (Phase 14) --- */
+
+cJSON *wire_build_bridge_hello(void) {
+    return cJSON_CreateObject();
+}
+
+cJSON *wire_build_bridge_hello_ack(void) {
+    return cJSON_CreateObject();
+}
+
+cJSON *wire_build_bridge_add_htlc(const unsigned char *payment_hash32,
+                                    uint64_t amount_msat, uint32_t cltv_expiry,
+                                    uint64_t htlc_id) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
+    cJSON_AddNumberToObject(j, "cltv_expiry", cltv_expiry);
+    cJSON_AddNumberToObject(j, "htlc_id", (double)htlc_id);
+    return j;
+}
+
+cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
+                                        const unsigned char *preimage32,
+                                        uint64_t htlc_id) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    wire_json_add_hex(j, "preimage", preimage32, 32);
+    cJSON_AddNumberToObject(j, "htlc_id", (double)htlc_id);
+    return j;
+}
+
+cJSON *wire_build_bridge_fail_htlc(const unsigned char *payment_hash32,
+                                     const char *reason, uint64_t htlc_id) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddStringToObject(j, "reason", reason ? reason : "unknown");
+    cJSON_AddNumberToObject(j, "htlc_id", (double)htlc_id);
+    return j;
+}
+
+cJSON *wire_build_bridge_send_pay(const char *bolt11,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t request_id) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddStringToObject(j, "bolt11", bolt11);
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    return j;
+}
+
+cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
+                                      const unsigned char *preimage32) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "request_id", (double)request_id);
+    cJSON_AddBoolToObject(j, "success", success);
+    if (preimage32)
+        wire_json_add_hex(j, "preimage", preimage32, 32);
+    return j;
+}
+
+cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
+                                    uint64_t amount_msat, size_t dest_client) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
+    cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
+    return j;
+}
+
+/* --- Register invoice (Phase 15) --- */
+
+cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
+                                     uint64_t amount_msat, size_t dest_client) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
+    cJSON_AddNumberToObject(j, "dest_client", (double)dest_client);
+    return j;
+}
+
+int wire_parse_register_invoice(const cJSON *json,
+                                  unsigned char *payment_hash32,
+                                  uint64_t *amount_msat, size_t *dest_client) {
+    cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
+    cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
+    if (!am || !cJSON_IsNumber(am) || !dc || !cJSON_IsNumber(dc))
+        return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    *amount_msat = (uint64_t)am->valuedouble;
+    *dest_client = (size_t)dc->valuedouble;
+    return 1;
+}
+
+/* --- Bridge message parsers (Phase 14) --- */
+
+int wire_parse_bridge_add_htlc(const cJSON *json,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *amount_msat, uint32_t *cltv_expiry,
+                                 uint64_t *htlc_id) {
+    cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
+    cJSON *ce = cJSON_GetObjectItem(json, "cltv_expiry");
+    cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
+    if (!am || !cJSON_IsNumber(am) || !ce || !cJSON_IsNumber(ce) ||
+        !hi || !cJSON_IsNumber(hi))
+        return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    *amount_msat = (uint64_t)am->valuedouble;
+    *cltv_expiry = (uint32_t)ce->valuedouble;
+    *htlc_id = (uint64_t)hi->valuedouble;
+    return 1;
+}
+
+int wire_parse_bridge_fulfill_htlc(const cJSON *json,
+                                     unsigned char *payment_hash32,
+                                     unsigned char *preimage32,
+                                     uint64_t *htlc_id) {
+    cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
+    if (!hi || !cJSON_IsNumber(hi)) return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    if (wire_json_get_hex(json, "preimage", preimage32, 32) != 32)
+        return 0;
+    *htlc_id = (uint64_t)hi->valuedouble;
+    return 1;
+}
+
+int wire_parse_bridge_fail_htlc(const cJSON *json,
+                                  unsigned char *payment_hash32,
+                                  char *reason, size_t reason_len,
+                                  uint64_t *htlc_id) {
+    cJSON *hi = cJSON_GetObjectItem(json, "htlc_id");
+    if (!hi || !cJSON_IsNumber(hi)) return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    *htlc_id = (uint64_t)hi->valuedouble;
+    if (reason && reason_len > 0) {
+        cJSON *re = cJSON_GetObjectItem(json, "reason");
+        if (re && cJSON_IsString(re)) {
+            strncpy(reason, re->valuestring, reason_len - 1);
+            reason[reason_len - 1] = '\0';
+        } else {
+            reason[0] = '\0';
+        }
+    }
+    return 1;
+}
+
+int wire_parse_bridge_send_pay(const cJSON *json,
+                                 char *bolt11, size_t bolt11_len,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *request_id) {
+    cJSON *b = cJSON_GetObjectItem(json, "bolt11");
+    cJSON *ri = cJSON_GetObjectItem(json, "request_id");
+    if (!b || !cJSON_IsString(b) || !ri || !cJSON_IsNumber(ri))
+        return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    *request_id = (uint64_t)ri->valuedouble;
+    if (bolt11 && bolt11_len > 0) {
+        strncpy(bolt11, b->valuestring, bolt11_len - 1);
+        bolt11[bolt11_len - 1] = '\0';
+    }
+    return 1;
+}
+
+int wire_parse_bridge_pay_result(const cJSON *json,
+                                   uint64_t *request_id, int *success,
+                                   unsigned char *preimage32) {
+    cJSON *ri = cJSON_GetObjectItem(json, "request_id");
+    cJSON *su = cJSON_GetObjectItem(json, "success");
+    if (!ri || !cJSON_IsNumber(ri) || !su || !cJSON_IsBool(su))
+        return 0;
+    *request_id = (uint64_t)ri->valuedouble;
+    *success = cJSON_IsTrue(su) ? 1 : 0;
+    if (*success && preimage32)
+        wire_json_get_hex(json, "preimage", preimage32, 32);
+    return 1;
+}
+
+int wire_parse_bridge_register(const cJSON *json,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *amount_msat, size_t *dest_client) {
+    cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
+    cJSON *dc = cJSON_GetObjectItem(json, "dest_client");
+    if (!am || !cJSON_IsNumber(am) || !dc || !cJSON_IsNumber(dc))
+        return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    *amount_msat = (uint64_t)am->valuedouble;
+    *dest_client = (size_t)dc->valuedouble;
+    return 1;
+}
+
+/* --- Reconnection messages (Phase 16) --- */
+
+cJSON *wire_build_reconnect(const secp256k1_context *ctx,
+                              const secp256k1_pubkey *pubkey,
+                              uint64_t commitment_number) {
+    cJSON *j = cJSON_CreateObject();
+    char hex[67];
+    pubkey_to_hex(ctx, pubkey, hex);
+    cJSON_AddStringToObject(j, "pubkey", hex);
+    cJSON_AddNumberToObject(j, "commitment_number", (double)commitment_number);
+    return j;
+}
+
+int wire_parse_reconnect(const cJSON *json, const secp256k1_context *ctx,
+                           secp256k1_pubkey *pubkey_out,
+                           uint64_t *commitment_number_out) {
+    cJSON *pk = cJSON_GetObjectItem(json, "pubkey");
+    cJSON *cn = cJSON_GetObjectItem(json, "commitment_number");
+    if (!pk || !cJSON_IsString(pk) || !cn || !cJSON_IsNumber(cn))
+        return 0;
+    if (!hex_to_pubkey(ctx, pubkey_out, pk->valuestring))
+        return 0;
+    *commitment_number_out = (uint64_t)cn->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_reconnect_ack(uint32_t channel_id,
+                                  uint64_t local_amount_msat,
+                                  uint64_t remote_amount_msat,
+                                  uint64_t commitment_number) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "channel_id", channel_id);
+    cJSON_AddNumberToObject(j, "local_amount_msat", (double)local_amount_msat);
+    cJSON_AddNumberToObject(j, "remote_amount_msat", (double)remote_amount_msat);
+    cJSON_AddNumberToObject(j, "commitment_number", (double)commitment_number);
+    return j;
+}
+
+int wire_parse_reconnect_ack(const cJSON *json, uint32_t *channel_id,
+                                uint64_t *local_amount_msat,
+                                uint64_t *remote_amount_msat,
+                                uint64_t *commitment_number) {
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
+    cJSON *la = cJSON_GetObjectItem(json, "local_amount_msat");
+    cJSON *ra = cJSON_GetObjectItem(json, "remote_amount_msat");
+    cJSON *cn = cJSON_GetObjectItem(json, "commitment_number");
+    if (!ci || !cJSON_IsNumber(ci) || !la || !cJSON_IsNumber(la) ||
+        !ra || !cJSON_IsNumber(ra) || !cn || !cJSON_IsNumber(cn))
+        return 0;
+    *channel_id = (uint32_t)ci->valuedouble;
+    *local_amount_msat = (uint64_t)la->valuedouble;
+    *remote_amount_msat = (uint64_t)ra->valuedouble;
+    *commitment_number = (uint64_t)cn->valuedouble;
+    return 1;
+}
+
+/* --- Invoice messages (Phase 17) --- */
+
+cJSON *wire_build_create_invoice(uint64_t amount_msat) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
+    return j;
+}
+
+int wire_parse_create_invoice(const cJSON *json, uint64_t *amount_msat) {
+    cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
+    if (!am || !cJSON_IsNumber(am))
+        return 0;
+    *amount_msat = (uint64_t)am->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_invoice_created(const unsigned char *payment_hash32,
+                                    uint64_t amount_msat) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "payment_hash", payment_hash32, 32);
+    cJSON_AddNumberToObject(j, "amount_msat", (double)amount_msat);
+    return j;
+}
+
+int wire_parse_invoice_created(const cJSON *json,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *amount_msat) {
+    cJSON *am = cJSON_GetObjectItem(json, "amount_msat");
+    if (!am || !cJSON_IsNumber(am))
+        return 0;
+    if (wire_json_get_hex(json, "payment_hash", payment_hash32, 32) != 32)
+        return 0;
+    *amount_msat = (uint64_t)am->valuedouble;
+    return 1;
+}
+
 /* --- Bundle parsing --- */
 
 size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
@@ -563,4 +952,24 @@ size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
         count++;
     }
     return count;
+}
+
+/* --- Encrypted transport convenience (Phase 19) --- */
+
+int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx) {
+    noise_state_t ns;
+    if (!noise_handshake_initiator(&ns, fd, ctx))
+        return 0;
+    wire_set_encryption(fd, &ns);
+    memset(&ns, 0, sizeof(ns));
+    return 1;
+}
+
+int wire_noise_handshake_responder(int fd, secp256k1_context *ctx) {
+    noise_state_t ns;
+    if (!noise_handshake_responder(&ns, fd, ctx))
+        return 0;
+    wire_set_encryption(fd, &ns);
+    memset(&ns, 0, sizeof(ns));
+    return 1;
 }

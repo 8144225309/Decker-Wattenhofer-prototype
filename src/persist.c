@@ -61,6 +61,15 @@ static const char *SCHEMA_SQL =
     "  pool_data BLOB,"
     "  next_index INTEGER DEFAULT 0,"
     "  PRIMARY KEY (channel_id, side)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS old_commitments ("
+    "  channel_id INTEGER NOT NULL,"
+    "  commit_num INTEGER NOT NULL,"
+    "  txid TEXT NOT NULL,"
+    "  to_local_vout INTEGER NOT NULL,"
+    "  to_local_amount INTEGER NOT NULL,"
+    "  to_local_spk TEXT NOT NULL,"
+    "  PRIMARY KEY (channel_id, commit_num)"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -603,4 +612,88 @@ int persist_load_nonce_pool(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return 1;
+}
+
+/* --- Old commitments (watchtower) --- */
+
+int persist_save_old_commitment(persist_t *p, uint32_t channel_id,
+                                  uint64_t commit_num,
+                                  const unsigned char *txid32,
+                                  uint32_t to_local_vout,
+                                  uint64_t to_local_amount,
+                                  const unsigned char *to_local_spk,
+                                  size_t spk_len) {
+    if (!p || !p->db || !txid32 || !to_local_spk) return 0;
+
+    char txid_hex[65], spk_hex[69];
+    hex_encode(txid32, 32, txid_hex);
+    hex_encode(to_local_spk, spk_len, spk_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO old_commitments "
+        "(channel_id, commit_num, txid, to_local_vout, to_local_amount, to_local_spk) "
+        "VALUES (?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+    sqlite3_bind_text(stmt, 3, txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 4, (int)to_local_vout);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)to_local_amount);
+    sqlite3_bind_text(stmt, 6, spk_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
+                                      uint64_t *commit_nums,
+                                      unsigned char (*txids)[32],
+                                      uint32_t *vouts,
+                                      uint64_t *amounts,
+                                      unsigned char (*spks)[34],
+                                      size_t *spk_lens,
+                                      size_t max_entries) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT commit_num, txid, to_local_vout, to_local_amount, to_local_spk "
+        "FROM old_commitments WHERE channel_id = ? ORDER BY commit_num ASC;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_entries) {
+        if (commit_nums)
+            commit_nums[count] = (uint64_t)sqlite3_column_int64(stmt, 0);
+
+        const char *txid_hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (txid_hex && txids)
+            hex_decode(txid_hex, txids[count], 32);
+
+        if (vouts)
+            vouts[count] = (uint32_t)sqlite3_column_int(stmt, 2);
+
+        if (amounts)
+            amounts[count] = (uint64_t)sqlite3_column_int64(stmt, 3);
+
+        const char *spk_hex_str = (const char *)sqlite3_column_text(stmt, 4);
+        if (spk_hex_str && spks && spk_lens) {
+            int decoded = hex_decode(spk_hex_str, spks[count], 34);
+            spk_lens[count] = decoded > 0 ? (size_t)decoded : 0;
+        }
+
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
 }

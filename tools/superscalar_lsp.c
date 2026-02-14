@@ -4,6 +4,8 @@
 #include "superscalar/regtest.h"
 #include "superscalar/report.h"
 #include "superscalar/persist.h"
+#include "superscalar/fee.h"
+#include "superscalar/watchtower.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -36,6 +38,9 @@ static void usage(const char *prog) {
         "  --step-blocks N     DW step blocks (default 10)\n"
         "  --seckey HEX        LSP secret key (32-byte hex, default: deterministic)\n"
         "  --payments N        Number of HTLC payments to process (default 0)\n"
+        "  --daemon            Run as long-lived daemon (Ctrl+C for graceful close)\n"
+        "  --demo              Run demo payment sequence after channels ready\n"
+        "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
         "  --regtest           Use regtest (required)\n"
@@ -224,8 +229,11 @@ int main(int argc, char *argv[]) {
     int regtest = 0;
     int n_clients = 4;
     int n_payments = 0;
+    int daemon_mode = 0;
+    int demo_mode = 0;
     uint64_t funding_sats = 100000;
     uint16_t step_blocks = 10;
+    uint64_t fee_rate = 1000;  /* sat/kvB, default 1 sat/vB */
     const char *seckey_hex = NULL;
     const char *report_path = NULL;
     const char *db_path = NULL;
@@ -245,6 +253,12 @@ int main(int argc, char *argv[]) {
             n_payments = atoi(argv[++i]);
         else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
             report_path = argv[++i];
+        else if (strcmp(argv[i], "--daemon") == 0)
+            daemon_mode = 1;
+        else if (strcmp(argv[i], "--demo") == 0)
+            demo_mode = 1;
+        else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
+            fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
@@ -319,6 +333,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     regtest_create_wallet(&rt, "superscalar_lsp");
+
+    /* Initialize fee estimator */
+    fee_estimator_t fee_est;
+    fee_init(&fee_est, fee_rate);
+    printf("LSP: fee rate: %llu sat/kvB\n", (unsigned long long)fee_rate);
 
     /* === Phase 1: Accept clients === */
     printf("LSP: listening on port %d, waiting for %d clients...\n", port, n_clients);
@@ -479,6 +498,9 @@ int main(int argc, char *argv[]) {
     }
     printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp.factory.n_nodes);
 
+    /* Set fee estimator on factory (for computed fees) */
+    lsp.factory.fee = &fee_est;
+
     /* Persist factory */
     if (use_db) {
         if (!persist_save_factory(&db, &lsp.factory, ctx, 0))
@@ -498,7 +520,7 @@ int main(int argc, char *argv[]) {
     /* === Phase 4b: Channel Operations === */
     lsp_channel_mgr_t mgr;
     int channels_active = 0;
-    if (n_payments > 0) {
+    if (n_payments > 0 || daemon_mode || demo_mode) {
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
@@ -506,6 +528,10 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
+        /* Set fee rate on all channels */
+        for (size_t c = 0; c < mgr.n_channels; c++)
+            mgr.entries[c].channel.fee_rate_sat_per_kvb = fee_rate;
+
         if (!lsp_channels_send_ready(&mgr, &lsp)) {
             fprintf(stderr, "LSP: send CHANNEL_READY failed\n");
             lsp_cleanup(&lsp);
@@ -513,8 +539,6 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
-        printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
-               n_payments, n_payments * 2);
 
         /* Persist initial channel state */
         if (use_db) {
@@ -526,15 +550,44 @@ int main(int argc, char *argv[]) {
         report_channel_state(&rpt, "channels_initial", &mgr);
         report_flush(&rpt);
 
-        if (!lsp_channels_run_event_loop(&mgr, &lsp, (size_t)(n_payments * 2))) {
-            fprintf(stderr, "LSP: event loop failed\n");
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+        /* Initialize watchtower for breach detection */
+        watchtower_t wt;
+        watchtower_init(&wt, mgr.n_channels, &rt, &fee_est,
+                          use_db ? &db : NULL);
+        for (size_t c = 0; c < mgr.n_channels; c++)
+            watchtower_set_channel(&wt, c, &mgr.entries[c].channel);
+        mgr.watchtower = &wt;
+
+        if (n_payments > 0) {
+            printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
+                   n_payments, n_payments * 2);
+            if (!lsp_channels_run_event_loop(&mgr, &lsp, (size_t)(n_payments * 2))) {
+                fprintf(stderr, "LSP: event loop failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+            printf("LSP: all %d payments processed\n", n_payments);
         }
+
+        if (demo_mode) {
+            printf("LSP: channels ready, running demo sequence...\n");
+            if (!lsp_channels_run_demo_sequence(&mgr, &lsp)) {
+                fprintf(stderr, "LSP: demo sequence failed\n");
+            }
+        }
+
+        if (daemon_mode) {
+            printf("LSP: channels ready, entering daemon mode...\n");
+
+            /* Accept bridge connection if available */
+            /* (bridge connects asynchronously — handled in daemon loop via select) */
+
+            lsp_channels_run_daemon_loop(&mgr, &lsp, &g_shutdown);
+        }
+
         channels_active = 1;
-        printf("LSP: all %d payments processed\n", n_payments);
 
         /* Persist updated channel balances */
         if (use_db) {

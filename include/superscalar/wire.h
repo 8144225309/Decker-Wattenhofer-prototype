@@ -29,6 +29,25 @@
 #define MSG_UPDATE_FAIL_HTLC   0x35
 #define MSG_CLOSE_REQUEST      0x36
 #define MSG_CHANNEL_NONCES     0x37   /* batch of pubnonces for channel signing */
+#define MSG_REGISTER_INVOICE   0x38   /* Client → LSP: register payment hash for inbound */
+
+/* Bridge messages (Phase 14) */
+#define MSG_BRIDGE_HELLO        0x40  /* Bridge → LSP: identify as bridge */
+#define MSG_BRIDGE_HELLO_ACK    0x41  /* LSP → Bridge: acknowledge */
+#define MSG_BRIDGE_ADD_HTLC     0x42  /* Bridge → LSP: inbound from LN */
+#define MSG_BRIDGE_FULFILL_HTLC 0x43  /* LSP → Bridge: preimage back */
+#define MSG_BRIDGE_FAIL_HTLC    0x44  /* LSP → Bridge: fail inbound */
+#define MSG_BRIDGE_SEND_PAY     0x45  /* LSP → Bridge: outbound via CLN */
+#define MSG_BRIDGE_PAY_RESULT   0x46  /* Bridge → LSP: sendpay result */
+#define MSG_BRIDGE_REGISTER     0x47  /* LSP → Bridge: register invoice */
+
+/* Reconnection messages (Phase 16) */
+#define MSG_RECONNECT           0x48  /* Client → LSP: reconnect with pubkey */
+#define MSG_RECONNECT_ACK       0x49  /* LSP → Client: reconnect acknowledged */
+
+/* Invoice messages (Phase 17) */
+#define MSG_CREATE_INVOICE      0x4A  /* LSP → Client: please create invoice */
+#define MSG_INVOICE_CREATED     0x4B  /* Client → LSP: here's the payment_hash */
 
 #define MSG_ERROR              0xFF
 
@@ -189,10 +208,132 @@ int wire_parse_channel_nonces(const cJSON *json, uint32_t *channel_id,
                                 unsigned char pubnonces_out[][66],
                                 size_t max_nonces, size_t *count_out);
 
+/* Client → LSP: REGISTER_INVOICE {payment_hash, amount_msat, dest_client} */
+cJSON *wire_build_register_invoice(const unsigned char *payment_hash32,
+                                     uint64_t amount_msat, size_t dest_client);
+
+int wire_parse_register_invoice(const cJSON *json,
+                                  unsigned char *payment_hash32,
+                                  uint64_t *amount_msat, size_t *dest_client);
+
+/* --- Bridge message builders (Phase 14) --- */
+
+/* Bridge → LSP: BRIDGE_HELLO {} */
+cJSON *wire_build_bridge_hello(void);
+
+/* LSP → Bridge: BRIDGE_HELLO_ACK {} */
+cJSON *wire_build_bridge_hello_ack(void);
+
+/* Bridge → LSP: BRIDGE_ADD_HTLC {payment_hash, amount_msat, cltv_expiry, htlc_id} */
+cJSON *wire_build_bridge_add_htlc(const unsigned char *payment_hash32,
+                                    uint64_t amount_msat, uint32_t cltv_expiry,
+                                    uint64_t htlc_id);
+
+/* LSP → Bridge: BRIDGE_FULFILL_HTLC {payment_hash, preimage, htlc_id} */
+cJSON *wire_build_bridge_fulfill_htlc(const unsigned char *payment_hash32,
+                                        const unsigned char *preimage32,
+                                        uint64_t htlc_id);
+
+/* LSP → Bridge: BRIDGE_FAIL_HTLC {payment_hash, reason, htlc_id} */
+cJSON *wire_build_bridge_fail_htlc(const unsigned char *payment_hash32,
+                                     const char *reason, uint64_t htlc_id);
+
+/* LSP → Bridge: BRIDGE_SEND_PAY {bolt11, payment_hash, request_id} */
+cJSON *wire_build_bridge_send_pay(const char *bolt11,
+                                    const unsigned char *payment_hash32,
+                                    uint64_t request_id);
+
+/* Bridge → LSP: BRIDGE_PAY_RESULT {request_id, success, preimage} */
+cJSON *wire_build_bridge_pay_result(uint64_t request_id, int success,
+                                      const unsigned char *preimage32);
+
+/* LSP → Bridge: BRIDGE_REGISTER {payment_hash, amount_msat, dest_client} */
+cJSON *wire_build_bridge_register(const unsigned char *payment_hash32,
+                                    uint64_t amount_msat, size_t dest_client);
+
+/* --- Bridge message parsers (Phase 14) --- */
+
+int wire_parse_bridge_add_htlc(const cJSON *json,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *amount_msat, uint32_t *cltv_expiry,
+                                 uint64_t *htlc_id);
+
+int wire_parse_bridge_fulfill_htlc(const cJSON *json,
+                                     unsigned char *payment_hash32,
+                                     unsigned char *preimage32,
+                                     uint64_t *htlc_id);
+
+int wire_parse_bridge_fail_htlc(const cJSON *json,
+                                  unsigned char *payment_hash32,
+                                  char *reason, size_t reason_len,
+                                  uint64_t *htlc_id);
+
+int wire_parse_bridge_send_pay(const cJSON *json,
+                                 char *bolt11, size_t bolt11_len,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *request_id);
+
+int wire_parse_bridge_pay_result(const cJSON *json,
+                                   uint64_t *request_id, int *success,
+                                   unsigned char *preimage32);
+
+int wire_parse_bridge_register(const cJSON *json,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *amount_msat, size_t *dest_client);
+
+/* --- Reconnection messages (Phase 16) --- */
+
+/* Client → LSP: RECONNECT {pubkey, commitment_number} */
+cJSON *wire_build_reconnect(const secp256k1_context *ctx,
+                              const secp256k1_pubkey *pubkey,
+                              uint64_t commitment_number);
+
+int wire_parse_reconnect(const cJSON *json, const secp256k1_context *ctx,
+                           secp256k1_pubkey *pubkey_out,
+                           uint64_t *commitment_number_out);
+
+/* LSP → Client: RECONNECT_ACK {channel_id, local_amount_msat, remote_amount_msat, commitment_number} */
+cJSON *wire_build_reconnect_ack(uint32_t channel_id,
+                                  uint64_t local_amount_msat,
+                                  uint64_t remote_amount_msat,
+                                  uint64_t commitment_number);
+
+int wire_parse_reconnect_ack(const cJSON *json, uint32_t *channel_id,
+                                uint64_t *local_amount_msat,
+                                uint64_t *remote_amount_msat,
+                                uint64_t *commitment_number);
+
+/* --- Invoice messages (Phase 17) --- */
+
+/* LSP → Client: CREATE_INVOICE {amount_msat} */
+cJSON *wire_build_create_invoice(uint64_t amount_msat);
+
+int wire_parse_create_invoice(const cJSON *json, uint64_t *amount_msat);
+
+/* Client → LSP: INVOICE_CREATED {payment_hash, amount_msat} */
+cJSON *wire_build_invoice_created(const unsigned char *payment_hash32,
+                                    uint64_t amount_msat);
+
+int wire_parse_invoice_created(const cJSON *json,
+                                 unsigned char *payment_hash32,
+                                 uint64_t *amount_msat);
+
 /* --- Bundle parsing --- */
 
 /* Parse a nonce or psig bundle array from JSON. Returns count, fills entries[]. */
 size_t wire_parse_bundle(const cJSON *array, wire_bundle_entry_t *entries,
                          size_t max_entries, size_t expected_data_len);
+
+/* --- Encrypted transport (Phase 19) --- */
+
+/* Perform noise handshake as initiator and register encryption for fd.
+   Call after wire_connect(), before any wire_send/wire_recv.
+   Returns 1 on success, 0 on failure. */
+int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx);
+
+/* Perform noise handshake as responder and register encryption for fd.
+   Call after wire_accept(), before any wire_send/wire_recv.
+   Returns 1 on success, 0 on failure. */
+int wire_noise_handshake_responder(int fd, secp256k1_context *ctx);
 
 #endif /* SUPERSCALAR_WIRE_H */

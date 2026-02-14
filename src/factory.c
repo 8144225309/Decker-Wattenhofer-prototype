@@ -345,7 +345,7 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
     f->n_participants = n_participants;
     f->step_blocks = step_blocks;
     f->states_per_layer = states_per_layer;
-    f->fee_per_tx = 500;
+    f->fee_per_tx = 500;  /* default; overridden if f->fee is set */
 
     for (size_t i = 0; i < n_participants; i++) {
         int ok;
@@ -366,7 +366,7 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
     f->n_participants = n_participants;
     f->step_blocks = step_blocks;
     f->states_per_layer = states_per_layer;
-    f->fee_per_tx = 500;
+    f->fee_per_tx = 500;  /* default; overridden if f->fee is set */
 
     for (size_t i = 0; i < n_participants; i++)
         f->pubkeys[i] = pubkeys[i];
@@ -388,6 +388,12 @@ void factory_set_funding(factory_t *f,
 
 int factory_build_tree(factory_t *f) {
     if (f->n_participants != 5) return 0;  /* 4 clients + 1 LSP */
+
+    /* Override fee_per_tx from fee estimator if available */
+    if (f->fee) {
+        /* Average tree tx: ~3 outputs */
+        f->fee_per_tx = fee_for_factory_tx(f->fee, 3);
+    }
 
     /* Participant indices: LSP=0, A=1, B=2, C=3, D=4 */
     uint32_t all[] = {0, 1, 2, 3, 4};

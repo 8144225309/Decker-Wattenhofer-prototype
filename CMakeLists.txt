@@ -53,6 +53,11 @@ add_library(superscalar
     src/lsp_channels.c
     src/report.c
     src/persist.c
+    src/bridge.c
+    src/fee.c
+    src/watchtower.c
+    src/crypto_aead.c
+    src/noise.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
@@ -76,6 +81,9 @@ add_executable(test_superscalar
     tests/test_wire.c
     tests/test_channels.c
     tests/test_persist.c
+    tests/test_bridge.c
+    tests/test_daemon.c
+    tests/test_reconnect.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})
@@ -95,3 +103,8 @@ target_include_directories(superscalar_client_bin PRIVATE ${secp256k1-zkp_SOURCE
 target_include_directories(superscalar_client_bin PRIVATE ${cjson_SOURCE_DIR})
 target_link_libraries(superscalar_client_bin PRIVATE superscalar)
 set_target_properties(superscalar_client_bin PROPERTIES OUTPUT_NAME superscalar_client)
+
+add_executable(superscalar_bridge tools/superscalar_bridge.c)
+target_include_directories(superscalar_bridge PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
+target_include_directories(superscalar_bridge PRIVATE ${cjson_SOURCE_DIR})
+target_link_libraries(superscalar_bridge PRIVATE superscalar)

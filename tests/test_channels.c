@@ -292,9 +292,13 @@ typedef struct {
 } multi_payment_data_t;
 
 static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
-                                     secp256k1_context *ctx, void *user_data) {
+                                     secp256k1_context *ctx,
+                                     const secp256k1_keypair *keypair,
+                                     factory_t *factory,
+                                     size_t n_participants,
+                                     void *user_data) {
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
-    (void)ctx;
+    (void)ctx; (void)keypair; (void)factory; (void)n_participants;
 
     for (size_t i = 0; i < data->n_actions; i++) {
         scripted_action_t *act = &data->actions[i];
@@ -431,9 +435,13 @@ typedef struct {
 } payment_test_data_t;
 
 static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
-                               secp256k1_context *ctx, void *user_data) {
+                               secp256k1_context *ctx,
+                               const secp256k1_keypair *keypair,
+                               factory_t *factory,
+                               size_t n_participants,
+                               void *user_data) {
     payment_test_data_t *data = (payment_test_data_t *)user_data;
-    (void)ctx;
+    (void)ctx; (void)keypair; (void)factory; (void)n_participants;
 
     if (data->is_sender) {
         /* Client A (index 1): send payment to Client B (index 2, = client_idx 1) */

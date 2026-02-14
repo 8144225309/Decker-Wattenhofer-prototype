@@ -21,6 +21,9 @@ typedef struct {
     /* Factory (built after all clients connect) */
     factory_t factory;
 
+    /* Bridge daemon connection (Phase 14) */
+    int bridge_fd;
+
     /* Listen socket */
     int listen_fd;
     int port;
@@ -49,6 +52,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
 int lsp_run_cooperative_close(lsp_t *lsp,
                                tx_buf_t *close_tx_out,
                                const tx_output_t *outputs, size_t n_outputs);
+
+/* Accept a bridge daemon connection (Phase 14).
+   Expects MSG_BRIDGE_HELLO, sends MSG_BRIDGE_HELLO_ACK.
+   Returns 1 on success. */
+int lsp_accept_bridge(lsp_t *lsp);
 
 /* Send MSG_ERROR to all connected clients, then close their fds. */
 void lsp_abort_ceremony(lsp_t *lsp, const char *reason);

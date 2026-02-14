@@ -7,6 +7,7 @@
 #include "tx_builder.h"
 #include "tapscript.h"
 #include "shachain.h"
+#include "fee.h"
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 
@@ -100,6 +101,7 @@ typedef struct {
 
     /* Fee per transaction */
     uint64_t fee_per_tx;
+    fee_estimator_t *fee;  /* if set, overrides fee_per_tx with computed fees */
 
     /* CLTV timeout (absolute block height) */
     uint32_t cltv_timeout;

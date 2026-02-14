@@ -590,8 +590,10 @@ int test_channel_penalty_tx(void) {
 
     /* Build an unsigned version of the penalty tx to compute its sighash.
        The penalty tx input spends local_txid:0 with nSequence=0xFFFFFFFE */
-    /* Penalty output amount = to_local_amount - 500 fee */
-    uint64_t penalty_output_amount = to_local_amount - 500;
+    /* Penalty output amount = to_local_amount - computed fee
+       Default fee_rate_sat_per_kvb=1000, penalty vsize=152 vB */
+    uint64_t penalty_fee = (remote_ch.fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    uint64_t penalty_output_amount = to_local_amount - penalty_fee;
 
     /* Extract the output spk from penalty tx for sighash computation.
        Parse: nVersion(4) + marker(1) + flag(1) + varint(1) + txid(32) + vout(4) +
@@ -1765,7 +1767,8 @@ int test_htlc_penalty(void) {
     /* Extract output SPK from penalty tx (same as in penalty test) */
     unsigned char penalty_out_spk[34];
     memcpy(penalty_out_spk, penalty_tx.data + 58, 34);
-    uint64_t penalty_amount = htlc_amount - 500;
+    uint64_t penalty_fee_computed = (remote_ch.fee_rate_sat_per_kvb * 152 + 999) / 1000;
+    uint64_t penalty_amount = htlc_amount - penalty_fee_computed;
 
     tx_output_t penalty_output;
     memcpy(penalty_output.script_pubkey, penalty_out_spk, 34);

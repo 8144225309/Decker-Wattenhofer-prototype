@@ -1,14 +1,25 @@
 #include "superscalar/client.h"
 #include "superscalar/wire.h"
 #include "superscalar/channel.h"
+#include "superscalar/factory.h"
 #include "superscalar/report.h"
 #include "superscalar/persist.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/select.h>
 #include <secp256k1.h>
 #include <secp256k1_extrakeys.h>
 #include "cJSON.h"
+
+static volatile sig_atomic_t g_shutdown = 0;
+
+static void sigint_handler(int sig) {
+    (void)sig;
+    g_shutdown = 1;
+}
 
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
@@ -34,7 +45,12 @@ typedef struct {
 
 /* Channel callback replicating multi_payment_client_cb from test harness */
 static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
-                                   secp256k1_context *ctx, void *user_data) {
+                                   secp256k1_context *ctx,
+                                   const secp256k1_keypair *keypair,
+                                   factory_t *factory,
+                                   size_t n_participants,
+                                   void *user_data) {
+    (void)keypair; (void)factory; (void)n_participants;
     multi_payment_data_t *data = (multi_payment_data_t *)user_data;
 
     for (size_t i = 0; i < data->n_actions; i++) {
@@ -166,6 +182,232 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     return 1;
 }
 
+/* Client-side invoice store for real preimage validation (Phase 17) */
+#define MAX_CLIENT_INVOICES 32
+
+typedef struct {
+    unsigned char payment_hash[32];
+    unsigned char preimage[32];
+    uint64_t amount_msat;
+    int active;
+} client_invoice_t;
+
+/* Data passed through daemon callback's user_data */
+typedef struct {
+    persist_t *db;
+    int saved_initial;  /* 1 after first save of factory+channel */
+    client_invoice_t invoices[MAX_CLIENT_INVOICES];
+    size_t n_invoices;
+} daemon_cb_data_t;
+
+/* Daemon mode callback: select() loop handling incoming HTLCs and close */
+static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
+                               secp256k1_context *ctx,
+                               const secp256k1_keypair *keypair,
+                               factory_t *factory,
+                               size_t n_participants,
+                               void *user_data) {
+    daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
+
+    /* Save factory + channel state on first entry (Phase 16 persistence) */
+    if (cbd && cbd->db && !cbd->saved_initial) {
+        persist_save_factory(cbd->db, factory, ctx, 0);
+        uint32_t client_idx = my_index - 1;
+        persist_save_channel(cbd->db, ch, 0, client_idx);
+        cbd->saved_initial = 1;
+        printf("Client %u: persisted factory + channel to DB\n", my_index);
+    }
+
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+
+    printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
+
+    while (!g_shutdown) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
+        int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
+        if (ret < 0) continue;  /* EINTR */
+        if (ret == 0) continue;  /* timeout */
+
+        wire_msg_t msg;
+        if (!wire_recv(fd, &msg)) {
+            fprintf(stderr, "Client %u: daemon recv failed (disconnected)\n", my_index);
+            break;
+        }
+
+        switch (msg.msg_type) {
+        case MSG_UPDATE_ADD_HTLC:
+            client_handle_add_htlc(ch, &msg);
+            cJSON_Delete(msg.json);
+
+            /* Wait for COMMITMENT_SIGNED */
+            if (!wire_recv(fd, &msg)) {
+                fprintf(stderr, "Client %u: recv commit failed\n", my_index);
+                return 0;
+            }
+            if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                client_handle_commitment_signed(fd, ch, ctx, &msg);
+                cJSON_Delete(msg.json);
+            } else {
+                cJSON_Delete(msg.json);
+            }
+
+            /* Persist balance after commitment update */
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+
+            /* Fulfill: find the most recent active received HTLC and look up preimage */
+            {
+                uint64_t htlc_id = 0;
+                unsigned char htlc_hash[32];
+                int found = 0;
+                for (size_t h = 0; h < ch->n_htlcs; h++) {
+                    if (ch->htlcs[h].state == HTLC_STATE_ACTIVE &&
+                        ch->htlcs[h].direction == HTLC_RECEIVED) {
+                        htlc_id = ch->htlcs[h].id;
+                        memcpy(htlc_hash, ch->htlcs[h].payment_hash, 32);
+                        found = 1;
+                    }
+                }
+                if (found) {
+                    /* Look up preimage from local invoice store */
+                    unsigned char preimage[32];
+                    int have_preimage = 0;
+                    if (cbd) {
+                        for (size_t inv = 0; inv < cbd->n_invoices; inv++) {
+                            if (cbd->invoices[inv].active &&
+                                memcmp(cbd->invoices[inv].payment_hash, htlc_hash, 32) == 0) {
+                                memcpy(preimage, cbd->invoices[inv].preimage, 32);
+                                cbd->invoices[inv].active = 0;
+                                have_preimage = 1;
+                                break;
+                            }
+                        }
+                    }
+                    if (!have_preimage) {
+                        fprintf(stderr, "Client %u: no preimage for HTLC %llu, failing\n",
+                                my_index, (unsigned long long)htlc_id);
+                        break;
+                    }
+                    printf("Client %u: fulfilling HTLC %llu with real preimage\n",
+                           my_index, (unsigned long long)htlc_id);
+                    client_fulfill_payment(fd, ch, htlc_id, preimage);
+
+                    /* Handle COMMITMENT_SIGNED for the fulfill */
+                    if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                        client_handle_commitment_signed(fd, ch, ctx, &msg);
+                    }
+                    if (msg.json) cJSON_Delete(msg.json);
+
+                    /* Persist balance after fulfill */
+                    if (cbd && cbd->db) {
+                        persist_update_channel_balance(cbd->db, my_index - 1,
+                            ch->local_amount, ch->remote_amount, ch->commitment_number);
+                    }
+                }
+            }
+            break;
+
+        case MSG_COMMITMENT_SIGNED:
+            client_handle_commitment_signed(fd, ch, ctx, &msg);
+            cJSON_Delete(msg.json);
+            /* Persist balance after commitment update */
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+            break;
+
+        case MSG_UPDATE_FULFILL_HTLC:
+            printf("Client %u: payment fulfilled!\n", my_index);
+            cJSON_Delete(msg.json);
+            /* Handle follow-up COMMITMENT_SIGNED */
+            if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
+                client_handle_commitment_signed(fd, ch, ctx, &msg);
+            }
+            if (msg.json) cJSON_Delete(msg.json);
+            /* Persist balance after fulfill */
+            if (cbd && cbd->db) {
+                persist_update_channel_balance(cbd->db, my_index - 1,
+                    ch->local_amount, ch->remote_amount, ch->commitment_number);
+            }
+            break;
+
+        case MSG_CLOSE_PROPOSE:
+            printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);
+            client_do_close_ceremony(fd, ctx, keypair, &my_pubkey,
+                                      factory, n_participants, &msg);
+            cJSON_Delete(msg.json);
+            return 2;  /* close already handled */
+
+        case MSG_CREATE_INVOICE: {
+            /* LSP asks us to create an invoice (Phase 17) */
+            uint64_t inv_amount_msat;
+            if (!wire_parse_create_invoice(msg.json, &inv_amount_msat)) {
+                fprintf(stderr, "Client %u: bad CREATE_INVOICE\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
+
+            if (cbd && cbd->n_invoices < MAX_CLIENT_INVOICES) {
+                client_invoice_t *inv = &cbd->invoices[cbd->n_invoices];
+
+                /* Generate random preimage from /dev/urandom */
+                FILE *urand = fopen("/dev/urandom", "rb");
+                if (urand) {
+                    if (fread(inv->preimage, 1, 32, urand) != 32)
+                        memset(inv->preimage, 0x42, 32); /* fallback */
+                    fclose(urand);
+                } else {
+                    /* Deterministic fallback: derive from index */
+                    memset(inv->preimage, 0x42, 32);
+                    inv->preimage[0] = (unsigned char)cbd->n_invoices;
+                    inv->preimage[1] = (unsigned char)my_index;
+                }
+
+                /* Compute payment_hash = SHA256(preimage) */
+                sha256(inv->preimage, 32, inv->payment_hash);
+                inv->amount_msat = inv_amount_msat;
+                inv->active = 1;
+                cbd->n_invoices++;
+
+                printf("Client %u: created invoice for %llu msat\n",
+                       my_index, (unsigned long long)inv_amount_msat);
+
+                /* Send MSG_INVOICE_CREATED back to LSP */
+                cJSON *reply = wire_build_invoice_created(inv->payment_hash,
+                                                            inv_amount_msat);
+                wire_send(fd, MSG_INVOICE_CREATED, reply);
+                cJSON_Delete(reply);
+
+                /* Also register with LSP so it knows to route to us */
+                uint32_t client_idx = my_index - 1;
+                cJSON *reg = wire_build_register_invoice(inv->payment_hash,
+                                                           inv_amount_msat,
+                                                           (size_t)client_idx);
+                wire_send(fd, MSG_REGISTER_INVOICE, reg);
+                cJSON_Delete(reg);
+            }
+            break;
+        }
+
+        default:
+            fprintf(stderr, "Client %u: daemon got unexpected msg 0x%02x\n",
+                    my_index, msg.msg_type);
+            cJSON_Delete(msg.json);
+            break;
+        }
+    }
+
+    return 1;  /* normal return — caller handles close */
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s --seckey HEX --port PORT [--host HOST] [OPTIONS]\n"
@@ -177,6 +419,8 @@ static void usage(const char *prog) {
         "  --send DEST:AMOUNT:PREIMAGE_HEX   Send payment (can repeat)\n"
         "  --recv PREIMAGE_HEX               Receive payment (can repeat)\n"
         "  --channels                        Expect channel phase (for when LSP uses --payments)\n"
+        "  --daemon                          Run as long-lived daemon (auto-fulfill HTLCs)\n"
+        "  --fee-rate N                      Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
         "  --report PATH                     Write diagnostic JSON report to PATH\n"
         "  --db PATH                         SQLite database for persistence (default: none)\n"
         "  --help                            Show this help\n",
@@ -188,6 +432,7 @@ int main(int argc, char *argv[]) {
     int port = 9735;
     const char *host = "127.0.0.1";
     int expect_channels = 0;
+    int daemon_mode = 0;
     const char *report_path = NULL;
     const char *db_path = NULL;
 
@@ -203,8 +448,12 @@ int main(int argc, char *argv[]) {
             host = argv[++i];
         else if (strcmp(argv[i], "--channels") == 0)
             expect_channels = 1;
+        else if (strcmp(argv[i], "--daemon") == 0)
+            daemon_mode = 1;
         else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
             report_path = argv[++i];
+        else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
+            ++i; /* parsed but not used by client (fee rate is LSP-managed) */
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
         else if (strcmp(argv[i], "--send") == 0 && i + 1 < argc) {
@@ -331,8 +580,34 @@ int main(int argc, char *argv[]) {
         printf("Client: persistence enabled (%s)\n", db_path);
     }
 
+    signal(SIGINT, sigint_handler);
+    signal(SIGTERM, sigint_handler);
+
     int ok;
-    if (n_actions > 0 || expect_channels) {
+    if (daemon_mode) {
+        daemon_cb_data_t cbd = { use_db ? &db : NULL, 0 };
+        int first_run = 1;
+
+        while (!g_shutdown) {
+            if (first_run || !use_db) {
+                ok = client_run_with_channels(ctx, &kp, host, port,
+                                                daemon_channel_cb, &cbd);
+                first_run = 0;
+            } else {
+                printf("Client: reconnecting from persisted state...\n");
+                cbd.saved_initial = 1;  /* already saved on first run */
+                ok = client_run_reconnect(ctx, &kp, host, port, &db,
+                                            daemon_channel_cb, &cbd);
+            }
+            if (g_shutdown) break;
+            if (!ok) {
+                fprintf(stderr, "Client: disconnected, retrying in 5s...\n");
+                sleep(5);
+            } else {
+                break;  /* clean exit */
+            }
+        }
+    } else if (n_actions > 0 || expect_channels) {
         multi_payment_data_t data = { actions, n_actions, 0 };
         ok = client_run_with_channels(ctx, &kp, host, port, standalone_channel_cb, &data);
     } else {

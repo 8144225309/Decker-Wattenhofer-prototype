@@ -28,4 +28,8 @@ int   regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
                              uint64_t *amount_sats_out,
                              unsigned char *scriptpubkey_out, size_t *spk_len_out);
 
+/* Get raw tx hex by txid. Returns 1 on success. */
+int regtest_get_raw_tx(regtest_t *rt, const char *txid,
+                         char *tx_hex_out, size_t max_len);
+
 #endif /* SUPERSCALAR_REGTEST_H */
