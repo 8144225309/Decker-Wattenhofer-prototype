@@ -29,7 +29,7 @@ System dependency:
 
 ## Test
 
-134 tests (115 unit + 19 regtest integration).
+137 tests (118 unit + 19 regtest integration).
 
 ```bash
 # unit tests (no bitcoind needed)
@@ -57,16 +57,17 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover protocol |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, key turnover tracking, migration |
-| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 36 message types |
+| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 36 message types, message logging callback |
 | `lsp` | lsp.c | LSP server: accept clients, factory creation ceremony, cooperative close |
 | `client` | client.c | Client: connect to LSP, factory ceremony, channel operations, close |
 | `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close, watchtower |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
-| `persist` | persist.c | SQLite3 persistence: factories, channels, HTLCs, revocation secrets, nonce pools, old commitments |
+| `persist` | persist.c | SQLite3 persistence: 10 tables (factories, channels, HTLCs, revocations, nonce pools, old commitments, wire messages, tree nodes, ladder factories) |
 | `bridge` | bridge.c | CLN bridge daemon for Lightning Network connectivity |
 | `fee` | fee.c | Configurable fee estimation: penalty, HTLC, and factory tx fee computation |
 | `watchtower` | watchtower.c | Breach detection: monitors chain for revoked commitments, builds and broadcasts penalty txs |
+| `keyfile` | keyfile.c | Encrypted keyfile: AES-256-CBC key storage with passphrase-derived encryption |
 
 ## Architecture
 
@@ -244,7 +245,7 @@ Monitors the blockchain for revoked commitment transactions:
 - Nonce pool management for distributed 2-of-2 signing
 
 ### Phase 13: Persistence (SQLite)
-- 6 database tables: factories, factory_participants, channels, revocation_secrets, htlcs, nonce_pools
+- 10 database tables: factories, factory_participants, channels, revocation_secrets, htlcs, nonce_pools, old_commitments, wire_messages, tree_nodes, ladder_factories
 - `--db PATH` flag on both LSP and client binaries
 - Full state round-trip: save and reload factory, channel, HTLC, and nonce pool state
 
@@ -284,6 +285,34 @@ Monitors the blockchain for revoked commitment transactions:
 - **Persistence**: new `old_commitments` table (7th table) for watchtower state
 - **Regtest helper**: `regtest_get_raw_tx()` for tx hex retrieval
 - 134/134 tests pass (115 unit + 19 regtest)
+
+### Phase 19: Encrypted Transport
+- ChaCha20-Poly1305 AEAD encryption (RFC 7539)
+- HMAC-SHA256 key derivation (RFC 4231)
+- Noise-style XX handshake: ephemeral ECDH + static key exchange
+- All wire messages encrypted after handshake with rotating nonces
+
+### Phase 20: Signet Interop
+- `--network` flag (regtest/signet/testnet/mainnet), `--cli-path`, `--rpcuser`, `--rpcpassword`
+- Signet-aware funding: balance check + confirmation wait instead of mining
+- Bridge integration in daemon loop: message-type dispatch (BRIDGE_HELLO vs RECONNECT)
+- CLN plugin: real `lightning-cli pay` via subprocess + `superscalar-pay` RPC
+- `tools/signet_setup.sh`: subcommand-based signet infrastructure setup (14 commands)
+
+### Phase 21: Web Dashboard + Signet Setup Rewrite
+- `tools/dashboard.py`: stdlib-only Python3 web dashboard (http.server + sqlite3 + subprocess)
+  - Dark theme, 7 tabs (Overview, Factory, Channels, Protocol Log, Lightning, Watchtower, Events)
+  - 4 data collectors (processes, bitcoin, databases, CLN), auto-refresh
+  - `--demo` mode with simulated data for UI preview
+- `tools/signet_setup.sh`: rewritten with 14 subcommands, colored output, python3 JSON parsing
+
+### Phase 22: Persist In-Memory State + Dashboard Exposure
+- **Wire message logging**: callback mechanism in `wire_send()`/`wire_recv()`, fd-to-peer-label map, all 36 message types named
+- **3 new SQLite tables**: `wire_messages` (protocol log), `tree_nodes` (factory tree topology), `ladder_factories` (lifecycle state)
+- **Dashboard Protocol Log tab**: color-coded message categories (channel/factory/bridge/close/invoice/error)
+- **Dashboard tree visualization**: interactive factory tree node layout + detail table
+- **Dashboard ladder section**: factory lifecycle progress bars (ACTIVE → DYING → EXPIRED)
+- 137/137 tests pass (118 unit + 19 regtest)
 
 ## License
 
