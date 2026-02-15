@@ -244,6 +244,14 @@ extern int test_regtest_init_full(void);
 extern int test_regtest_get_balance(void);
 extern int test_mine_blocks_non_regtest(void);
 
+/* Phase 23: Persistence Hardening */
+extern int test_persist_dw_counter_round_trip(void);
+extern int test_persist_departed_clients_round_trip(void);
+extern int test_persist_invoice_round_trip(void);
+extern int test_persist_htlc_origin_round_trip(void);
+extern int test_persist_client_invoice_round_trip(void);
+extern int test_persist_counter_round_trip(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -443,6 +451,14 @@ static void run_unit_tests(void) {
     RUN_TEST(test_regtest_init_full);
     RUN_TEST(test_regtest_get_balance);
     RUN_TEST(test_mine_blocks_non_regtest);
+
+    printf("\n=== Persistence Hardening (Phase 23) ===\n");
+    RUN_TEST(test_persist_dw_counter_round_trip);
+    RUN_TEST(test_persist_departed_clients_round_trip);
+    RUN_TEST(test_persist_invoice_round_trip);
+    RUN_TEST(test_persist_htlc_origin_round_trip);
+    RUN_TEST(test_persist_client_invoice_round_trip);
+    RUN_TEST(test_persist_counter_round_trip);
 }
 
 static void run_regtest_tests(void) {
@@ -487,7 +503,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-19)\n");
+    printf("SuperScalar Test Suite (Phase 1-23)\n");
     printf("===================================\n");
 
     if (run_unit) run_unit_tests();

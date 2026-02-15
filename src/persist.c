@@ -112,6 +112,51 @@ static const char *SCHEMA_SQL =
     "  active_blocks INTEGER,"
     "  dying_blocks INTEGER,"
     "  updated_at INTEGER"
+    ");"
+    /* Phase 23: Persistence Hardening */
+    "CREATE TABLE IF NOT EXISTS dw_counter_state ("
+    "  factory_id INTEGER PRIMARY KEY,"
+    "  current_epoch INTEGER NOT NULL,"
+    "  n_layers INTEGER NOT NULL,"
+    "  layer_states TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS departed_clients ("
+    "  factory_id INTEGER NOT NULL,"
+    "  client_idx INTEGER NOT NULL,"
+    "  extracted_key TEXT NOT NULL,"
+    "  departed_at INTEGER DEFAULT (strftime('%%s','now')),"
+    "  PRIMARY KEY (factory_id, client_idx)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS invoice_registry ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  payment_hash TEXT NOT NULL,"
+    "  dest_client INTEGER NOT NULL,"
+    "  amount_msat INTEGER NOT NULL,"
+    "  bridge_htlc_id INTEGER DEFAULT 0,"
+    "  active INTEGER DEFAULT 1,"
+    "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
+    ");"
+    "CREATE TABLE IF NOT EXISTS htlc_origins ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  payment_hash TEXT NOT NULL,"
+    "  bridge_htlc_id INTEGER DEFAULT 0,"
+    "  request_id INTEGER DEFAULT 0,"
+    "  sender_idx INTEGER NOT NULL,"
+    "  sender_htlc_id INTEGER DEFAULT 0,"
+    "  active INTEGER DEFAULT 1,"
+    "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
+    ");"
+    "CREATE TABLE IF NOT EXISTS client_invoices ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  payment_hash TEXT NOT NULL,"
+    "  preimage TEXT NOT NULL,"
+    "  amount_msat INTEGER NOT NULL,"
+    "  active INTEGER DEFAULT 1,"
+    "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
+    ");"
+    "CREATE TABLE IF NOT EXISTS id_counters ("
+    "  name TEXT PRIMARY KEY,"
+    "  value INTEGER NOT NULL"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -904,4 +949,442 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
     return ok;
+}
+
+/* === Phase 23: Persistence Hardening === */
+
+/* --- DW counter state --- */
+
+int persist_save_dw_counter(persist_t *p, uint32_t factory_id,
+                             uint32_t current_epoch, uint32_t n_layers,
+                             const uint32_t *layer_states) {
+    if (!p || !p->db || !layer_states || n_layers == 0) return 0;
+
+    /* Build comma-separated layer_states string */
+    char buf[256];
+    buf[0] = '\0';
+    for (uint32_t i = 0; i < n_layers; i++) {
+        char tmp[16];
+        snprintf(tmp, sizeof(tmp), "%s%u", i > 0 ? "," : "", layer_states[i]);
+        strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
+    }
+
+    const char *sql =
+        "INSERT OR REPLACE INTO dw_counter_state "
+        "(factory_id, current_epoch, n_layers, layer_states) "
+        "VALUES (?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)current_epoch);
+    sqlite3_bind_int(stmt, 3, (int)n_layers);
+    sqlite3_bind_text(stmt, 4, buf, -1, SQLITE_TRANSIENT);
+
+    int ok2 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok2;
+}
+
+int persist_load_dw_counter(persist_t *p, uint32_t factory_id,
+                             uint32_t *epoch_out, uint32_t *n_layers_out,
+                             uint32_t *layer_states_out, size_t max_layers) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT current_epoch, n_layers, layer_states "
+        "FROM dw_counter_state WHERE factory_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    uint32_t epoch = (uint32_t)sqlite3_column_int(stmt, 0);
+    uint32_t n_layers = (uint32_t)sqlite3_column_int(stmt, 1);
+    const char *states_str = (const char *)sqlite3_column_text(stmt, 2);
+
+    if (epoch_out) *epoch_out = epoch;
+    if (n_layers_out) *n_layers_out = n_layers;
+
+    /* Parse comma-separated layer states */
+    if (layer_states_out && states_str) {
+        char tmp[256];
+        strncpy(tmp, states_str, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        char *tok = strtok(tmp, ",");
+        size_t idx = 0;
+        while (tok && idx < max_layers && idx < n_layers) {
+            layer_states_out[idx++] = (uint32_t)strtol(tok, NULL, 10);
+            tok = strtok(NULL, ",");
+        }
+    }
+
+    sqlite3_finalize(stmt);
+    return 1;
+}
+
+/* --- Departed clients --- */
+
+int persist_save_departed_client(persist_t *p, uint32_t factory_id,
+                                  uint32_t client_idx,
+                                  const unsigned char *extracted_key32) {
+    if (!p || !p->db || !extracted_key32) return 0;
+
+    char key_hex[65];
+    hex_encode(extracted_key32, 32, key_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO departed_clients "
+        "(factory_id, client_idx, extracted_key) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)client_idx);
+    sqlite3_bind_text(stmt, 3, key_hex, -1, SQLITE_TRANSIENT);
+
+    int ok3 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok3;
+}
+
+size_t persist_load_departed_clients(persist_t *p, uint32_t factory_id,
+                                      int *departed_out,
+                                      unsigned char (*keys_out)[32],
+                                      size_t max_clients) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT client_idx, extracted_key FROM departed_clients "
+        "WHERE factory_id = ? ORDER BY client_idx;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint32_t cidx = (uint32_t)sqlite3_column_int(stmt, 0);
+        const char *key_hex = (const char *)sqlite3_column_text(stmt, 1);
+
+        if (cidx < max_clients) {
+            if (departed_out) departed_out[cidx] = 1;
+            if (keys_out && key_hex)
+                hex_decode(key_hex, keys_out[cidx], 32);
+        }
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* --- Invoice registry --- */
+
+int persist_save_invoice(persist_t *p,
+                          const unsigned char *payment_hash32,
+                          size_t dest_client, uint64_t amount_msat) {
+    if (!p || !p->db || !payment_hash32) return 0;
+
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+
+    const char *sql =
+        "INSERT INTO invoice_registry "
+        "(payment_hash, dest_client, amount_msat) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)dest_client);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)amount_msat);
+
+    int ok4 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok4;
+}
+
+int persist_deactivate_invoice(persist_t *p,
+                                const unsigned char *payment_hash32) {
+    if (!p || !p->db || !payment_hash32) return 0;
+
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+
+    const char *sql =
+        "UPDATE invoice_registry SET active = 0 "
+        "WHERE payment_hash = ? AND active = 1;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+
+    int ok5 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok5;
+}
+
+size_t persist_load_invoices(persist_t *p,
+                              unsigned char (*hashes_out)[32],
+                              size_t *dest_clients_out,
+                              uint64_t *amounts_out,
+                              size_t max_invoices) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT payment_hash, dest_client, amount_msat "
+        "FROM invoice_registry WHERE active = 1 ORDER BY id;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_invoices) {
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (hashes_out && hash_hex)
+            hex_decode(hash_hex, hashes_out[count], 32);
+        if (dest_clients_out)
+            dest_clients_out[count] = (size_t)sqlite3_column_int(stmt, 1);
+        if (amounts_out)
+            amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 2);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* --- HTLC origin tracking --- */
+
+int persist_save_htlc_origin(persist_t *p,
+                              const unsigned char *payment_hash32,
+                              uint64_t bridge_htlc_id, uint64_t request_id,
+                              size_t sender_idx, uint64_t sender_htlc_id) {
+    if (!p || !p->db || !payment_hash32) return 0;
+
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+
+    const char *sql =
+        "INSERT INTO htlc_origins "
+        "(payment_hash, bridge_htlc_id, request_id, sender_idx, sender_htlc_id) "
+        "VALUES (?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)bridge_htlc_id);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)request_id);
+    sqlite3_bind_int(stmt, 4, (int)sender_idx);
+    sqlite3_bind_int64(stmt, 5, (sqlite3_int64)sender_htlc_id);
+
+    int ok6 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok6;
+}
+
+int persist_deactivate_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32) {
+    if (!p || !p->db || !payment_hash32) return 0;
+
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+
+    const char *sql =
+        "UPDATE htlc_origins SET active = 0 "
+        "WHERE payment_hash = ? AND active = 1;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+
+    int ok7 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok7;
+}
+
+size_t persist_load_htlc_origins(persist_t *p,
+                                  unsigned char (*hashes_out)[32],
+                                  uint64_t *bridge_ids_out,
+                                  uint64_t *request_ids_out,
+                                  size_t *sender_idxs_out,
+                                  uint64_t *sender_htlc_ids_out,
+                                  size_t max_origins) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT payment_hash, bridge_htlc_id, request_id, sender_idx, sender_htlc_id "
+        "FROM htlc_origins WHERE active = 1 ORDER BY id;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_origins) {
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (hashes_out && hash_hex)
+            hex_decode(hash_hex, hashes_out[count], 32);
+        if (bridge_ids_out)
+            bridge_ids_out[count] = (uint64_t)sqlite3_column_int64(stmt, 1);
+        if (request_ids_out)
+            request_ids_out[count] = (uint64_t)sqlite3_column_int64(stmt, 2);
+        if (sender_idxs_out)
+            sender_idxs_out[count] = (size_t)sqlite3_column_int(stmt, 3);
+        if (sender_htlc_ids_out)
+            sender_htlc_ids_out[count] = (uint64_t)sqlite3_column_int64(stmt, 4);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* --- Client invoices --- */
+
+int persist_save_client_invoice(persist_t *p,
+                                 const unsigned char *payment_hash32,
+                                 const unsigned char *preimage32,
+                                 uint64_t amount_msat) {
+    if (!p || !p->db || !payment_hash32 || !preimage32) return 0;
+
+    char hash_hex[65], preimage_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+    hex_encode(preimage32, 32, preimage_hex);
+
+    const char *sql =
+        "INSERT INTO client_invoices "
+        "(payment_hash, preimage, amount_msat) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, preimage_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)amount_msat);
+
+    int ok8 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok8;
+}
+
+int persist_deactivate_client_invoice(persist_t *p,
+                                       const unsigned char *payment_hash32) {
+    if (!p || !p->db || !payment_hash32) return 0;
+
+    char hash_hex[65];
+    hex_encode(payment_hash32, 32, hash_hex);
+
+    const char *sql =
+        "UPDATE client_invoices SET active = 0 "
+        "WHERE payment_hash = ? AND active = 1;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, hash_hex, -1, SQLITE_TRANSIENT);
+
+    int ok9 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok9;
+}
+
+size_t persist_load_client_invoices(persist_t *p,
+                                     unsigned char (*hashes_out)[32],
+                                     unsigned char (*preimages_out)[32],
+                                     uint64_t *amounts_out,
+                                     size_t max_invoices) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT payment_hash, preimage, amount_msat "
+        "FROM client_invoices WHERE active = 1 ORDER BY id;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_invoices) {
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 0);
+        if (hashes_out && hash_hex)
+            hex_decode(hash_hex, hashes_out[count], 32);
+        const char *preimage_hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (preimages_out && preimage_hex)
+            hex_decode(preimage_hex, preimages_out[count], 32);
+        if (amounts_out)
+            amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 2);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* --- ID counters --- */
+
+int persist_save_counter(persist_t *p, const char *name, uint64_t value) {
+    if (!p || !p->db || !name) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO id_counters (name, value) VALUES (?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)value);
+
+    int ok10 = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok10;
+}
+
+uint64_t persist_load_counter(persist_t *p, const char *name,
+                               uint64_t default_val) {
+    if (!p || !p->db || !name) return default_val;
+
+    const char *sql =
+        "SELECT value FROM id_counters WHERE name = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return default_val;
+
+    sqlite3_bind_text(stmt, 1, name, -1, SQLITE_TRANSIENT);
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return default_val;
+    }
+
+    uint64_t val = (uint64_t)sqlite3_column_int64(stmt, 0);
+    sqlite3_finalize(stmt);
+    return val;
 }

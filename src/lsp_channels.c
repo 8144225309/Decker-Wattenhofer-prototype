@@ -1,4 +1,5 @@
 #include "superscalar/lsp_channels.h"
+#include "superscalar/persist.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -418,7 +419,14 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             origin->request_id = request_id;
             origin->sender_idx = sender_idx;
             origin->sender_htlc_id = new_htlc_id;
+            /* Persist full origin with all fields */
+            if (mgr->persist)
+                persist_save_htlc_origin((persist_t *)mgr->persist,
+                    payment_hash, 0, request_id, sender_idx, new_htlc_id);
         }
+        if (mgr->persist)
+            persist_save_counter((persist_t *)mgr->persist,
+                                  "next_request_id", mgr->next_request_id);
         printf("LSP: HTLC from client %zu routed to bridge (bolt11)\n", sender_idx);
         return 1;
     }
@@ -562,6 +570,10 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     unsigned char payment_hash[32];
     /* Compute hash from preimage */
     sha256(preimage, 32, payment_hash);
+
+    /* Deactivate fulfilled invoice in persistence */
+    if (mgr->persist)
+        persist_deactivate_invoice((persist_t *)mgr->persist, payment_hash);
 
     /* Check if this HTLC originated from the bridge */
     uint64_t bridge_htlc_id = lsp_channels_get_bridge_origin(mgr, payment_hash);
@@ -715,6 +727,10 @@ int lsp_channels_register_invoice(lsp_channel_mgr_t *mgr,
     inv->amount_msat = amount_msat;
     inv->bridge_htlc_id = 0;
     inv->active = 1;
+
+    if (mgr->persist)
+        persist_save_invoice((persist_t *)mgr->persist, payment_hash32,
+                              dest_client, amount_msat);
     return 1;
 }
 
@@ -739,6 +755,10 @@ void lsp_channels_track_bridge_origin(lsp_channel_mgr_t *mgr,
     memcpy(origin->payment_hash, payment_hash32, 32);
     origin->bridge_htlc_id = bridge_htlc_id;
     origin->active = 1;
+
+    if (mgr->persist)
+        persist_save_htlc_origin((persist_t *)mgr->persist, payment_hash32,
+                                  bridge_htlc_id, 0, 0, 0);
 }
 
 uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
@@ -747,6 +767,9 @@ uint64_t lsp_channels_get_bridge_origin(lsp_channel_mgr_t *mgr,
         if (!mgr->htlc_origins[i].active) continue;
         if (memcmp(mgr->htlc_origins[i].payment_hash, payment_hash32, 32) == 0) {
             mgr->htlc_origins[i].active = 0;
+            if (mgr->persist)
+                persist_deactivate_htlc_origin((persist_t *)mgr->persist,
+                                                payment_hash32);
             return mgr->htlc_origins[i].bridge_htlc_id;
         }
     }

@@ -319,3 +319,217 @@ int test_persist_multi_channel(void) {
     persist_close(&db);
     return 1;
 }
+
+/* ==== Phase 23: Persistence Hardening Tests ==== */
+
+/* ---- Test: DW counter save/load round-trip ---- */
+
+int test_persist_dw_counter_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    uint32_t layers[] = {3, 1};
+    TEST_ASSERT(persist_save_dw_counter(&db, 0, 7, 2, layers), "save dw counter");
+
+    uint32_t epoch, n_layers;
+    uint32_t loaded_layers[8];
+    TEST_ASSERT(persist_load_dw_counter(&db, 0, &epoch, &n_layers, loaded_layers, 8),
+                "load dw counter");
+    TEST_ASSERT_EQ(epoch, 7, "epoch");
+    TEST_ASSERT_EQ(n_layers, 2, "n_layers");
+    TEST_ASSERT_EQ(loaded_layers[0], 3, "layer 0");
+    TEST_ASSERT_EQ(loaded_layers[1], 1, "layer 1");
+
+    /* Overwrite with new epoch */
+    uint32_t layers2[] = {4, 2, 0};
+    TEST_ASSERT(persist_save_dw_counter(&db, 0, 12, 3, layers2), "save dw counter 2");
+    TEST_ASSERT(persist_load_dw_counter(&db, 0, &epoch, &n_layers, loaded_layers, 8),
+                "load dw counter 2");
+    TEST_ASSERT_EQ(epoch, 12, "epoch 2");
+    TEST_ASSERT_EQ(n_layers, 3, "n_layers 2");
+    TEST_ASSERT_EQ(loaded_layers[0], 4, "layer 0 v2");
+    TEST_ASSERT_EQ(loaded_layers[1], 2, "layer 1 v2");
+    TEST_ASSERT_EQ(loaded_layers[2], 0, "layer 2 v2");
+
+    /* Non-existent factory */
+    TEST_ASSERT(!persist_load_dw_counter(&db, 99, &epoch, &n_layers, loaded_layers, 8),
+                "missing factory returns 0");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: Departed clients round-trip ---- */
+
+int test_persist_departed_clients_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char key0[32], key1[32], key2[32];
+    memset(key0, 0xAA, 32);
+    memset(key1, 0xBB, 32);
+    memset(key2, 0xCC, 32);
+
+    TEST_ASSERT(persist_save_departed_client(&db, 0, 1, key0), "save departed 0");
+    TEST_ASSERT(persist_save_departed_client(&db, 0, 2, key1), "save departed 1");
+    TEST_ASSERT(persist_save_departed_client(&db, 0, 3, key2), "save departed 2");
+
+    int departed[8];
+    unsigned char keys[8][32];
+    memset(departed, 0, sizeof(departed));
+    memset(keys, 0, sizeof(keys));
+
+    size_t count = persist_load_departed_clients(&db, 0, departed, keys, 8);
+    TEST_ASSERT_EQ(count, 3, "departed count");
+    TEST_ASSERT_EQ(departed[1], 1, "client 1 departed");
+    TEST_ASSERT_EQ(departed[2], 1, "client 2 departed");
+    TEST_ASSERT_EQ(departed[3], 1, "client 3 departed");
+    TEST_ASSERT_EQ(departed[0], 0, "client 0 not departed");
+    TEST_ASSERT(memcmp(keys[1], key0, 32) == 0, "key 0 matches");
+    TEST_ASSERT(memcmp(keys[2], key1, 32) == 0, "key 1 matches");
+    TEST_ASSERT(memcmp(keys[3], key2, 32) == 0, "key 2 matches");
+
+    /* Different factory returns 0 */
+    memset(departed, 0, sizeof(departed));
+    count = persist_load_departed_clients(&db, 99, departed, keys, 8);
+    TEST_ASSERT_EQ(count, 0, "no departed for factory 99");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: Invoice registry round-trip ---- */
+
+int test_persist_invoice_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char hash0[32], hash1[32], hash2[32];
+    memset(hash0, 0x01, 32);
+    memset(hash1, 0x02, 32);
+    memset(hash2, 0x03, 32);
+
+    TEST_ASSERT(persist_save_invoice(&db, hash0, 0, 10000), "save invoice 0");
+    TEST_ASSERT(persist_save_invoice(&db, hash1, 2, 25000), "save invoice 1");
+    TEST_ASSERT(persist_save_invoice(&db, hash2, 1, 5000), "save invoice 2");
+
+    /* Deactivate one */
+    TEST_ASSERT(persist_deactivate_invoice(&db, hash2), "deactivate invoice 2");
+
+    /* Load active only */
+    unsigned char hashes[8][32];
+    size_t dests[8];
+    uint64_t amounts[8];
+    size_t count = persist_load_invoices(&db, hashes, dests, amounts, 8);
+    TEST_ASSERT_EQ(count, 2, "active invoice count");
+    TEST_ASSERT(memcmp(hashes[0], hash0, 32) == 0, "hash 0");
+    TEST_ASSERT_EQ(dests[0], 0, "dest 0");
+    TEST_ASSERT_EQ(amounts[0], 10000, "amount 0");
+    TEST_ASSERT(memcmp(hashes[1], hash1, 32) == 0, "hash 1");
+    TEST_ASSERT_EQ(dests[1], 2, "dest 1");
+    TEST_ASSERT_EQ(amounts[1], 25000, "amount 1");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: HTLC origin round-trip ---- */
+
+int test_persist_htlc_origin_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char hash0[32], hash1[32];
+    memset(hash0, 0xA1, 32);
+    memset(hash1, 0xB2, 32);
+
+    TEST_ASSERT(persist_save_htlc_origin(&db, hash0, 5, 0, 0, 0),
+                "save origin 0");
+    TEST_ASSERT(persist_save_htlc_origin(&db, hash1, 0, 3, 1, 7),
+                "save origin 1");
+
+    /* Deactivate first */
+    TEST_ASSERT(persist_deactivate_htlc_origin(&db, hash0), "deactivate origin 0");
+
+    /* Load active */
+    unsigned char hashes[8][32];
+    uint64_t bridge[8], req[8], htlc_ids[8];
+    size_t senders[8];
+    size_t count = persist_load_htlc_origins(&db, hashes, bridge, req,
+                                               senders, htlc_ids, 8);
+    TEST_ASSERT_EQ(count, 1, "active origin count");
+    TEST_ASSERT(memcmp(hashes[0], hash1, 32) == 0, "hash matches");
+    TEST_ASSERT_EQ(bridge[0], 0, "bridge_htlc_id");
+    TEST_ASSERT_EQ(req[0], 3, "request_id");
+    TEST_ASSERT_EQ(senders[0], 1, "sender_idx");
+    TEST_ASSERT_EQ(htlc_ids[0], 7, "sender_htlc_id");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: Client invoice round-trip ---- */
+
+int test_persist_client_invoice_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    unsigned char hash0[32], preimage0[32];
+    unsigned char hash1[32], preimage1[32];
+    memset(hash0, 0xD0, 32); memset(preimage0, 0xE0, 32);
+    memset(hash1, 0xD1, 32); memset(preimage1, 0xE1, 32);
+
+    TEST_ASSERT(persist_save_client_invoice(&db, hash0, preimage0, 10000),
+                "save client invoice 0");
+    TEST_ASSERT(persist_save_client_invoice(&db, hash1, preimage1, 5000),
+                "save client invoice 1");
+
+    /* Deactivate first */
+    TEST_ASSERT(persist_deactivate_client_invoice(&db, hash0),
+                "deactivate client invoice 0");
+
+    /* Load active */
+    unsigned char hashes[8][32], preimages[8][32];
+    uint64_t amounts[8];
+    size_t count = persist_load_client_invoices(&db, hashes, preimages, amounts, 8);
+    TEST_ASSERT_EQ(count, 1, "active client invoice count");
+    TEST_ASSERT(memcmp(hashes[0], hash1, 32) == 0, "hash matches");
+    TEST_ASSERT(memcmp(preimages[0], preimage1, 32) == 0, "preimage matches");
+    TEST_ASSERT_EQ(amounts[0], 5000, "amount matches");
+
+    persist_close(&db);
+    return 1;
+}
+
+/* ---- Test: ID counter round-trip ---- */
+
+int test_persist_counter_round_trip(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    TEST_ASSERT(persist_save_counter(&db, "next_request_id", 5), "save counter");
+
+    uint64_t val = persist_load_counter(&db, "next_request_id", 0);
+    TEST_ASSERT_EQ(val, 5, "counter value");
+
+    /* Overwrite */
+    TEST_ASSERT(persist_save_counter(&db, "next_request_id", 42), "overwrite counter");
+    val = persist_load_counter(&db, "next_request_id", 0);
+    TEST_ASSERT_EQ(val, 42, "updated value");
+
+    /* Missing key returns default */
+    val = persist_load_counter(&db, "nonexistent", 999);
+    TEST_ASSERT_EQ(val, 999, "missing key returns default");
+
+    /* Multiple counters */
+    TEST_ASSERT(persist_save_counter(&db, "next_htlc_id", 100), "save htlc counter");
+    val = persist_load_counter(&db, "next_htlc_id", 0);
+    TEST_ASSERT_EQ(val, 100, "htlc counter value");
+
+    /* First counter still intact */
+    val = persist_load_counter(&db, "next_request_id", 0);
+    TEST_ASSERT_EQ(val, 42, "first counter still correct");
+
+    persist_close(&db);
+    return 1;
+}

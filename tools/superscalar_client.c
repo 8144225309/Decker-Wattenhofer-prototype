@@ -285,6 +285,9 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                 memcmp(cbd->invoices[inv].payment_hash, htlc_hash, 32) == 0) {
                                 memcpy(preimage, cbd->invoices[inv].preimage, 32);
                                 cbd->invoices[inv].active = 0;
+                                /* Deactivate in persistence (Phase 23) */
+                                if (cbd->db)
+                                    persist_deactivate_client_invoice(cbd->db, htlc_hash);
                                 have_preimage = 1;
                                 break;
                             }
@@ -377,6 +380,11 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 inv->amount_msat = inv_amount_msat;
                 inv->active = 1;
                 cbd->n_invoices++;
+
+                /* Persist client invoice (Phase 23) */
+                if (cbd->db)
+                    persist_save_client_invoice(cbd->db, inv->payment_hash,
+                                                inv->preimage, inv_amount_msat);
 
                 printf("Client %u: created invoice for %llu msat\n",
                        my_index, (unsigned long long)inv_amount_msat);
@@ -641,6 +649,25 @@ int main(int argc, char *argv[]) {
     int ok;
     if (daemon_mode) {
         daemon_cb_data_t cbd = { use_db ? &db : NULL, 0 };
+
+        /* Load persisted client invoices (Phase 23) */
+        if (use_db) {
+            unsigned char ci_hashes[MAX_CLIENT_INVOICES][32];
+            unsigned char ci_preimages[MAX_CLIENT_INVOICES][32];
+            uint64_t ci_amounts[MAX_CLIENT_INVOICES];
+            size_t n_ci = persist_load_client_invoices(&db,
+                ci_hashes, ci_preimages, ci_amounts, MAX_CLIENT_INVOICES);
+            for (size_t i = 0; i < n_ci && cbd.n_invoices < MAX_CLIENT_INVOICES; i++) {
+                client_invoice_t *inv = &cbd.invoices[cbd.n_invoices++];
+                memcpy(inv->payment_hash, ci_hashes[i], 32);
+                memcpy(inv->preimage, ci_preimages[i], 32);
+                inv->amount_msat = ci_amounts[i];
+                inv->active = 1;
+            }
+            if (n_ci > 0)
+                printf("Client: loaded %zu invoices from DB\n", n_ci);
+        }
+
         int first_run = 1;
 
         while (!g_shutdown) {

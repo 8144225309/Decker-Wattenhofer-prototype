@@ -52,6 +52,9 @@ typedef struct {
 
     /* Watchtower (Phase 18) */
     watchtower_t *watchtower;
+
+    /* Persistence (Phase 23) */
+    void *persist;  /* persist_t* or NULL — avoids header dependency */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

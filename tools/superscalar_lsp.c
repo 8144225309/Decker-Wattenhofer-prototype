@@ -583,12 +583,15 @@ int main(int argc, char *argv[]) {
     /* Set fee estimator on factory (for computed fees) */
     lsp.factory.fee = &fee_est;
 
-    /* Persist factory + tree nodes */
+    /* Persist factory + tree nodes + DW counter */
     if (use_db) {
         if (!persist_save_factory(&db, &lsp.factory, ctx, 0))
             fprintf(stderr, "LSP: warning: failed to persist factory\n");
         if (!persist_save_tree_nodes(&db, &lsp.factory, 0))
             fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
+        /* Save initial DW counter state (Phase 23) */
+        uint32_t init_layers[] = {4, 4};  /* states_per_layer for each DW layer */
+        persist_save_dw_counter(&db, 0, 0, 2, init_layers);
     }
 
     /* Report: factory tree */
@@ -612,6 +615,53 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
+        /* Set persistence pointer (Phase 23) */
+        mgr.persist = use_db ? &db : NULL;
+
+        /* Load persisted state (Phase 23) */
+        if (use_db) {
+            mgr.next_request_id = persist_load_counter(&db, "next_request_id", 1);
+
+            /* Load invoices */
+            unsigned char inv_hashes[MAX_INVOICE_REGISTRY][32];
+            size_t inv_dests[MAX_INVOICE_REGISTRY];
+            uint64_t inv_amounts[MAX_INVOICE_REGISTRY];
+            size_t n_inv = persist_load_invoices(&db,
+                inv_hashes, inv_dests, inv_amounts, MAX_INVOICE_REGISTRY);
+            for (size_t i = 0; i < n_inv; i++) {
+                if (mgr.n_invoices >= MAX_INVOICE_REGISTRY) break;
+                invoice_entry_t *inv = &mgr.invoices[mgr.n_invoices++];
+                memcpy(inv->payment_hash, inv_hashes[i], 32);
+                inv->dest_client = inv_dests[i];
+                inv->amount_msat = inv_amounts[i];
+                inv->bridge_htlc_id = 0;
+                inv->active = 1;
+            }
+            if (n_inv > 0)
+                printf("LSP: loaded %zu invoices from DB\n", n_inv);
+
+            /* Load HTLC origins */
+            unsigned char orig_hashes[MAX_HTLC_ORIGINS][32];
+            uint64_t orig_bridge[MAX_HTLC_ORIGINS], orig_req[MAX_HTLC_ORIGINS];
+            size_t orig_sender[MAX_HTLC_ORIGINS];
+            uint64_t orig_htlc[MAX_HTLC_ORIGINS];
+            size_t n_orig = persist_load_htlc_origins(&db,
+                orig_hashes, orig_bridge, orig_req, orig_sender, orig_htlc,
+                MAX_HTLC_ORIGINS);
+            for (size_t i = 0; i < n_orig; i++) {
+                if (mgr.n_htlc_origins >= MAX_HTLC_ORIGINS) break;
+                htlc_origin_t *origin = &mgr.htlc_origins[mgr.n_htlc_origins++];
+                memcpy(origin->payment_hash, orig_hashes[i], 32);
+                origin->bridge_htlc_id = orig_bridge[i];
+                origin->request_id = orig_req[i];
+                origin->sender_idx = orig_sender[i];
+                origin->sender_htlc_id = orig_htlc[i];
+                origin->active = 1;
+            }
+            if (n_orig > 0)
+                printf("LSP: loaded %zu HTLC origins from DB\n", n_orig);
+        }
+
         /* Set fee rate on all channels */
         for (size_t c = 0; c < mgr.n_channels; c++)
             mgr.entries[c].channel.fee_rate_sat_per_kvb = fee_rate;

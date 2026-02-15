@@ -135,4 +135,72 @@ int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
                                  uint32_t active_blocks,
                                  uint32_t dying_blocks);
 
+/* --- DW counter state (Phase 23) --- */
+
+int persist_save_dw_counter(persist_t *p, uint32_t factory_id,
+                             uint32_t current_epoch, uint32_t n_layers,
+                             const uint32_t *layer_states);
+int persist_load_dw_counter(persist_t *p, uint32_t factory_id,
+                             uint32_t *epoch_out, uint32_t *n_layers_out,
+                             uint32_t *layer_states_out, size_t max_layers);
+
+/* --- Departed clients (Phase 23) --- */
+
+int persist_save_departed_client(persist_t *p, uint32_t factory_id,
+                                  uint32_t client_idx,
+                                  const unsigned char *extracted_key32);
+size_t persist_load_departed_clients(persist_t *p, uint32_t factory_id,
+                                      int *departed_out,
+                                      unsigned char (*keys_out)[32],
+                                      size_t max_clients);
+
+/* --- Invoice registry (Phase 23) --- */
+
+int persist_save_invoice(persist_t *p,
+                          const unsigned char *payment_hash32,
+                          size_t dest_client, uint64_t amount_msat);
+int persist_deactivate_invoice(persist_t *p,
+                                const unsigned char *payment_hash32);
+size_t persist_load_invoices(persist_t *p,
+                              unsigned char (*hashes_out)[32],
+                              size_t *dest_clients_out,
+                              uint64_t *amounts_out,
+                              size_t max_invoices);
+
+/* --- HTLC origin tracking (Phase 23) --- */
+
+int persist_save_htlc_origin(persist_t *p,
+                              const unsigned char *payment_hash32,
+                              uint64_t bridge_htlc_id, uint64_t request_id,
+                              size_t sender_idx, uint64_t sender_htlc_id);
+int persist_deactivate_htlc_origin(persist_t *p,
+                                    const unsigned char *payment_hash32);
+size_t persist_load_htlc_origins(persist_t *p,
+                                  unsigned char (*hashes_out)[32],
+                                  uint64_t *bridge_ids_out,
+                                  uint64_t *request_ids_out,
+                                  size_t *sender_idxs_out,
+                                  uint64_t *sender_htlc_ids_out,
+                                  size_t max_origins);
+
+/* --- Client invoices (Phase 23) --- */
+
+int persist_save_client_invoice(persist_t *p,
+                                 const unsigned char *payment_hash32,
+                                 const unsigned char *preimage32,
+                                 uint64_t amount_msat);
+int persist_deactivate_client_invoice(persist_t *p,
+                                       const unsigned char *payment_hash32);
+size_t persist_load_client_invoices(persist_t *p,
+                                     unsigned char (*hashes_out)[32],
+                                     unsigned char (*preimages_out)[32],
+                                     uint64_t *amounts_out,
+                                     size_t max_invoices);
+
+/* --- ID counters (Phase 23) --- */
+
+int persist_save_counter(persist_t *p, const char *name, uint64_t value);
+uint64_t persist_load_counter(persist_t *p, const char *name,
+                               uint64_t default_val);
+
 #endif /* SUPERSCALAR_PERSIST_H */

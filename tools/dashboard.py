@@ -124,6 +124,25 @@ def collect_databases(cfg):
         rows, err = query_db(path,
             "SELECT * FROM ladder_factories ORDER BY factory_id")
         data[label]["ladder_factories"] = rows if not err else []
+        # Phase 23: persistence hardening tables
+        rows, err = query_db(path,
+            "SELECT * FROM dw_counter_state ORDER BY factory_id")
+        data[label]["dw_counter_state"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT * FROM departed_clients ORDER BY factory_id, client_idx")
+        data[label]["departed_clients"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT * FROM invoice_registry ORDER BY id DESC LIMIT 50")
+        data[label]["invoice_registry"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT * FROM htlc_origins ORDER BY id DESC LIMIT 50")
+        data[label]["htlc_origins"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT * FROM client_invoices ORDER BY id DESC LIMIT 50")
+        data[label]["client_invoices"] = rows if not err else []
+        rows, err = query_db(path,
+            "SELECT * FROM id_counters ORDER BY name")
+        data[label]["id_counters"] = rows if not err else []
     return data
 
 def collect_cln(cfg):
@@ -245,6 +264,29 @@ def collect_demo():
                     {"factory_id":0,"state":"active","is_funded":1,"is_initialized":1,"n_departed":0,"created_block":cb,"active_blocks":4320,"dying_blocks":432,"updated_at":int(t)-60},
                     {"factory_id":1,"state":"dying","is_funded":1,"is_initialized":1,"n_departed":2,"created_block":cb-4000,"active_blocks":4320,"dying_blocks":432,"updated_at":int(t)-30},
                 ],
+                # Phase 23
+                "dw_counter_state":[{"factory_id":0,"current_epoch":7,"n_layers":2,"layer_states":"3,1"}],
+                "departed_clients":[
+                    {"factory_id":1,"client_idx":2,"extracted_key":_rh(64),"departed_at":int(t)-1800},
+                    {"factory_id":1,"client_idx":3,"extracted_key":_rh(64),"departed_at":int(t)-900},
+                ],
+                "invoice_registry":[
+                    {"id":1,"payment_hash":_rh(64),"dest_client":0,"amount_msat":10000,"bridge_htlc_id":0,"active":1,"created_at":int(t)-600},
+                    {"id":2,"payment_hash":_rh(64),"dest_client":2,"amount_msat":25000,"bridge_htlc_id":5,"active":1,"created_at":int(t)-300},
+                    {"id":3,"payment_hash":_rh(64),"dest_client":1,"amount_msat":5000,"bridge_htlc_id":0,"active":0,"created_at":int(t)-1200},
+                ],
+                "htlc_origins":[
+                    {"id":1,"payment_hash":_rh(64),"bridge_htlc_id":5,"request_id":0,"sender_idx":0,"sender_htlc_id":0,"active":1,"created_at":int(t)-300},
+                    {"id":2,"payment_hash":_rh(64),"bridge_htlc_id":0,"request_id":3,"sender_idx":1,"sender_htlc_id":2,"active":0,"created_at":int(t)-600},
+                ],
+                "client_invoices":[
+                    {"id":1,"payment_hash":_rh(64),"preimage":_rh(64),"amount_msat":10000,"active":1,"created_at":int(t)-500},
+                    {"id":2,"payment_hash":_rh(64),"preimage":_rh(64),"amount_msat":5000,"active":0,"created_at":int(t)-1000},
+                ],
+                "id_counters":[
+                    {"name":"next_request_id","value":4},
+                    {"name":"next_htlc_id","value":12},
+                ],
             },
             "client": {
                 "factories":[{"id":0,"n_participants":5,"funding_txid":ft,"funding_vout":0,"funding_amount":200000,"step_blocks":144,"states_per_layer":spl,"cltv_timeout":ct,"fee_per_tx":354,"state":"active","created_at":int(t)-3600}],
@@ -255,6 +297,10 @@ def collect_demo():
                 "nonce_pools":[{"channel_id":0,"side":"local","next_index":6},{"channel_id":0,"side":"remote","next_index":5}],
                 "old_commitments":[{"channel_id":0,"commit_num":i,"txid":_rh(64),"to_local_amount":24500,"to_local_vout":0} for i in range(3)],
                 "tree_nodes":[],"wire_messages":[],"ladder_factories":[],
+                "dw_counter_state":[],"departed_clients":[],"invoice_registry":[],
+                "htlc_origins":[],"client_invoices":[
+                    {"id":1,"payment_hash":_rh(64),"preimage":_rh(64),"amount_msat":10000,"active":1,"created_at":int(t)-500},
+                ],"id_counters":[],
             },
         },
         "cln": {
@@ -475,6 +521,18 @@ function rOverview(D){
    const pc=lf.state==='expired'?'po':lf.state==='dying'?'po':'pg';
    h+=`<tr><td>#${lf.factory_id}</td><td>${sb(lf.state)}</td><td>${lf.is_funded?'\u2705':'\u274C'}</td><td>${lf.is_initialized?'\u2705':'\u274C'}</td><td>${lf.n_departed||0}</td><td>${lf.created_block||'\u2014'}</td><td class="r">${lf.active_blocks||'\u2014'}</td><td class="r">${lf.dying_blocks||'\u2014'}</td><td style="min-width:100px">${prog(pct,pc)}</td><td>${ta(lf.updated_at)}</td></tr>`;}
   h+=`</table></div>`;}
+ // DW Counter State (Phase 23)
+ const dwc=lsp.dw_counter_state||[];
+ if(dwc.length){h+=`<div class="s"><div class="st"><span>DW Counter State</span><span class="c">${dwc.length}</span></div>`;
+  h+=`<div class="kv">`;
+  for(const d of dwc)h+=`<div class="ki"><span class="k">Factory #${d.factory_id}</span><span class="v">epoch=${d.current_epoch} layers=${d.n_layers} states=[${d.layer_states}]</span></div>`;
+  h+=`</div></div>`;}
+ // ID Counters (Phase 23)
+ const idc=lsp.id_counters||[];
+ if(idc.length){h+=`<div class="s"><div class="st"><span>ID Counters</span><span class="c">${idc.length}</span></div>`;
+  h+=`<div class="kv">`;
+  for(const c of idc)h+=`<div class="ki"><span class="k">${c.name}</span><span class="v">${c.value}</span></div>`;
+  h+=`</div></div>`;}
  // Channels summary
  const chs=lsp.channels||[];
  h+=`<div class="s"><div class="st"><span>Channels</span><span class="c">${chs.length}</span></div>`;
@@ -513,6 +571,12 @@ function rFactory(D){
  }
  if(!facs.length)h+=`<p class="mu">No factories</p>`;
  h+=`</div>`;
+ // Departed Clients (Phase 23)
+ const dep=lsp.departed_clients||[];
+ if(dep.length){h+=`<div class="s"><div class="st"><span>Departed Clients</span><span class="c">${dep.length}</span></div>`;
+  h+=`<table><tr><th>Factory</th><th>Client Idx</th><th>Extracted Key</th><th>Departed</th></tr>`;
+  for(const d of dep)h+=`<tr><td>#${d.factory_id}</td><td>${d.client_idx}</td><td class="h">${th(d.extracted_key)}</td><td>${ta(d.departed_at)}</td></tr>`;
+  h+=`</table></div>`;}
  // Tree nodes visualization
  const tn=lsp.tree_nodes||[];
  if(tn.length){h+=`<div class="s"><div class="st"><span>Timeout-Sig-Tree Nodes</span><span class="c">${tn.length}</span></div>`;
@@ -583,6 +647,18 @@ function rChannels(D){
    h+=`<tr><td>${x.id??'\u2014'}</td><td>${x.channel_id}</td><td>${x.htlc_id??'\u2014'}</td><td style="${dc}">${x.direction||'?'}</td><td class="r">${fs(x.amount)}</td><td>${sb(x.state)}</td><td class="r">${x.cltv_expiry??'\u2014'}</td><td class="h">${th(x.payment_hash)}</td><td class="h">${x.payment_preimage?ts(x.payment_preimage):'\u2014'}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
+ // Invoice Registry (Phase 23)
+ const invReg=lsp.invoice_registry||[];
+ if(invReg.length){h+=`<div class="s"><div class="st"><span>Invoice Registry</span><span class="c">${invReg.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th>Dest</th><th class="r">Amount (msat)</th><th>Bridge HTLC</th><th>Active</th><th>Payment Hash</th><th>Created</th></tr>`;
+  for(const iv of invReg)h+=`<tr><td>${iv.id}</td><td>Client ${iv.dest_client}</td><td class="r">${iv.amount_msat?.toLocaleString()??'\u2014'}</td><td>${iv.bridge_htlc_id||'\u2014'}</td><td>${iv.active?'\u2705':'\u274C'}</td><td class="h">${th(iv.payment_hash)}</td><td>${ta(iv.created_at)}</td></tr>`;
+  h+=`</table></div>`;}
+ // HTLC Origins (Phase 23)
+ const htlcOrig=lsp.htlc_origins||[];
+ if(htlcOrig.length){h+=`<div class="s"><div class="st"><span>HTLC Origins</span><span class="c">${htlcOrig.length}</span></div>`;
+  h+=`<table><tr><th>ID</th><th>Bridge HTLC</th><th>Request</th><th>Sender</th><th>Sender HTLC</th><th>Active</th><th>Payment Hash</th></tr>`;
+  for(const o of htlcOrig)h+=`<tr><td>${o.id}</td><td>${o.bridge_htlc_id||'\u2014'}</td><td>${o.request_id||'\u2014'}</td><td>${o.sender_idx}</td><td>${o.sender_htlc_id||'\u2014'}</td><td>${o.active?'\u2705':'\u274C'}</td><td class="h">${th(o.payment_hash)}</td></tr>`;
+  h+=`</table></div>`;}
  return h;
 }
 
