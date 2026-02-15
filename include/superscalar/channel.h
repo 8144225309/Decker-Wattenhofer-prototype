@@ -11,6 +11,8 @@
 
 #define CHANNEL_DEFAULT_CSV_DELAY 144  /* ~1 day */
 #define MAX_HTLCS 16
+#define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
+#define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 
 typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
 typedef enum { HTLC_STATE_ACTIVE, HTLC_STATE_FULFILLED, HTLC_STATE_FAILED } htlc_state_t;
@@ -237,6 +239,9 @@ int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
                            const unsigned char *preimage32);
 
 int channel_fail_htlc(channel_t *ch, uint64_t htlc_id);
+
+/* Fail all HTLCs whose cltv_expiry <= current_height. Returns count failed. */
+int channel_check_htlc_timeouts(channel_t *ch, uint32_t current_height);
 
 /* --- HTLC resolution transactions --- */
 

@@ -215,6 +215,30 @@ extern int test_noise_handshake(void);
 extern int test_encrypted_wire_round_trip(void);
 extern int test_encrypted_tamper_reject(void);
 
+/* Demo Day: Network Mode */
+extern int test_network_init_regtest(void);
+extern int test_network_mode_flag(void);
+extern int test_block_height(void);
+
+/* Demo Day: Dust/Reserve Validation */
+extern int test_dust_limit_reject(void);
+extern int test_reserve_enforcement(void);
+extern int test_factory_dust_reject(void);
+
+/* Demo Day: Watchtower Wiring */
+extern int test_watchtower_wired(void);
+extern int test_watchtower_entry_fields(void);
+
+/* Demo Day: HTLC Timeout Enforcement */
+extern int test_htlc_timeout_auto_fail(void);
+extern int test_htlc_fulfill_before_timeout(void);
+extern int test_htlc_no_timeout_zero_expiry(void);
+
+/* Demo Day: Encrypted Keyfile */
+extern int test_keyfile_save_load(void);
+extern int test_keyfile_wrong_passphrase(void);
+extern int test_keyfile_generate(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -385,6 +409,30 @@ static void run_unit_tests(void) {
     RUN_TEST(test_noise_handshake);
     RUN_TEST(test_encrypted_wire_round_trip);
     RUN_TEST(test_encrypted_tamper_reject);
+
+    printf("\n=== Network Mode (Demo Day Step 1) ===\n");
+    RUN_TEST(test_network_init_regtest);
+    RUN_TEST(test_network_mode_flag);
+    RUN_TEST(test_block_height);
+
+    printf("\n=== Dust/Reserve Validation (Demo Day Step 2) ===\n");
+    RUN_TEST(test_dust_limit_reject);
+    RUN_TEST(test_reserve_enforcement);
+    RUN_TEST(test_factory_dust_reject);
+
+    printf("\n=== Watchtower Wiring (Demo Day Step 3) ===\n");
+    RUN_TEST(test_watchtower_wired);
+    RUN_TEST(test_watchtower_entry_fields);
+
+    printf("\n=== HTLC Timeout Enforcement (Demo Day Step 4) ===\n");
+    RUN_TEST(test_htlc_timeout_auto_fail);
+    RUN_TEST(test_htlc_fulfill_before_timeout);
+    RUN_TEST(test_htlc_no_timeout_zero_expiry);
+
+    printf("\n=== Encrypted Keyfile (Demo Day Step 5) ===\n");
+    RUN_TEST(test_keyfile_save_load);
+    RUN_TEST(test_keyfile_wrong_passphrase);
+    RUN_TEST(test_keyfile_generate);
 }
 
 static void run_regtest_tests(void) {

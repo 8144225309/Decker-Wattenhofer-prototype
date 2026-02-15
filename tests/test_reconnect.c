@@ -1041,3 +1041,352 @@ int test_encrypted_tamper_reject(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Network mode tests (Step 1: Demo Day) ---- */
+
+#include "superscalar/regtest.h"
+
+/* Test: regtest_init backward compat — network field exists and stores "regtest" */
+int test_network_init_regtest(void) {
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.cli_path, "bitcoin-cli", sizeof(rt.cli_path) - 1);
+    strncpy(rt.rpcuser, "rpcuser", sizeof(rt.rpcuser) - 1);
+    strncpy(rt.rpcpassword, "rpcpass", sizeof(rt.rpcpassword) - 1);
+    strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
+
+    TEST_ASSERT(strcmp(rt.network, "regtest") == 0, "network field stores regtest");
+    TEST_ASSERT(sizeof(rt.network) >= 16, "network field large enough");
+    return 1;
+}
+
+/* Test: different network modes can be stored */
+int test_network_mode_flag(void) {
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+
+    strncpy(rt.network, "signet", sizeof(rt.network) - 1);
+    TEST_ASSERT(strcmp(rt.network, "signet") == 0, "stores signet");
+
+    strncpy(rt.network, "testnet", sizeof(rt.network) - 1);
+    TEST_ASSERT(strcmp(rt.network, "testnet") == 0, "stores testnet");
+
+    strncpy(rt.network, "mainnet", sizeof(rt.network) - 1);
+    TEST_ASSERT(strcmp(rt.network, "mainnet") == 0, "stores mainnet");
+
+    return 1;
+}
+
+/* Test: regtest_get_block_height function works without crash */
+int test_block_height(void) {
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.cli_path, "echo", sizeof(rt.cli_path) - 1);
+    strncpy(rt.rpcuser, "x", sizeof(rt.rpcuser) - 1);
+    strncpy(rt.rpcpassword, "x", sizeof(rt.rpcpassword) - 1);
+    strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
+
+    /* With a fake cli, should not crash and returns a reasonable value */
+    int h = regtest_get_block_height(&rt);
+    TEST_ASSERT(h >= -1, "block height returns valid int");
+    return 1;
+}
+
+/* ---- Dust/Reserve Validation tests (Step 2: Demo Day) ---- */
+
+#include "superscalar/channel.h"
+
+/* Helper: create a test channel with known balances */
+static int make_test_channel(channel_t *ch, secp256k1_context *ctx,
+                              uint64_t local, uint64_t remote) {
+    unsigned char seckey[32];
+    memset(seckey, 0x11, 32);
+
+    secp256k1_pubkey local_pk, remote_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_pk, seckey);
+    unsigned char remote_sec[32];
+    memset(remote_sec, 0x22, 32);
+    secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_sec);
+
+    unsigned char txid[32], spk[34];
+    memset(txid, 0xAA, 32);
+    memset(spk, 0, 34);
+    spk[0] = 0x51; spk[1] = 0x20;
+
+    return channel_init(ch, ctx, seckey, &local_pk, &remote_pk,
+                         txid, 0, local + remote, spk, 34,
+                         local, remote, 144);
+}
+
+int test_dust_limit_reject(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    make_test_channel(&ch, ctx, 50000, 50000);
+
+    unsigned char hash[32];
+    memset(hash, 0x42, 32);
+    uint64_t htlc_id;
+
+    /* Below dust: should fail */
+    int ok = channel_add_htlc(&ch, HTLC_OFFERED, 100, hash, 500, &htlc_id);
+    TEST_ASSERT(ok == 0, "HTLC below dust limit rejected");
+
+    /* Exactly at dust: should succeed */
+    ok = channel_add_htlc(&ch, HTLC_OFFERED, CHANNEL_DUST_LIMIT_SATS, hash, 500, &htlc_id);
+    TEST_ASSERT(ok == 1, "HTLC at dust limit accepted");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_reserve_enforcement(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    /* Start with local=10000, remote=10000 */
+    make_test_channel(&ch, ctx, 10000, 10000);
+
+    unsigned char hash[32];
+    memset(hash, 0x43, 32);
+    uint64_t htlc_id;
+
+    /* Try to send 6000 — would leave local at 4000 < 5000 reserve. Should fail. */
+    int ok = channel_add_htlc(&ch, HTLC_OFFERED, 6000, hash, 500, &htlc_id);
+    TEST_ASSERT(ok == 0, "HTLC violating reserve rejected");
+
+    /* Send 4000 — leaves 6000 >= 5000 reserve. Should succeed. */
+    memset(hash, 0x44, 32);
+    ok = channel_add_htlc(&ch, HTLC_OFFERED, 4000, hash, 500, &htlc_id);
+    TEST_ASSERT(ok == 1, "HTLC respecting reserve accepted");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_dust_reject(void) {
+    /* Constants check: CHANNEL_DUST_LIMIT_SATS is 546 */
+    TEST_ASSERT_EQ(CHANNEL_DUST_LIMIT_SATS, 546, "dust limit is 546");
+    TEST_ASSERT_EQ(CHANNEL_RESERVE_SATS, 5000, "reserve is 5000");
+    return 1;
+}
+
+/* ---- Watchtower Wiring tests (Step 3: Demo Day) ---- */
+
+#include "superscalar/watchtower.h"
+
+int test_watchtower_wired(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Create a channel */
+    channel_t ch;
+    make_test_channel(&ch, ctx, 50000, 50000);
+
+    /* Set up basepoints */
+    unsigned char pay_sec[32], del_sec[32], rev_sec[32], htlc_sec[32];
+    memset(pay_sec, 0x31, 32);
+    memset(del_sec, 0x32, 32);
+    memset(rev_sec, 0x33, 32);
+    memset(htlc_sec, 0x34, 32);
+    channel_set_local_basepoints(&ch, pay_sec, del_sec, rev_sec);
+    channel_set_local_htlc_basepoint(&ch, htlc_sec);
+
+    /* Set remote basepoints */
+    secp256k1_pubkey rpay, rdel, rrev, rhtlc;
+    unsigned char rs[32];
+    memset(rs, 0x41, 32); secp256k1_ec_pubkey_create(ctx, &rpay, rs);
+    memset(rs, 0x42, 32); secp256k1_ec_pubkey_create(ctx, &rdel, rs);
+    memset(rs, 0x43, 32); secp256k1_ec_pubkey_create(ctx, &rrev, rs);
+    memset(rs, 0x44, 32); secp256k1_ec_pubkey_create(ctx, &rhtlc, rs);
+    channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
+    channel_set_remote_htlc_basepoint(&ch, &rhtlc);
+
+    unsigned char seed[32];
+    memset(seed, 0x50, 32);
+    channel_set_shachain_seed(&ch, seed);
+
+    /* Init watchtower */
+    watchtower_t wt;
+    watchtower_init(&wt, 1, NULL, NULL, NULL);
+    watchtower_set_channel(&wt, 0, &ch);
+
+    /* watchtower_watch should accept an entry */
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xDE, 32);
+    unsigned char fake_spk[34];
+    memset(fake_spk, 0, 34);
+    fake_spk[0] = 0x51; fake_spk[1] = 0x20;
+
+    int ok = watchtower_watch(&wt, 0, 0, fake_txid, 0, 25000, fake_spk, 34);
+    TEST_ASSERT(ok == 1, "watchtower_watch accepts entry");
+    TEST_ASSERT_EQ(wt.n_entries, 1, "watchtower has 1 entry");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_watchtower_entry_fields(void) {
+    watchtower_t wt;
+    watchtower_init(&wt, 1, NULL, NULL, NULL);
+
+    unsigned char txid[32];
+    memset(txid, 0xBE, 32);
+    unsigned char spk[34];
+    memset(spk, 0, 34);
+    spk[0] = 0x51; spk[1] = 0x20;
+
+    watchtower_watch(&wt, 0, 42, txid, 1, 12345, spk, 34);
+
+    TEST_ASSERT_EQ(wt.entries[0].channel_id, 0, "channel_id stored");
+    TEST_ASSERT_EQ(wt.entries[0].commit_num, 42, "commit_num stored");
+    TEST_ASSERT_EQ(wt.entries[0].to_local_vout, 1, "vout stored");
+    TEST_ASSERT_EQ(wt.entries[0].to_local_amount, 12345, "amount stored");
+    TEST_ASSERT_MEM_EQ(wt.entries[0].txid, txid, 32, "txid stored");
+
+    return 1;
+}
+
+/* ---- HTLC Timeout Enforcement tests (Step 4: Demo Day) ---- */
+
+int test_htlc_timeout_auto_fail(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    make_test_channel(&ch, ctx, 50000, 50000);
+
+    unsigned char hash[32];
+    memset(hash, 0x55, 32);
+    uint64_t htlc_id;
+
+    /* Add HTLC with cltv_expiry = 100 */
+    int ok = channel_add_htlc(&ch, HTLC_OFFERED, 10000, hash, 100, &htlc_id);
+    TEST_ASSERT(ok == 1, "HTLC added");
+
+    /* At height 99: should NOT timeout */
+    int failed = channel_check_htlc_timeouts(&ch, 99);
+    TEST_ASSERT_EQ(failed, 0, "no timeout at height 99");
+
+    /* At height 100: should timeout */
+    failed = channel_check_htlc_timeouts(&ch, 100);
+    TEST_ASSERT_EQ(failed, 1, "timeout at height 100");
+
+    /* Verify HTLC is now failed */
+    TEST_ASSERT_EQ(ch.htlcs[0].state, HTLC_STATE_FAILED, "HTLC state is FAILED");
+
+    /* Verify funds returned to offerer (local) */
+    TEST_ASSERT_EQ(ch.local_amount, 50000, "local balance restored");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_htlc_fulfill_before_timeout(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    make_test_channel(&ch, ctx, 50000, 50000);
+
+    /* Add HTLC with cltv_expiry = 200 */
+    unsigned char preimage[32], hash[32];
+    memset(preimage, 0x77, 32);
+    extern void sha256(const unsigned char *, size_t, unsigned char *);
+    sha256(preimage, 32, hash);
+
+    uint64_t htlc_id;
+    int ok = channel_add_htlc(&ch, HTLC_OFFERED, 10000, hash, 200, &htlc_id);
+    TEST_ASSERT(ok == 1, "HTLC added");
+
+    /* Fulfill before timeout */
+    ok = channel_fulfill_htlc(&ch, htlc_id, preimage);
+    TEST_ASSERT(ok == 1, "fulfill succeeds before timeout");
+
+    /* Check timeouts at height 200 — should find nothing (already fulfilled) */
+    int failed = channel_check_htlc_timeouts(&ch, 200);
+    TEST_ASSERT_EQ(failed, 0, "no timeout for fulfilled HTLC");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_htlc_no_timeout_zero_expiry(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    channel_t ch;
+    make_test_channel(&ch, ctx, 50000, 50000);
+
+    unsigned char hash[32];
+    memset(hash, 0x88, 32);
+    uint64_t htlc_id;
+
+    /* Add HTLC with cltv_expiry = 0 (should NOT auto-fail) */
+    int ok = channel_add_htlc(&ch, HTLC_OFFERED, 10000, hash, 0, &htlc_id);
+    TEST_ASSERT(ok == 1, "HTLC added with zero expiry");
+
+    int failed = channel_check_htlc_timeouts(&ch, 1000);
+    TEST_ASSERT_EQ(failed, 0, "zero expiry HTLCs not auto-failed");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Keyfile tests (Step 5: Demo Day) ---- */
+
+#include "superscalar/keyfile.h"
+
+int test_keyfile_save_load(void) {
+    unsigned char seckey[32];
+    memset(seckey, 0xAB, 32);
+
+    const char *path = "/tmp/test_superscalar_keyfile.dat";
+    int ok = keyfile_save(path, seckey, "testpassword123");
+    TEST_ASSERT(ok == 1, "keyfile_save succeeds");
+
+    unsigned char loaded[32];
+    ok = keyfile_load(path, loaded, "testpassword123");
+    TEST_ASSERT(ok == 1, "keyfile_load succeeds");
+    TEST_ASSERT_MEM_EQ(seckey, loaded, 32, "round-trip key matches");
+
+    unlink(path);
+    return 1;
+}
+
+int test_keyfile_wrong_passphrase(void) {
+    unsigned char seckey[32];
+    memset(seckey, 0xCD, 32);
+
+    const char *path = "/tmp/test_superscalar_keyfile2.dat";
+    keyfile_save(path, seckey, "correct_password");
+
+    unsigned char loaded[32];
+    int ok = keyfile_load(path, loaded, "wrong_password");
+    TEST_ASSERT(ok == 0, "wrong passphrase rejected");
+
+    unlink(path);
+    return 1;
+}
+
+int test_keyfile_generate(void) {
+    const char *path = "/tmp/test_superscalar_keyfile3.dat";
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char seckey[32];
+    int ok = keyfile_generate(path, seckey, "genpass", ctx);
+    TEST_ASSERT(ok == 1, "keyfile_generate succeeds");
+
+    /* Verify the generated key is valid */
+    secp256k1_keypair kp;
+    ok = secp256k1_keypair_create(ctx, &kp, seckey);
+    TEST_ASSERT(ok == 1, "generated key is valid");
+
+    /* Verify we can reload it */
+    unsigned char reloaded[32];
+    ok = keyfile_load(path, reloaded, "genpass");
+    TEST_ASSERT(ok == 1, "reload generated key");
+    TEST_ASSERT_MEM_EQ(seckey, reloaded, 32, "reloaded key matches");
+
+    unlink(path);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

@@ -33,9 +33,15 @@ static char *run_command(const char *cmd) {
 }
 
 static void build_cli_prefix(const regtest_t *rt, char *buf, size_t buf_len) {
-    snprintf(buf, buf_len,
-        "%s -regtest -rpcuser=%s -rpcpassword=%s",
-        rt->cli_path, rt->rpcuser, rt->rpcpassword);
+    if (strcmp(rt->network, "mainnet") == 0) {
+        snprintf(buf, buf_len,
+            "%s -rpcuser=%s -rpcpassword=%s",
+            rt->cli_path, rt->rpcuser, rt->rpcpassword);
+    } else {
+        snprintf(buf, buf_len,
+            "%s -%s -rpcuser=%s -rpcpassword=%s",
+            rt->cli_path, rt->network, rt->rpcuser, rt->rpcpassword);
+    }
 
     if (rt->wallet[0] != '\0') {
         size_t cur = strlen(buf);
@@ -44,12 +50,29 @@ static void build_cli_prefix(const regtest_t *rt, char *buf, size_t buf_len) {
 }
 
 int regtest_init(regtest_t *rt) {
+    return regtest_init_network(rt, "regtest");
+}
+
+int regtest_init_network(regtest_t *rt, const char *network) {
     memset(rt, 0, sizeof(*rt));
     strncpy(rt->cli_path, "bitcoin-cli", sizeof(rt->cli_path) - 1);
     strncpy(rt->rpcuser, "rpcuser", sizeof(rt->rpcuser) - 1);
     strncpy(rt->rpcpassword, "rpcpass", sizeof(rt->rpcpassword) - 1);
+    strncpy(rt->network, network ? network : "regtest", sizeof(rt->network) - 1);
 
-    char *result = run_command("bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass getblockchaininfo 2>&1");
+    /* Build verification command using the configured network */
+    char cmd[512];
+    if (strcmp(rt->network, "mainnet") == 0) {
+        snprintf(cmd, sizeof(cmd),
+            "bitcoin-cli -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
+            rt->rpcuser, rt->rpcpassword);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+            "bitcoin-cli -%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
+            rt->network, rt->rpcuser, rt->rpcpassword);
+    }
+
+    char *result = run_command(cmd);
     if (!result) return 0;
 
     int ok = (strstr(result, "\"chain\"") != NULL);
@@ -111,7 +134,18 @@ int regtest_get_new_address(regtest_t *rt, char *addr_out, size_t len) {
     return 1;
 }
 
+int regtest_get_block_height(regtest_t *rt) {
+    char *result = regtest_exec(rt, "getblockcount", "");
+    if (!result) return -1;
+    int height = atoi(result);
+    free(result);
+    return height;
+}
+
 int regtest_mine_blocks(regtest_t *rt, int n, const char *address) {
+    /* Only allow mining on regtest to prevent accidental mining on other networks */
+    if (strcmp(rt->network, "regtest") != 0) return 0;
+
     char params[512];
     snprintf(params, sizeof(params), "%d \"%s\"", n, address);
     char *result = regtest_exec(rt, "generatetoaddress", params);

@@ -13,10 +13,13 @@ typedef struct {
     char rpcuser[64];
     char rpcpassword[64];
     char wallet[64];
+    char network[16];  /* "regtest", "signet", "testnet", "mainnet" */
 } regtest_t;
 
 int   regtest_init(regtest_t *rt);
+int   regtest_init_network(regtest_t *rt, const char *network);
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params);
+int   regtest_get_block_height(regtest_t *rt);
 int   regtest_create_wallet(regtest_t *rt, const char *name);
 int   regtest_get_new_address(regtest_t *rt, char *addr_out, size_t len);
 int   regtest_mine_blocks(regtest_t *rt, int n, const char *address);

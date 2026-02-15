@@ -1,5 +1,7 @@
 #include "superscalar/factory.h"
+#include "superscalar/channel.h"
 #include "superscalar/shachain.h"
+#include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
 
@@ -238,6 +240,12 @@ static int setup_leaf_outputs(
     uint64_t output_total = input_amount - f->fee_per_tx;
     uint64_t per_output = output_total / 3;
     uint64_t remainder = output_total - per_output * 3;
+
+    if (per_output < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Factory: output %llu below dust limit\n",
+                (unsigned long long)per_output);
+        return 0;
+    }
 
     node->n_outputs = 3;
 

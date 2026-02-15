@@ -6,6 +6,7 @@
 #include "superscalar/persist.h"
 #include "superscalar/fee.h"
 #include "superscalar/watchtower.h"
+#include "superscalar/keyfile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,7 +28,7 @@ static void sigint_handler(int sig) {
 
 static void usage(const char *prog) {
     fprintf(stderr,
-        "Usage: %s --port PORT --regtest [OPTIONS]\n"
+        "Usage: %s --port PORT --network MODE [OPTIONS]\n"
         "\n"
         "  SuperScalar LSP: creates a factory with N clients, then cooperatively closes.\n"
         "\n"
@@ -43,7 +44,10 @@ static void usage(const char *prog) {
         "  --fee-rate N        Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
         "  --report PATH       Write diagnostic JSON report to PATH\n"
         "  --db PATH           SQLite database for persistence (default: none)\n"
-        "  --regtest           Use regtest (required)\n"
+        "  --network MODE      Network: regtest, signet, testnet, mainnet (default: regtest)\n"
+        "  --regtest           Shorthand for --network regtest\n"
+        "  --keyfile PATH      Load/save secret key from encrypted file\n"
+        "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -226,7 +230,6 @@ static void report_channel_state(report_t *rpt, const char *label,
 
 int main(int argc, char *argv[]) {
     int port = 9735;
-    int regtest = 0;
     int n_clients = 4;
     int n_payments = 0;
     int daemon_mode = 0;
@@ -237,6 +240,9 @@ int main(int argc, char *argv[]) {
     const char *seckey_hex = NULL;
     const char *report_path = NULL;
     const char *db_path = NULL;
+    const char *network = NULL;
+    const char *keyfile_path = NULL;
+    const char *passphrase = "";
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -261,19 +267,22 @@ int main(int argc, char *argv[]) {
             fee_rate = (uint64_t)strtoull(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
+        else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
+            network = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
-            regtest = 1;
+            network = "regtest";
+        else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
+            keyfile_path = argv[++i];
+        else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
+            passphrase = argv[++i];
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
         }
     }
 
-    if (!regtest) {
-        fprintf(stderr, "Error: --regtest is required (only mode supported).\n");
-        usage(argv[0]);
-        return 1;
-    }
+    if (!network)
+        network = "regtest";  /* default to regtest */
     if (n_clients < 1 || n_clients > LSP_MAX_CLIENTS) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
@@ -312,6 +321,19 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "Error: invalid --seckey (need 64 hex chars)\n");
             return 1;
         }
+    } else if (keyfile_path) {
+        /* Try to load from keyfile */
+        if (keyfile_load(keyfile_path, lsp_seckey, passphrase)) {
+            printf("LSP: loaded key from %s\n", keyfile_path);
+        } else {
+            /* File doesn't exist or wrong passphrase — generate new key */
+            printf("LSP: generating new key and saving to %s\n", keyfile_path);
+            if (!keyfile_generate(keyfile_path, lsp_seckey, passphrase, ctx)) {
+                fprintf(stderr, "Error: failed to generate keyfile\n");
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+        }
     } else {
         /* Deterministic default key for regtest */
         memset(lsp_seckey, 0x10, 32);
@@ -325,10 +347,10 @@ int main(int argc, char *argv[]) {
     }
     /* Note: lsp_seckey zeroed at cleanup — needed for lsp_channels_init() */
 
-    /* Initialize regtest */
+    /* Initialize bitcoin-cli connection */
     regtest_t rt;
-    if (!regtest_init(&rt)) {
-        fprintf(stderr, "Error: cannot connect to bitcoind (is it running with -regtest?)\n");
+    if (!regtest_init_network(&rt, network)) {
+        fprintf(stderr, "Error: cannot connect to bitcoind (is it running with -%s?)\n", network);
         secp256k1_context_destroy(ctx);
         return 1;
     }

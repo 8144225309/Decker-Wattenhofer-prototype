@@ -861,13 +861,21 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
     if (ch->n_htlcs >= MAX_HTLCS)
         return 0;
 
-    /* Check sufficient balance from offerer */
+    /* Reject HTLC amount below dust */
+    if (amount_sats < CHANNEL_DUST_LIMIT_SATS)
+        return 0;
+
+    /* Check sufficient balance from offerer + reserve */
     if (direction == HTLC_OFFERED) {
         if (amount_sats > ch->local_amount)
+            return 0;
+        if (ch->local_amount - amount_sats < CHANNEL_RESERVE_SATS)
             return 0;
         ch->local_amount -= amount_sats;
     } else {
         if (amount_sats > ch->remote_amount)
+            return 0;
+        if (ch->remote_amount - amount_sats < CHANNEL_RESERVE_SATS)
             return 0;
         ch->remote_amount -= amount_sats;
     }
@@ -942,6 +950,21 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
     h->state = HTLC_STATE_FAILED;
     ch->commitment_number++;
     return 1;
+}
+
+/* ---- HTLC timeout enforcement ---- */
+
+int channel_check_htlc_timeouts(channel_t *ch, uint32_t current_height) {
+    int failed = 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++) {
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE &&
+            ch->htlcs[i].cltv_expiry > 0 &&
+            current_height >= ch->htlcs[i].cltv_expiry) {
+            channel_fail_htlc(ch, ch->htlcs[i].id);
+            failed++;
+        }
+    }
+    return failed;
 }
 
 /* ---- Cooperative close ---- */

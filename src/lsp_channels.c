@@ -8,6 +8,69 @@
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 
+/* After receiving a revocation, register the old commitment with the watchtower.
+   We rebuild the old commitment tx to get its txid and to_local output info. */
+static void watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
+                                       uint32_t channel_id,
+                                       uint64_t old_commit_num,
+                                       uint64_t old_local, uint64_t old_remote) {
+    if (!wt) return;
+
+    /* Save current state */
+    uint64_t saved_num = ch->commitment_number;
+    uint64_t saved_local = ch->local_amount;
+    uint64_t saved_remote = ch->remote_amount;
+
+    /* Temporarily set to old state */
+    ch->commitment_number = old_commit_num;
+    ch->local_amount = old_local;
+    ch->remote_amount = old_remote;
+
+    tx_buf_t old_tx;
+    tx_buf_init(&old_tx, 512);
+    unsigned char old_txid[32];
+    int ok = channel_build_commitment_tx(ch, &old_tx, old_txid);
+
+    /* Restore state */
+    ch->commitment_number = saved_num;
+    ch->local_amount = saved_local;
+    ch->remote_amount = saved_remote;
+
+    if (!ok) {
+        tx_buf_free(&old_tx);
+        return;
+    }
+
+    /* to_local is vout 0, its SPK is the first output scriptPubKey */
+    /* Extract to_local_spk from the old commitment tx output 0 */
+    unsigned char to_local_spk[34];
+    /* In our commitment tx, output[0] = to_local with a P2TR SPK (34 bytes) */
+    /* We can get the SPK from the serialized tx: skip past version(4)+marker(1)+flag(1)+
+       vin_count(1)+vin(41)+vout_count(1) to first output amount(8)+spk_len(1)+spk(34) */
+    /* Simpler: use the to_local amount = old_local (what was local at that commitment) */
+    /* For the SPK, rebuild it from the commitment tx structure */
+    /* Actually, the simplest approach: parse the first output's SPK from the raw tx */
+    if (old_tx.len > 60) {
+        /* Standard commitment tx layout (segwit):
+           4 version + 1 marker + 1 flag + 1 vincount +
+           (32 prevhash + 4 vout + 1 scriptlen + 0 script + 4 sequence) = 41 vin bytes
+           + 1 voutcount = 49 bytes offset to first output
+           First output: 8 amount + 1 scriptlen + N script */
+        size_t ofs = 4 + 1 + 1 + 1 + 41 + 1;  /* 49 */
+        if (ofs + 8 + 1 + 34 <= old_tx.len) {
+            uint8_t spk_len = old_tx.data[ofs + 8];
+            if (spk_len == 34) {
+                memcpy(to_local_spk, &old_tx.data[ofs + 9], 34);
+                watchtower_watch(wt, channel_id, old_commit_num,
+                                   old_txid, 0, old_local,
+                                   to_local_spk, 34);
+            }
+        }
+    }
+
+    tx_buf_free(&old_tx);
+}
+
 /*
  * Factory tree layout (5 participants: LSP=0, A=1, B=2, C=3, D=4):
  *   node[0] = kickoff_root (5-of-5)
@@ -324,9 +387,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
-            channel_receive_revocation(sender_ch,
-                                        sender_ch->commitment_number - 1,
-                                        rev_secret);
+            uint64_t old_cn = sender_ch->commitment_number - 1;
+            channel_receive_revocation(sender_ch, old_cn, rev_secret);
+            watch_revoked_commitment(mgr->watchtower, sender_ch,
+                (uint32_t)sender_idx, old_cn,
+                sender_ch->local_amount, sender_ch->remote_amount);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -420,9 +485,11 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
-            channel_receive_revocation(dest_ch,
-                                        dest_ch->commitment_number - 1,
-                                        rev_secret);
+            uint64_t old_cn = dest_ch->commitment_number - 1;
+            channel_receive_revocation(dest_ch, old_cn, rev_secret);
+            watch_revoked_commitment(mgr->watchtower, dest_ch,
+                (uint32_t)dest_idx, old_cn,
+                dest_ch->local_amount, dest_ch->remote_amount);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -481,7 +548,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
-            channel_receive_revocation(ch, ch->commitment_number - 1, rev_secret);
+            uint64_t old_cn = ch->commitment_number - 1;
+            channel_receive_revocation(ch, old_cn, rev_secret);
+            watch_revoked_commitment(mgr->watchtower, ch,
+                (uint32_t)client_idx, old_cn,
+                ch->local_amount, ch->remote_amount);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -550,9 +621,11 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                                 rev_secret, next_point)) {
-                    channel_receive_revocation(sender_ch,
-                                                sender_ch->commitment_number - 1,
-                                                rev_secret);
+                    uint64_t old_cn = sender_ch->commitment_number - 1;
+                    channel_receive_revocation(sender_ch, old_cn, rev_secret);
+                    watch_revoked_commitment(mgr->watchtower, sender_ch,
+                        (uint32_t)s, old_cn,
+                        sender_ch->local_amount, sender_ch->remote_amount);
                 }
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
@@ -762,9 +835,11 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             unsigned char rev_secret[32], next_point[33];
             if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                             rev_secret, next_point)) {
-                channel_receive_revocation(dest_ch,
-                                            dest_ch->commitment_number - 1,
-                                            rev_secret);
+                uint64_t old_cn = dest_ch->commitment_number - 1;
+                channel_receive_revocation(dest_ch, old_cn, rev_secret);
+                watch_revoked_commitment(mgr->watchtower, dest_ch,
+                    (uint32_t)dest_idx, old_cn,
+                    dest_ch->local_amount, dest_ch->remote_amount);
             }
             cJSON_Delete(ack_msg.json);
         }
@@ -1151,6 +1226,20 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             /* Timeout — run watchtower check if available */
             if (mgr->watchtower)
                 watchtower_check(mgr->watchtower);
+            /* Check HTLC timeouts if we have a chain connection */
+            if (mgr->watchtower && mgr->watchtower->rt) {
+                int height = regtest_get_block_height(mgr->watchtower->rt);
+                if (height > 0) {
+                    for (size_t c = 0; c < mgr->n_channels; c++) {
+                        channel_t *ch = &mgr->entries[c].channel;
+                        int n_failed = channel_check_htlc_timeouts(ch, (uint32_t)height);
+                        if (n_failed > 0) {
+                            printf("LSP: auto-failed %d expired HTLCs on channel %zu "
+                                   "(height=%d)\n", n_failed, c, height);
+                        }
+                    }
+                }
+            }
             continue;
         }
 
@@ -1380,9 +1469,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
-            channel_receive_revocation(sender_ch,
-                                        sender_ch->commitment_number - 1,
-                                        rev_secret);
+            uint64_t old_cn = sender_ch->commitment_number - 1;
+            channel_receive_revocation(sender_ch, old_cn, rev_secret);
+            watch_revoked_commitment(mgr->watchtower, sender_ch,
+                (uint32_t)from_client, old_cn,
+                sender_ch->local_amount, sender_ch->remote_amount);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -1433,9 +1524,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         unsigned char rev_secret[32], next_point[33];
         if (wire_parse_revoke_and_ack(ack_msg.json, &ack_chan_id,
                                         rev_secret, next_point)) {
-            channel_receive_revocation(dest_ch,
-                                        dest_ch->commitment_number - 1,
-                                        rev_secret);
+            uint64_t old_cn = dest_ch->commitment_number - 1;
+            channel_receive_revocation(dest_ch, old_cn, rev_secret);
+            watch_revoked_commitment(mgr->watchtower, dest_ch,
+                (uint32_t)to_client, old_cn,
+                dest_ch->local_amount, dest_ch->remote_amount);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -1482,9 +1575,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
                                                 rev_secret, next_point)) {
-                    channel_receive_revocation(dest_ch,
-                                                dest_ch->commitment_number - 1,
-                                                rev_secret);
+                    uint64_t old_cn = dest_ch->commitment_number - 1;
+                    channel_receive_revocation(dest_ch, old_cn, rev_secret);
+                    watch_revoked_commitment(mgr->watchtower, dest_ch,
+                        (uint32_t)to_client, old_cn,
+                        dest_ch->local_amount, dest_ch->remote_amount);
                 }
             }
             if (ack.json) cJSON_Delete(ack.json);
@@ -1519,9 +1614,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 unsigned char rev_secret[32], next_point[33];
                 if (wire_parse_revoke_and_ack(ack.json, &ack_chan_id,
                                                 rev_secret, next_point)) {
-                    channel_receive_revocation(sender_ch,
-                                                sender_ch->commitment_number - 1,
-                                                rev_secret);
+                    uint64_t old_cn = sender_ch->commitment_number - 1;
+                    channel_receive_revocation(sender_ch, old_cn, rev_secret);
+                    watch_revoked_commitment(mgr->watchtower, sender_ch,
+                        (uint32_t)from_client, old_cn,
+                        sender_ch->local_amount, sender_ch->remote_amount);
                 }
             }
             if (ack.json) cJSON_Delete(ack.json);

@@ -4,6 +4,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/report.h"
 #include "superscalar/persist.h"
+#include "superscalar/keyfile.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -423,6 +424,10 @@ static void usage(const char *prog) {
         "  --fee-rate N                      Fee rate in sat/kvB (default 1000 = 1 sat/vB)\n"
         "  --report PATH                     Write diagnostic JSON report to PATH\n"
         "  --db PATH                         SQLite database for persistence (default: none)\n"
+        "  --network MODE                    Network: regtest, signet, testnet, mainnet (default: regtest)\n"
+        "  --regtest                         Shorthand for --network regtest\n"
+        "  --keyfile PATH                    Load/save secret key from encrypted file\n"
+        "  --passphrase PASS                 Passphrase for keyfile (default: empty)\n"
         "  --help                            Show this help\n",
         prog);
 }
@@ -435,6 +440,8 @@ int main(int argc, char *argv[]) {
     int daemon_mode = 0;
     const char *report_path = NULL;
     const char *db_path = NULL;
+    const char *keyfile_path = NULL;
+    const char *passphrase = "";
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -456,6 +463,14 @@ int main(int argc, char *argv[]) {
             ++i; /* parsed but not used by client (fee rate is LSP-managed) */
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
+        else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
+            ++i; /* parsed but not used by client (network is LSP-managed) */
+        else if (strcmp(argv[i], "--regtest") == 0)
+            ; /* accepted for backward compat */
+        else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
+            keyfile_path = argv[++i];
+        else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
+            passphrase = argv[++i];
         else if (strcmp(argv[i], "--send") == 0 && i + 1 < argc) {
             if (n_actions >= MAX_ACTIONS) {
                 fprintf(stderr, "Too many actions (max %d)\n", MAX_ACTIONS);
@@ -505,14 +520,36 @@ int main(int argc, char *argv[]) {
         }
     }
 
-    if (!seckey_hex) {
-        usage(argv[0]);
-        return 1;
+    unsigned char seckey[32];
+    int key_loaded = 0;
+
+    if (seckey_hex) {
+        if (hex_decode(seckey_hex, seckey, 32) != 32) {
+            fprintf(stderr, "Invalid seckey hex\n");
+            return 1;
+        }
+        key_loaded = 1;
+    } else if (keyfile_path) {
+        secp256k1_context *tmp_ctx = secp256k1_context_create(
+            SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+        if (keyfile_load(keyfile_path, seckey, passphrase)) {
+            printf("Client: loaded key from %s\n", keyfile_path);
+            key_loaded = 1;
+        } else {
+            printf("Client: generating new key and saving to %s\n", keyfile_path);
+            if (keyfile_generate(keyfile_path, seckey, passphrase, tmp_ctx)) {
+                key_loaded = 1;
+            } else {
+                fprintf(stderr, "Error: failed to generate keyfile\n");
+                secp256k1_context_destroy(tmp_ctx);
+                return 1;
+            }
+        }
+        secp256k1_context_destroy(tmp_ctx);
     }
 
-    unsigned char seckey[32];
-    if (hex_decode(seckey_hex, seckey, 32) != 32) {
-        fprintf(stderr, "Invalid seckey hex\n");
+    if (!key_loaded) {
+        usage(argv[0]);
         return 1;
     }
 

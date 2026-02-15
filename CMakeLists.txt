@@ -58,6 +58,7 @@ add_library(superscalar
     src/watchtower.c
     src/crypto_aead.c
     src/noise.c
+    src/keyfile.c
 )
 target_include_directories(superscalar PUBLIC include)
 target_include_directories(superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
