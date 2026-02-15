@@ -917,29 +917,19 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
 /* --- Reconnection (Phase 16) --- */
 
-int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd) {
-    if (!mgr || !lsp || new_fd < 0) return 0;
-
-    /* 1. Recv MSG_RECONNECT */
-    wire_msg_t msg;
-    if (!wire_recv(new_fd, &msg) || msg.msg_type != MSG_RECONNECT) {
-        fprintf(stderr, "LSP reconnect: expected MSG_RECONNECT, got 0x%02x\n",
-                msg.msg_type);
-        if (msg.json) cJSON_Delete(msg.json);
-        wire_close(new_fd);
-        return 0;
-    }
+/* Core reconnect handler that takes an already-read MSG_RECONNECT message. */
+static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                       int new_fd, const wire_msg_t *msg) {
+    if (!mgr || !lsp || new_fd < 0 || !msg) return 0;
 
     /* 2. Parse pubkey + commitment_number */
     secp256k1_pubkey client_pk;
     uint64_t commitment_number;
-    if (!wire_parse_reconnect(msg.json, mgr->ctx, &client_pk, &commitment_number)) {
+    if (!wire_parse_reconnect(msg->json, mgr->ctx, &client_pk, &commitment_number)) {
         fprintf(stderr, "LSP reconnect: failed to parse MSG_RECONNECT\n");
-        cJSON_Delete(msg.json);
         wire_close(new_fd);
         return 0;
     }
-    cJSON_Delete(msg.json);
 
     /* 3. Match pubkey against lsp->client_pubkeys[] to find client index */
     int found = -1;
@@ -1058,6 +1048,24 @@ int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd
     printf("LSP: client %zu reconnected (commitment=%llu)\n",
            c, (unsigned long long)ch->commitment_number);
     return 1;
+}
+
+int lsp_channels_handle_reconnect(lsp_channel_mgr_t *mgr, lsp_t *lsp, int new_fd) {
+    if (!mgr || !lsp || new_fd < 0) return 0;
+
+    /* Read MSG_RECONNECT */
+    wire_msg_t msg;
+    if (!wire_recv(new_fd, &msg) || msg.msg_type != MSG_RECONNECT) {
+        fprintf(stderr, "LSP reconnect: expected MSG_RECONNECT, got 0x%02x\n",
+                msg.msg_type);
+        if (msg.json) cJSON_Delete(msg.json);
+        wire_close(new_fd);
+        return 0;
+    }
+
+    int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &msg);
+    cJSON_Delete(msg.json);
+    return ret;
 }
 
 lsp_channel_entry_t *lsp_channels_get(lsp_channel_mgr_t *mgr, size_t client_idx) {
@@ -1243,13 +1251,42 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             continue;
         }
 
-        /* Handle new connections on listen_fd (Phase 16 reconnection) */
+        /* Handle new connections on listen_fd (bridge or client reconnect) */
         if (lsp->listen_fd >= 0 && FD_ISSET(lsp->listen_fd, &rfds)) {
             int new_fd = wire_accept(lsp->listen_fd);
             if (new_fd >= 0) {
-                if (!lsp_channels_handle_reconnect(mgr, lsp, new_fd)) {
-                    fprintf(stderr, "LSP daemon: reconnect handshake failed\n");
-                    /* new_fd already closed by handle_reconnect on failure */
+                /* Noise handshake */
+                if (!wire_noise_handshake_responder(new_fd, mgr->ctx)) {
+                    wire_close(new_fd);
+                } else {
+                    /* Peek at first message to distinguish bridge vs client */
+                    wire_msg_t peek;
+                    if (wire_recv(new_fd, &peek)) {
+                        if (peek.msg_type == MSG_BRIDGE_HELLO) {
+                            /* Bridge connection */
+                            cJSON_Delete(peek.json);
+                            cJSON *ack = wire_build_bridge_hello_ack();
+                            wire_send(new_fd, MSG_BRIDGE_HELLO_ACK, ack);
+                            cJSON_Delete(ack);
+                            lsp->bridge_fd = new_fd;
+                            mgr->bridge_fd = new_fd;
+                            printf("LSP: bridge connected in daemon loop (fd=%d)\n", new_fd);
+                        } else if (peek.msg_type == MSG_RECONNECT) {
+                            /* Client reconnect — use pre-read message */
+                            int ret = handle_reconnect_with_msg(mgr, lsp, new_fd, &peek);
+                            cJSON_Delete(peek.json);
+                            if (!ret) {
+                                fprintf(stderr, "LSP daemon: reconnect handshake failed\n");
+                            }
+                        } else {
+                            fprintf(stderr, "LSP daemon: unexpected msg 0x%02x from new connection\n",
+                                    peek.msg_type);
+                            cJSON_Delete(peek.json);
+                            wire_close(new_fd);
+                        }
+                    } else {
+                        wire_close(new_fd);
+                    }
                 }
             }
         }

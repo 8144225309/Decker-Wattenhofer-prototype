@@ -18,6 +18,9 @@ typedef struct {
 
 int   regtest_init(regtest_t *rt);
 int   regtest_init_network(regtest_t *rt, const char *network);
+int   regtest_init_full(regtest_t *rt, const char *network,
+                        const char *cli_path, const char *rpcuser,
+                        const char *rpcpassword);
 char *regtest_exec(const regtest_t *rt, const char *method, const char *params);
 int   regtest_get_block_height(regtest_t *rt);
 int   regtest_create_wallet(regtest_t *rt, const char *name);
@@ -34,5 +37,12 @@ int   regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
 /* Get raw tx hex by txid. Returns 1 on success. */
 int regtest_get_raw_tx(regtest_t *rt, const char *txid,
                          char *tx_hex_out, size_t max_len);
+
+/* Get wallet balance in BTC. Returns -1.0 on error. */
+double regtest_get_balance(regtest_t *rt);
+
+/* Poll for tx confirmation. Returns confirmations count, -1 on timeout. */
+int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
+                                    int timeout_secs);
 
 #endif /* SUPERSCALAR_REGTEST_H */

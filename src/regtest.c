@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
@@ -60,16 +61,53 @@ int regtest_init_network(regtest_t *rt, const char *network) {
     strncpy(rt->rpcpassword, "rpcpass", sizeof(rt->rpcpassword) - 1);
     strncpy(rt->network, network ? network : "regtest", sizeof(rt->network) - 1);
 
-    /* Build verification command using the configured network */
+    /* Build verification command using rt->cli_path (not hardcoded) */
     char cmd[512];
     if (strcmp(rt->network, "mainnet") == 0) {
         snprintf(cmd, sizeof(cmd),
-            "bitcoin-cli -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
-            rt->rpcuser, rt->rpcpassword);
+            "%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
+            rt->cli_path, rt->rpcuser, rt->rpcpassword);
     } else {
         snprintf(cmd, sizeof(cmd),
-            "bitcoin-cli -%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
-            rt->network, rt->rpcuser, rt->rpcpassword);
+            "%s -%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
+            rt->cli_path, rt->network, rt->rpcuser, rt->rpcpassword);
+    }
+
+    char *result = run_command(cmd);
+    if (!result) return 0;
+
+    int ok = (strstr(result, "\"chain\"") != NULL);
+    free(result);
+    return ok ? 1 : 0;
+}
+
+int regtest_init_full(regtest_t *rt, const char *network,
+                      const char *cli_path, const char *rpcuser,
+                      const char *rpcpassword) {
+    memset(rt, 0, sizeof(*rt));
+    strncpy(rt->cli_path,
+            cli_path ? cli_path : "bitcoin-cli",
+            sizeof(rt->cli_path) - 1);
+    strncpy(rt->rpcuser,
+            rpcuser ? rpcuser : "rpcuser",
+            sizeof(rt->rpcuser) - 1);
+    strncpy(rt->rpcpassword,
+            rpcpassword ? rpcpassword : "rpcpass",
+            sizeof(rt->rpcpassword) - 1);
+    strncpy(rt->network,
+            network ? network : "regtest",
+            sizeof(rt->network) - 1);
+
+    /* Verify connection */
+    char cmd[512];
+    if (strcmp(rt->network, "mainnet") == 0) {
+        snprintf(cmd, sizeof(cmd),
+            "%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
+            rt->cli_path, rt->rpcuser, rt->rpcpassword);
+    } else {
+        snprintf(cmd, sizeof(cmd),
+            "%s -%s -rpcuser=%s -rpcpassword=%s getblockchaininfo 2>&1",
+            rt->cli_path, rt->network, rt->rpcuser, rt->rpcpassword);
     }
 
     char *result = run_command(cmd);
@@ -442,4 +480,35 @@ int regtest_get_raw_tx(regtest_t *rt, const char *txid,
     tx_hex_out[max_len - 1] = '\0';
     free(result);
     return 1;
+}
+
+double regtest_get_balance(regtest_t *rt) {
+    char *result = regtest_exec(rt, "getbalance", "");
+    if (!result) return -1.0;
+    double bal = atof(result);
+    free(result);
+    return bal;
+}
+
+int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
+                                    int timeout_secs) {
+    if (!rt || !txid) return -1;
+
+    int elapsed = 0;
+    while (elapsed < timeout_secs) {
+        int conf = regtest_get_confirmations(rt, txid);
+        if (conf >= 1) return conf;
+
+        /* Also check mempool — tx exists but unconfirmed */
+        if (conf < 0 && !regtest_is_in_mempool(rt, txid)) {
+            fprintf(stderr, "regtest_wait_for_confirmation: tx %s not found\n", txid);
+            return -1;
+        }
+
+        printf("  waiting for confirmation... (%ds/%ds)\n", elapsed, timeout_secs);
+        sleep(10);
+        elapsed += 10;
+    }
+
+    return -1;  /* timeout */
 }

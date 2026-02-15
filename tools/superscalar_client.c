@@ -428,6 +428,9 @@ static void usage(const char *prog) {
         "  --regtest                         Shorthand for --network regtest\n"
         "  --keyfile PATH                    Load/save secret key from encrypted file\n"
         "  --passphrase PASS                 Passphrase for keyfile (default: empty)\n"
+        "  --cli-path PATH                   Path to bitcoin-cli binary (default: bitcoin-cli)\n"
+        "  --rpcuser USER                    Bitcoin RPC username (default: rpcuser)\n"
+        "  --rpcpassword PASS                Bitcoin RPC password (default: rpcpass)\n"
         "  --help                            Show this help\n",
         prog);
 }
@@ -467,6 +470,12 @@ int main(int argc, char *argv[]) {
             ++i; /* parsed but not used by client (network is LSP-managed) */
         else if (strcmp(argv[i], "--regtest") == 0)
             ; /* accepted for backward compat */
+        else if (strcmp(argv[i], "--cli-path") == 0 && i + 1 < argc)
+            ++i; /* parsed but not used by client (LSP manages chain) */
+        else if (strcmp(argv[i], "--rpcuser") == 0 && i + 1 < argc)
+            ++i; /* parsed but not used by client (LSP manages chain) */
+        else if (strcmp(argv[i], "--rpcpassword") == 0 && i + 1 < argc)
+            ++i; /* parsed but not used by client (LSP manages chain) */
         else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)

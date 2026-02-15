@@ -48,6 +48,9 @@ static void usage(const char *prog) {
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
         "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
+        "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
+        "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
+        "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -243,6 +246,9 @@ int main(int argc, char *argv[]) {
     const char *network = NULL;
     const char *keyfile_path = NULL;
     const char *passphrase = "";
+    const char *cli_path = NULL;
+    const char *rpcuser = NULL;
+    const char *rpcpassword = NULL;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -275,6 +281,12 @@ int main(int argc, char *argv[]) {
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
             passphrase = argv[++i];
+        else if (strcmp(argv[i], "--cli-path") == 0 && i + 1 < argc)
+            cli_path = argv[++i];
+        else if (strcmp(argv[i], "--rpcuser") == 0 && i + 1 < argc)
+            rpcuser = argv[++i];
+        else if (strcmp(argv[i], "--rpcpassword") == 0 && i + 1 < argc)
+            rpcpassword = argv[++i];
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -283,6 +295,7 @@ int main(int argc, char *argv[]) {
 
     if (!network)
         network = "regtest";  /* default to regtest */
+    int is_regtest = (strcmp(network, "regtest") == 0);
     if (n_clients < 1 || n_clients > LSP_MAX_CLIENTS) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
@@ -349,7 +362,13 @@ int main(int argc, char *argv[]) {
 
     /* Initialize bitcoin-cli connection */
     regtest_t rt;
-    if (!regtest_init_network(&rt, network)) {
+    int rt_ok;
+    if (cli_path || rpcuser || rpcpassword) {
+        rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword);
+    } else {
+        rt_ok = regtest_init_network(&rt, network);
+    }
+    if (!rt_ok) {
         fprintf(stderr, "Error: cannot connect to bitcoind (is it running with -%s?)\n", network);
         secp256k1_context_destroy(ctx);
         return 1;
@@ -442,13 +461,27 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    regtest_mine_blocks(&rt, 101, mine_addr);
 
-    if (!ensure_funded(&rt, mine_addr)) {
-        fprintf(stderr, "LSP: failed to fund wallet (exhausted regtest?)\n");
-        lsp_cleanup(&lsp);
-        secp256k1_context_destroy(ctx);
-        return 1;
+    if (is_regtest) {
+        regtest_mine_blocks(&rt, 101, mine_addr);
+        if (!ensure_funded(&rt, mine_addr)) {
+            fprintf(stderr, "LSP: failed to fund wallet (exhausted regtest?)\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    } else {
+        /* Signet/testnet/mainnet: check wallet balance, no mining */
+        double bal = regtest_get_balance(&rt);
+        double needed = (double)funding_sats / 100000000.0;
+        if (bal < needed) {
+            fprintf(stderr, "LSP: wallet balance %.8f BTC insufficient (need %.8f). "
+                    "Fund via faucet first.\n", bal, needed);
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("LSP: wallet balance: %.8f BTC (sufficient)\n", bal);
     }
 
     double funding_btc = (double)funding_sats / 100000000.0;
@@ -459,7 +492,18 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    regtest_mine_blocks(&rt, 1, mine_addr);
+    if (is_regtest) {
+        regtest_mine_blocks(&rt, 1, mine_addr);
+    } else {
+        printf("LSP: waiting for funding tx confirmation on %s...\n", network);
+        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex, 600);
+        if (conf < 1) {
+            fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
+            lsp_cleanup(&lsp);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
     printf("LSP: funded %llu sats, txid: %s\n",
            (unsigned long long)funding_sats, funding_txid_hex);
 
@@ -703,7 +747,12 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
-    regtest_mine_blocks(&rt, 1, mine_addr);
+    if (is_regtest) {
+        regtest_mine_blocks(&rt, 1, mine_addr);
+    } else {
+        printf("LSP: waiting for close tx confirmation on %s...\n", network);
+        regtest_wait_for_confirmation(&rt, close_txid, 600);
+    }
     tx_buf_free(&close_tx);
 
     int conf = regtest_get_confirmations(&rt, close_txid);

@@ -239,6 +239,11 @@ extern int test_keyfile_save_load(void);
 extern int test_keyfile_wrong_passphrase(void);
 extern int test_keyfile_generate(void);
 
+/* Phase 20: Signet Interop */
+extern int test_regtest_init_full(void);
+extern int test_regtest_get_balance(void);
+extern int test_mine_blocks_non_regtest(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -433,6 +438,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_keyfile_save_load);
     RUN_TEST(test_keyfile_wrong_passphrase);
     RUN_TEST(test_keyfile_generate);
+
+    printf("\n=== Signet Interop (Phase 20) ===\n");
+    RUN_TEST(test_regtest_init_full);
+    RUN_TEST(test_regtest_get_balance);
+    RUN_TEST(test_mine_blocks_non_regtest);
 }
 
 static void run_regtest_tests(void) {
