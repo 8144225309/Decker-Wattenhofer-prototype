@@ -939,13 +939,33 @@ int main(int argc, char *argv[]) {
             return 1;
         }
 
-        /* Broadcast old (revoked) commitment */
-        char *old_hex = malloc(old_commit_tx.len * 2 + 1);
-        hex_encode(old_commit_tx.data, old_commit_tx.len, old_hex);
+        /* Sign the old commitment (need both LSP + client 0 keys) */
+        unsigned char c0_sec[32];
+        memset(c0_sec, 0x22, 32);  /* Client 0 key = 0x22 repeated (same as demo) */
+        secp256k1_keypair c0_kp;
+        secp256k1_keypair_create(ctx, &c0_kp, c0_sec);
+        memset(c0_sec, 0, 32);  /* wipe secret */
+
+        tx_buf_t old_signed;
+        tx_buf_init(&old_signed, 512);
+        if (!channel_sign_commitment(ch0, &old_signed, &old_commit_tx, &c0_kp)) {
+            fprintf(stderr, "BREACH TEST: failed to sign old commitment\n");
+            tx_buf_free(&old_signed);
+            tx_buf_free(&old_commit_tx);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        tx_buf_free(&old_commit_tx);
+
+        /* Broadcast old (revoked) signed commitment */
+        char *old_hex = malloc(old_signed.len * 2 + 1);
+        hex_encode(old_signed.data, old_signed.len, old_hex);
         char old_txid_str[65];
         int sent = regtest_send_raw_tx(&rt, old_hex, old_txid_str);
         free(old_hex);
-        tx_buf_free(&old_commit_tx);
+        tx_buf_free(&old_signed);
 
         if (!sent) {
             fprintf(stderr, "BREACH TEST: failed to broadcast revoked commitment\n");
@@ -970,8 +990,14 @@ int main(int argc, char *argv[]) {
                 regtest_mine_blocks(&rt, 1, mine_addr);
                 printf("BREACH TEST PASSED — penalty confirmed on-chain\n");
             } else {
-                printf("BREACH TEST: watchtower did not detect breach "
-                       "(may need watchtower entries)\n");
+                fprintf(stderr, "BREACH TEST FAILED: watchtower did not detect breach\n");
+                report_add_string(&rpt, "result", "breach_test_failed");
+                report_close(&rpt);
+                if (use_db) persist_close(&db);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
             }
         }
 
@@ -1600,7 +1626,7 @@ int main(int argc, char *argv[]) {
         /* Fund new factory (same address since same participants) */
         char fund2_txid_hex[65];
         if (is_regtest) {
-            if (!regtest_fund_address(&rt, fund_addr, funding_sats, fund2_txid_hex)) {
+            if (!regtest_fund_address(&rt, fund_addr, funding_btc, fund2_txid_hex)) {
                 fprintf(stderr, "ROTATION: fund Factory 1 failed\n");
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;

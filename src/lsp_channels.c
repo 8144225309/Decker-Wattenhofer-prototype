@@ -348,6 +348,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     channel_t *sender_ch = &mgr->entries[sender_idx].channel;
 
+    /* Capture amounts before add_htlc changes them (for watchtower) */
+    uint64_t old_sender_local = sender_ch->local_amount;
+    uint64_t old_sender_remote = sender_ch->remote_amount;
+
     /* Add HTLC to sender's channel (offered from client = received by LSP) */
     uint64_t new_htlc_id;
     if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
@@ -397,7 +401,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
             watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
-                sender_ch->local_amount, sender_ch->remote_amount);
+                old_sender_local, old_sender_remote);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -447,6 +451,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     }
 
     channel_t *dest_ch = &mgr->entries[dest_idx].channel;
+
+    /* Capture amounts before add_htlc changes them (for watchtower) */
+    uint64_t old_dest_local = dest_ch->local_amount;
+    uint64_t old_dest_remote = dest_ch->remote_amount;
 
     /* Add HTLC to destination's channel (offered from LSP) */
     uint64_t dest_htlc_id;
@@ -502,7 +510,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
             watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)dest_idx, old_cn,
-                dest_ch->local_amount, dest_ch->remote_amount);
+                old_dest_local, old_dest_remote);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -523,6 +531,10 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
 
     channel_t *ch = &mgr->entries[client_idx].channel;
+
+    /* Capture amounts before fulfill changes them (for watchtower) */
+    uint64_t old_ch_local = ch->local_amount;
+    uint64_t old_ch_remote = ch->remote_amount;
 
     /* Fulfill the HTLC on this channel (LSP offered → client fulfills) */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage)) {
@@ -565,7 +577,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(ch, old_cn, rev_secret);
             watch_revoked_commitment(mgr->watchtower, ch,
                 (uint32_t)client_idx, old_cn,
-                ch->local_amount, ch->remote_amount);
+                old_ch_local, old_ch_remote);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -605,6 +617,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             if (memcmp(htlc->payment_hash, payment_hash, 32) != 0) continue;
 
             /* Found it — fulfill on sender's channel */
+            uint64_t old_sender_local = sender_ch->local_amount;
+            uint64_t old_sender_remote = sender_ch->remote_amount;
             if (!channel_fulfill_htlc(sender_ch, htlc->id, preimage)) {
                 fprintf(stderr, "LSP: back-fulfill failed\n");
                 continue;
@@ -642,7 +656,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)s, old_cn,
-                        sender_ch->local_amount, sender_ch->remote_amount);
+                        old_sender_local, old_sender_remote);
                 }
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
@@ -812,6 +826,10 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
+        /* Capture amounts before add_htlc changes them (for watchtower) */
+        uint64_t old_dest_local = dest_ch->local_amount;
+        uint64_t old_dest_remote = dest_ch->remote_amount;
+
         /* Add HTLC to destination's channel (offered from LSP) */
         uint64_t dest_htlc_id;
         if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
@@ -867,7 +885,7 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 channel_receive_revocation(dest_ch, old_cn, rev_secret);
                 watch_revoked_commitment(mgr->watchtower, dest_ch,
                     (uint32_t)dest_idx, old_cn,
-                    dest_ch->local_amount, dest_ch->remote_amount);
+                    old_dest_local, old_dest_remote);
             }
             cJSON_Delete(ack_msg.json);
         }
@@ -1552,6 +1570,11 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* 4. Add HTLC on sender's channel (HTLC_RECEIVED from LSP perspective) */
     channel_t *sender_ch = &mgr->entries[from_client].channel;
+
+    /* Capture amounts before add_htlc changes them (for watchtower) */
+    uint64_t old_sender_local = sender_ch->local_amount;
+    uint64_t old_sender_remote = sender_ch->remote_amount;
+
     uint64_t sender_htlc_id;
     if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
                            payment_hash, 500, &sender_htlc_id)) {
@@ -1603,13 +1626,18 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
             watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)from_client, old_cn,
-                sender_ch->local_amount, sender_ch->remote_amount);
+                old_sender_local, old_sender_remote);
         }
         cJSON_Delete(ack_msg.json);
     }
 
     /* 7. Forward HTLC to destination client */
     channel_t *dest_ch = &mgr->entries[to_client].channel;
+
+    /* Capture amounts before add_htlc changes them (for watchtower) */
+    uint64_t old_dest_local = dest_ch->local_amount;
+    uint64_t old_dest_remote = dest_ch->remote_amount;
+
     uint64_t dest_htlc_id;
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
                            payment_hash, 500, &dest_htlc_id)) {
@@ -1658,7 +1686,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
             watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)to_client, old_cn,
-                dest_ch->local_amount, dest_ch->remote_amount);
+                old_dest_local, old_dest_remote);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -1679,6 +1707,10 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         cJSON_Delete(ful_msg.json);
+
+        /* Capture amounts before fulfill changes them (for watchtower) */
+        uint64_t old_dest_ful_local = dest_ch->local_amount;
+        uint64_t old_dest_ful_remote = dest_ch->remote_amount;
 
         /* Fulfill on dest channel */
         channel_fulfill_htlc(dest_ch, ful_htlc_id, preimage);
@@ -1709,13 +1741,15 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)to_client, old_cn,
-                        dest_ch->local_amount, dest_ch->remote_amount);
+                        old_dest_ful_local, old_dest_ful_remote);
                 }
             }
             if (ack.json) cJSON_Delete(ack.json);
         }
 
         /* 10. Back-propagate fulfill to sender */
+        uint64_t old_sender_ful_local = sender_ch->local_amount;
+        uint64_t old_sender_ful_remote = sender_ch->remote_amount;
         channel_fulfill_htlc(sender_ch, sender_htlc_id, preimage);
 
         cJSON *ful_fwd = wire_build_update_fulfill_htlc(sender_htlc_id, preimage);
@@ -1748,7 +1782,7 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)from_client, old_cn,
-                        sender_ch->local_amount, sender_ch->remote_amount);
+                        old_sender_ful_local, old_sender_ful_remote);
                 }
             }
             if (ack.json) cJSON_Delete(ack.json);
