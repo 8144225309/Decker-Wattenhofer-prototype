@@ -231,6 +231,12 @@ static void report_channel_state(report_t *rpt, const char *label,
     report_end_section(rpt);
 }
 
+/* Wire message log callback (Phase 22) */
+static void lsp_wire_log_cb(int dir, uint8_t type, const cJSON *json,
+                              const char *peer_label, void *ud) {
+    persist_log_wire_message((persist_t *)ud, dir, type, peer_label, json);
+}
+
 int main(int argc, char *argv[]) {
     int port = 9735;
     int n_clients = 4;
@@ -322,6 +328,9 @@ int main(int argc, char *argv[]) {
         }
         use_db = 1;
         printf("LSP: persistence enabled (%s)\n", db_path);
+
+        /* Wire message logging (Phase 22) */
+        wire_set_log_callback(lsp_wire_log_cb, &db);
     }
 
     /* Create LSP keypair */
@@ -397,6 +406,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
     printf("LSP: all %d clients connected\n", n_clients);
+
+    /* Set peer labels for wire logging (Phase 22) */
+    for (size_t i = 0; i < lsp.n_clients; i++) {
+        char label[32];
+        snprintf(label, sizeof(label), "client_%zu", i);
+        wire_set_peer_label(lsp.client_fds[i], label);
+    }
 
     /* Report: participants */
     report_begin_section(&rpt, "participants");
@@ -567,10 +583,12 @@ int main(int argc, char *argv[]) {
     /* Set fee estimator on factory (for computed fees) */
     lsp.factory.fee = &fee_est;
 
-    /* Persist factory */
+    /* Persist factory + tree nodes */
     if (use_db) {
         if (!persist_save_factory(&db, &lsp.factory, ctx, 0))
             fprintf(stderr, "LSP: warning: failed to persist factory\n");
+        if (!persist_save_tree_nodes(&db, &lsp.factory, 0))
+            fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
     }
 
     /* Report: factory tree */

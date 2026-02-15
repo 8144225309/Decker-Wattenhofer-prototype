@@ -336,4 +336,18 @@ int wire_noise_handshake_initiator(int fd, secp256k1_context *ctx);
    Returns 1 on success, 0 on failure. */
 int wire_noise_handshake_responder(int fd, secp256k1_context *ctx);
 
+/* --- Wire message logging (Phase 22) --- */
+
+/* Log callback: direction 0=sent, 1=recv */
+typedef void (*wire_log_callback_t)(int direction, uint8_t msg_type,
+                                     const cJSON *json, const char *peer_label,
+                                     void *userdata);
+void wire_set_log_callback(wire_log_callback_t cb, void *userdata);
+
+/* Human-readable name for a message type constant */
+const char *wire_msg_type_name(uint8_t type);
+
+/* Associate a peer label (e.g. "client_0", "bridge") with a file descriptor */
+void wire_set_peer_label(int fd, const char *label);
+
 #endif /* SUPERSCALAR_WIRE_H */

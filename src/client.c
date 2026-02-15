@@ -433,6 +433,7 @@ int client_run_with_channels(secp256k1_context *ctx,
         fprintf(stderr, "Client: connect failed\n");
         return 0;
     }
+    wire_set_peer_label(fd, "lsp");
 
     /* Encrypted transport handshake */
     if (!wire_noise_handshake_initiator(fd, ctx)) {
@@ -893,6 +894,7 @@ int client_run_reconnect(secp256k1_context *ctx,
         factory_free(&factory);
         return 0;
     }
+    wire_set_peer_label(fd, "lsp");
 
     /* Encrypted transport handshake */
     if (!wire_noise_handshake_initiator(fd, ctx)) {

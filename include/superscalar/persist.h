@@ -112,4 +112,27 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       size_t *spk_lens,
                                       size_t max_entries);
 
+/* --- Wire message logging (Phase 22) --- */
+
+/* Log a wire message to the wire_messages table. */
+void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
+                               const char *peer_label, const void *json);
+
+/* --- Factory tree nodes (Phase 22) --- */
+
+/* Save all tree nodes for a factory. */
+int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id);
+
+/* --- Ladder factory state (Phase 22) --- */
+
+/* Save ladder factory lifecycle state.
+   state_str: "active", "dying", or "expired". */
+int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
+                                 const char *state_str,
+                                 int is_funded, int is_initialized,
+                                 size_t n_departed,
+                                 uint32_t created_block,
+                                 uint32_t active_blocks,
+                                 uint32_t dying_blocks);
+
 #endif /* SUPERSCALAR_PERSIST_H */

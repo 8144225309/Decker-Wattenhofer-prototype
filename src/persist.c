@@ -1,10 +1,13 @@
 #include "superscalar/persist.h"
+#include "superscalar/wire.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
+extern void reverse_bytes(unsigned char *data, size_t len);
 
 static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS factories ("
@@ -70,6 +73,45 @@ static const char *SCHEMA_SQL =
     "  to_local_amount INTEGER NOT NULL,"
     "  to_local_spk TEXT NOT NULL,"
     "  PRIMARY KEY (channel_id, commit_num)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS wire_messages ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  timestamp INTEGER NOT NULL,"
+    "  direction TEXT NOT NULL,"
+    "  msg_type INTEGER NOT NULL,"
+    "  msg_name TEXT NOT NULL,"
+    "  peer TEXT,"
+    "  payload_summary TEXT"
+    ");"
+    "CREATE TABLE IF NOT EXISTS tree_nodes ("
+    "  factory_id INTEGER NOT NULL,"
+    "  node_index INTEGER NOT NULL,"
+    "  type TEXT NOT NULL,"
+    "  parent_index INTEGER,"
+    "  parent_vout INTEGER,"
+    "  dw_layer_index INTEGER,"
+    "  n_signers INTEGER,"
+    "  signer_indices TEXT,"
+    "  n_outputs INTEGER,"
+    "  output_amounts TEXT,"
+    "  nsequence INTEGER,"
+    "  input_amount INTEGER,"
+    "  txid TEXT,"
+    "  is_built INTEGER,"
+    "  is_signed INTEGER,"
+    "  spending_spk TEXT,"
+    "  PRIMARY KEY (factory_id, node_index)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS ladder_factories ("
+    "  factory_id INTEGER PRIMARY KEY,"
+    "  state TEXT NOT NULL,"
+    "  is_funded INTEGER,"
+    "  is_initialized INTEGER,"
+    "  n_departed INTEGER DEFAULT 0,"
+    "  created_block INTEGER,"
+    "  active_blocks INTEGER,"
+    "  dying_blocks INTEGER,"
+    "  updated_at INTEGER"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -696,4 +738,170 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- Wire message logging (Phase 22) --- */
+
+void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
+                               const char *peer_label, const void *json) {
+    if (!p || !p->db) return;
+
+    const char *dir_str = direction ? "recv" : "sent";
+    const char *msg_name = wire_msg_type_name(msg_type);
+
+    /* Truncated payload summary */
+    char summary[501];
+    summary[0] = '\0';
+    if (json) {
+        char *printed = cJSON_PrintUnformatted((cJSON *)json);
+        if (printed) {
+            size_t len = strlen(printed);
+            if (len > 500) len = 500;
+            memcpy(summary, printed, len);
+            summary[len] = '\0';
+            free(printed);
+        }
+    }
+
+    const char *sql =
+        "INSERT INTO wire_messages "
+        "(timestamp, direction, msg_type, msg_name, peer, payload_summary) "
+        "VALUES (?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)time(NULL));
+    sqlite3_bind_text(stmt, 2, dir_str, -1, SQLITE_STATIC);
+    sqlite3_bind_int(stmt, 3, (int)msg_type);
+    sqlite3_bind_text(stmt, 4, msg_name, -1, SQLITE_STATIC);
+    sqlite3_bind_text(stmt, 5, peer_label ? peer_label : "unknown", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, summary, -1, SQLITE_TRANSIENT);
+
+    sqlite3_step(stmt);
+    sqlite3_finalize(stmt);
+}
+
+/* --- Factory tree nodes (Phase 22) --- */
+
+int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id) {
+    if (!p || !p->db || !f) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO tree_nodes "
+        "(factory_id, node_index, type, parent_index, parent_vout, "
+        " dw_layer_index, n_signers, signer_indices, n_outputs, output_amounts, "
+        " nsequence, input_amount, txid, is_built, is_signed, spending_spk) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        const factory_node_t *node = &f->nodes[i];
+
+        sqlite3_stmt *stmt;
+        if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+            return 0;
+
+        sqlite3_bind_int(stmt, 1, (int)factory_id);
+        sqlite3_bind_int(stmt, 2, (int)i);
+        sqlite3_bind_text(stmt, 3, node->type == NODE_KICKOFF ? "kickoff" : "state",
+                          -1, SQLITE_STATIC);
+        sqlite3_bind_int(stmt, 4, node->parent_index);
+        sqlite3_bind_int(stmt, 5, (int)node->parent_vout);
+        sqlite3_bind_int(stmt, 6, node->dw_layer_index);
+        sqlite3_bind_int(stmt, 7, (int)node->n_signers);
+
+        /* signer_indices as comma-separated */
+        char signers_buf[128];
+        signers_buf[0] = '\0';
+        for (size_t s = 0; s < node->n_signers; s++) {
+            char tmp[16];
+            snprintf(tmp, sizeof(tmp), "%s%u", s > 0 ? "," : "",
+                     node->signer_indices[s]);
+            strncat(signers_buf, tmp, sizeof(signers_buf) - strlen(signers_buf) - 1);
+        }
+        sqlite3_bind_text(stmt, 8, signers_buf, -1, SQLITE_TRANSIENT);
+
+        sqlite3_bind_int(stmt, 9, (int)node->n_outputs);
+
+        /* output_amounts as comma-separated sats */
+        char amounts_buf[256];
+        amounts_buf[0] = '\0';
+        for (size_t o = 0; o < node->n_outputs; o++) {
+            char tmp[32];
+            snprintf(tmp, sizeof(tmp), "%s%llu", o > 0 ? "," : "",
+                     (unsigned long long)node->outputs[o].amount_sats);
+            strncat(amounts_buf, tmp, sizeof(amounts_buf) - strlen(amounts_buf) - 1);
+        }
+        sqlite3_bind_text(stmt, 10, amounts_buf, -1, SQLITE_TRANSIENT);
+
+        sqlite3_bind_int64(stmt, 11, (sqlite3_int64)node->nsequence);
+        sqlite3_bind_int64(stmt, 12, (sqlite3_int64)node->input_amount);
+
+        /* txid in display order */
+        if (node->is_built) {
+            unsigned char display_txid[32];
+            memcpy(display_txid, node->txid, 32);
+            reverse_bytes(display_txid, 32);
+            char txid_hex[65];
+            hex_encode(display_txid, 32, txid_hex);
+            sqlite3_bind_text(stmt, 13, txid_hex, -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 13);
+        }
+
+        sqlite3_bind_int(stmt, 14, node->is_built);
+        sqlite3_bind_int(stmt, 15, node->is_signed);
+
+        /* spending_spk as hex */
+        if (node->spending_spk_len > 0) {
+            char spk_hex[69];
+            hex_encode(node->spending_spk, node->spending_spk_len, spk_hex);
+            sqlite3_bind_text(stmt, 16, spk_hex, -1, SQLITE_TRANSIENT);
+        } else {
+            sqlite3_bind_null(stmt, 16);
+        }
+
+        int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+        sqlite3_finalize(stmt);
+        if (!ok) return 0;
+    }
+
+    return 1;
+}
+
+/* --- Ladder factory state (Phase 22) --- */
+
+int persist_save_ladder_factory(persist_t *p, uint32_t factory_id,
+                                 const char *state_str,
+                                 int is_funded, int is_initialized,
+                                 size_t n_departed,
+                                 uint32_t created_block,
+                                 uint32_t active_blocks,
+                                 uint32_t dying_blocks) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO ladder_factories "
+        "(factory_id, state, is_funded, is_initialized, n_departed, "
+        " created_block, active_blocks, dying_blocks, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_text(stmt, 2, state_str ? state_str : "active", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 3, is_funded);
+    sqlite3_bind_int(stmt, 4, is_initialized);
+    sqlite3_bind_int(stmt, 5, (int)n_departed);
+    sqlite3_bind_int(stmt, 6, (int)created_block);
+    sqlite3_bind_int(stmt, 7, (int)active_blocks);
+    sqlite3_bind_int(stmt, 8, (int)dying_blocks);
+    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)time(NULL));
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
 }

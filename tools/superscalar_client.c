@@ -409,6 +409,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
     return 1;  /* normal return — caller handles close */
 }
 
+/* Wire message log callback (Phase 22) */
+static void client_wire_log_cb(int dir, uint8_t type, const cJSON *json,
+                                 const char *peer_label, void *ud) {
+    persist_log_wire_message((persist_t *)ud, dir, type, peer_label, json);
+}
+
 static void usage(const char *prog) {
     fprintf(stderr,
         "Usage: %s --seckey HEX --port PORT [--host HOST] [OPTIONS]\n"
@@ -624,6 +630,9 @@ int main(int argc, char *argv[]) {
         }
         use_db = 1;
         printf("Client: persistence enabled (%s)\n", db_path);
+
+        /* Wire message logging (Phase 22) */
+        wire_set_log_callback(client_wire_log_cb, &db);
     }
 
     signal(SIGINT, sigint_handler);

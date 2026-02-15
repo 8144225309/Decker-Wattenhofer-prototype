@@ -15,6 +15,86 @@ extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
 
+/* --- Wire message logging (Phase 22) --- */
+
+static wire_log_callback_t g_wire_log_cb = NULL;
+static void *g_wire_log_ud = NULL;
+
+#define WIRE_MAX_FDS 32
+static struct { int fd; char label[32]; } g_peer_labels[WIRE_MAX_FDS];
+static size_t g_n_peer_labels = 0;
+
+void wire_set_log_callback(wire_log_callback_t cb, void *userdata) {
+    g_wire_log_cb = cb;
+    g_wire_log_ud = userdata;
+}
+
+void wire_set_peer_label(int fd, const char *label) {
+    /* Update existing entry if fd already registered */
+    for (size_t i = 0; i < g_n_peer_labels; i++) {
+        if (g_peer_labels[i].fd == fd) {
+            strncpy(g_peer_labels[i].label, label, sizeof(g_peer_labels[i].label) - 1);
+            g_peer_labels[i].label[sizeof(g_peer_labels[i].label) - 1] = '\0';
+            return;
+        }
+    }
+    if (g_n_peer_labels < WIRE_MAX_FDS) {
+        g_peer_labels[g_n_peer_labels].fd = fd;
+        strncpy(g_peer_labels[g_n_peer_labels].label, label,
+                sizeof(g_peer_labels[g_n_peer_labels].label) - 1);
+        g_peer_labels[g_n_peer_labels].label[sizeof(g_peer_labels[g_n_peer_labels].label) - 1] = '\0';
+        g_n_peer_labels++;
+    }
+}
+
+static const char *wire_get_peer_label(int fd) {
+    for (size_t i = 0; i < g_n_peer_labels; i++) {
+        if (g_peer_labels[i].fd == fd)
+            return g_peer_labels[i].label;
+    }
+    return "unknown";
+}
+
+const char *wire_msg_type_name(uint8_t type) {
+    switch (type) {
+    case 0x01: return "HELLO";
+    case 0x02: return "HELLO_ACK";
+    case 0x10: return "FACTORY_PROPOSE";
+    case 0x11: return "NONCE_BUNDLE";
+    case 0x12: return "ALL_NONCES";
+    case 0x13: return "PSIG_BUNDLE";
+    case 0x14: return "FACTORY_READY";
+    case 0x20: return "CLOSE_PROPOSE";
+    case 0x21: return "CLOSE_NONCE";
+    case 0x22: return "CLOSE_ALL_NONCES";
+    case 0x23: return "CLOSE_PSIG";
+    case 0x24: return "CLOSE_DONE";
+    case 0x30: return "CHANNEL_READY";
+    case 0x31: return "UPDATE_ADD_HTLC";
+    case 0x32: return "COMMITMENT_SIGNED";
+    case 0x33: return "REVOKE_AND_ACK";
+    case 0x34: return "UPDATE_FULFILL_HTLC";
+    case 0x35: return "UPDATE_FAIL_HTLC";
+    case 0x36: return "CLOSE_REQUEST";
+    case 0x37: return "CHANNEL_NONCES";
+    case 0x38: return "REGISTER_INVOICE";
+    case 0x40: return "BRIDGE_HELLO";
+    case 0x41: return "BRIDGE_HELLO_ACK";
+    case 0x42: return "BRIDGE_ADD_HTLC";
+    case 0x43: return "BRIDGE_FULFILL_HTLC";
+    case 0x44: return "BRIDGE_FAIL_HTLC";
+    case 0x45: return "BRIDGE_SEND_PAY";
+    case 0x46: return "BRIDGE_PAY_RESULT";
+    case 0x47: return "BRIDGE_REGISTER";
+    case 0x48: return "RECONNECT";
+    case 0x49: return "RECONNECT_ACK";
+    case 0x4A: return "CREATE_INVOICE";
+    case 0x4B: return "INVOICE_CREATED";
+    case 0xFF: return "ERROR";
+    default:   return "UNKNOWN";
+    }
+}
+
 /* --- TCP transport --- */
 
 int wire_listen(const char *host, int port) {
@@ -164,6 +244,8 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
                  write_all(fd, ciphertext, pt_len) &&
                  write_all(fd, tag, 16);
         free(ciphertext);
+        if (ok && g_wire_log_cb)
+            g_wire_log_cb(0, msg_type, json, wire_get_peer_label(fd), g_wire_log_ud);
         return ok;
     }
 
@@ -179,6 +261,8 @@ int wire_send(int fd, uint8_t msg_type, cJSON *json) {
     int ok = write_all(fd, header, 5) &&
              write_all(fd, (unsigned char *)payload, payload_len);
     free(payload);
+    if (ok && g_wire_log_cb)
+        g_wire_log_cb(0, msg_type, json, wire_get_peer_label(fd), g_wire_log_ud);
     return ok;
 }
 
@@ -233,6 +317,8 @@ int wire_recv(int fd, wire_msg_t *msg) {
 
         msg->json = cJSON_Parse(buf);
         free(buf);
+        if (msg->json && g_wire_log_cb)
+            g_wire_log_cb(1, msg->msg_type, msg->json, wire_get_peer_label(fd), g_wire_log_ud);
         return msg->json ? 1 : 0;
     }
 
@@ -253,6 +339,8 @@ int wire_recv(int fd, wire_msg_t *msg) {
 
     msg->json = cJSON_Parse(buf);
     free(buf);
+    if (msg->json && g_wire_log_cb)
+        g_wire_log_cb(1, msg->msg_type, msg->json, wire_get_peer_label(fd), g_wire_log_ud);
     return msg->json ? 1 : 0;
 }
 
