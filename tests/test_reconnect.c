@@ -1466,3 +1466,170 @@ int test_mine_blocks_non_regtest(void) {
 
     return 1;
 }
+
+/* ---- Demo Protections (Tier 1) ---- */
+
+#include "superscalar/factory.h"
+#include "superscalar/dw_state.h"
+
+/* Test: factory lifecycle state transitions ACTIVE→DYING→EXPIRED */
+int test_factory_lifecycle_daemon_check(void) {
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+
+    /* Set lifecycle: created at block 100, active 20 blocks, dying 10 blocks */
+    factory_set_lifecycle(&f, 100, 20, 10);
+
+    /* At block 110: still ACTIVE */
+    factory_state_t s = factory_get_state(&f, 110);
+    TEST_ASSERT_EQ(s, FACTORY_ACTIVE, "block 110 = ACTIVE");
+
+    /* At block 119: last ACTIVE block */
+    s = factory_get_state(&f, 119);
+    TEST_ASSERT_EQ(s, FACTORY_ACTIVE, "block 119 = ACTIVE (last)");
+
+    /* At block 120: transitions to DYING */
+    s = factory_get_state(&f, 120);
+    TEST_ASSERT_EQ(s, FACTORY_DYING, "block 120 = DYING");
+
+    /* Check blocks_until_expired from DYING */
+    uint32_t remaining = factory_blocks_until_expired(&f, 120);
+    TEST_ASSERT_EQ(remaining, 10, "10 blocks until expired at 120");
+
+    remaining = factory_blocks_until_expired(&f, 125);
+    TEST_ASSERT_EQ(remaining, 5, "5 blocks until expired at 125");
+
+    /* At block 130: transitions to EXPIRED */
+    s = factory_get_state(&f, 130);
+    TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 130 = EXPIRED");
+
+    /* At block 200: still EXPIRED */
+    s = factory_get_state(&f, 200);
+    TEST_ASSERT_EQ(s, FACTORY_EXPIRED, "block 200 = EXPIRED");
+
+    return 1;
+}
+
+/* Test: rebuilding old commitment matches watchtower entry */
+int test_breach_detect_old_commitment(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Create channel with 50k/50k balances */
+    channel_t ch;
+    make_test_channel(&ch, ctx, 50000, 50000);
+
+    /* Set up basepoints (required for commitment tx) */
+    unsigned char pay_sec[32], del_sec[32], rev_sec[32], htlc_sec[32];
+    memset(pay_sec, 0x31, 32);
+    memset(del_sec, 0x32, 32);
+    memset(rev_sec, 0x33, 32);
+    memset(htlc_sec, 0x34, 32);
+    channel_set_local_basepoints(&ch, pay_sec, del_sec, rev_sec);
+    channel_set_local_htlc_basepoint(&ch, htlc_sec);
+
+    secp256k1_pubkey rpay, rdel, rrev, rhtlc;
+    unsigned char rs[32];
+    memset(rs, 0x41, 32); secp256k1_ec_pubkey_create(ctx, &rpay, rs);
+    memset(rs, 0x42, 32); secp256k1_ec_pubkey_create(ctx, &rdel, rs);
+    memset(rs, 0x43, 32); secp256k1_ec_pubkey_create(ctx, &rrev, rs);
+    memset(rs, 0x44, 32); secp256k1_ec_pubkey_create(ctx, &rhtlc, rs);
+    channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
+    channel_set_remote_htlc_basepoint(&ch, &rhtlc);
+
+    unsigned char seed[32];
+    memset(seed, 0x50, 32);
+    channel_set_shachain_seed(&ch, seed);
+
+    /* Build commitment #0 and save its txid */
+    tx_buf_t commit0_tx;
+    tx_buf_init(&commit0_tx, 512);
+    unsigned char commit0_txid[32];
+    int ok = channel_build_commitment_tx(&ch, &commit0_tx, commit0_txid);
+    TEST_ASSERT(ok == 1, "build commitment #0");
+    tx_buf_free(&commit0_tx);
+
+    /* Simulate a payment: update channel balances */
+    ch.local_amount = 40000;
+    ch.remote_amount = 60000;
+    ch.commitment_number = 1;
+
+    /* Now rebuild old commitment #0 (same pattern as watch_revoked_commitment) */
+    uint64_t saved_num = ch.commitment_number;
+    uint64_t saved_local = ch.local_amount;
+    uint64_t saved_remote = ch.remote_amount;
+
+    ch.commitment_number = 0;
+    ch.local_amount = 50000;
+    ch.remote_amount = 50000;
+
+    tx_buf_t rebuilt_tx;
+    tx_buf_init(&rebuilt_tx, 512);
+    unsigned char rebuilt_txid[32];
+    ok = channel_build_commitment_tx(&ch, &rebuilt_tx, rebuilt_txid);
+
+    ch.commitment_number = saved_num;
+    ch.local_amount = saved_local;
+    ch.remote_amount = saved_remote;
+
+    TEST_ASSERT(ok == 1, "rebuild old commitment");
+    tx_buf_free(&rebuilt_tx);
+
+    /* Verify rebuilt txid matches original commit #0 txid */
+    TEST_ASSERT_MEM_EQ(commit0_txid, rebuilt_txid, 32,
+                        "rebuilt txid matches original");
+
+    /* Register in watchtower and verify entry matches */
+    watchtower_t wt;
+    watchtower_init(&wt, 1, NULL, NULL, NULL);
+    watchtower_set_channel(&wt, 0, &ch);
+
+    unsigned char fake_spk[34];
+    memset(fake_spk, 0, 34);
+    fake_spk[0] = 0x51; fake_spk[1] = 0x20;
+    watchtower_watch(&wt, 0, 0, commit0_txid, 0, 50000, fake_spk, 34);
+
+    TEST_ASSERT_MEM_EQ(wt.entries[0].txid, rebuilt_txid, 32,
+                        "watchtower entry matches rebuilt txid");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: DW counter advance and delay decrease */
+int test_dw_counter_tracks_advance(void) {
+    dw_counter_t ctr;
+    dw_counter_init(&ctr, 2, 10, 4);  /* 2 layers, step=10, 4 states each */
+
+    /* Initial state: epoch 0 */
+    TEST_ASSERT_EQ(dw_counter_epoch(&ctr), 0, "initial epoch 0");
+
+    /* Get initial delay for layer 0 */
+    uint16_t d0_init = dw_delay_for_state(&ctr.layers[0].config,
+                                            ctr.layers[0].current_state);
+    TEST_ASSERT(d0_init > 0, "initial delay > 0");
+
+    /* Advance once */
+    int ok = dw_counter_advance(&ctr);
+    TEST_ASSERT(ok == 1, "first advance succeeds");
+    TEST_ASSERT_EQ(dw_counter_epoch(&ctr), 1, "epoch now 1");
+
+    /* Inner layer advanced, so its delay should decrease */
+    uint16_t d1_new = dw_delay_for_state(&ctr.layers[1].config,
+                                           ctr.layers[1].current_state);
+    uint16_t d1_init = dw_delay_for_state(&ctr.layers[1].config, 0);
+    TEST_ASSERT(d1_new < d1_init, "inner delay decreased after advance");
+
+    /* Advance until exhausted */
+    while (dw_counter_advance(&ctr))
+        ;
+
+    /* total_states = 4^2 = 16, max epoch = 15 */
+    TEST_ASSERT_EQ(dw_counter_epoch(&ctr), 15, "exhausted at epoch 15");
+
+    /* Further advance should fail */
+    ok = dw_counter_advance(&ctr);
+    TEST_ASSERT(ok == 0, "advance returns 0 when exhausted");
+
+    return 1;
+}

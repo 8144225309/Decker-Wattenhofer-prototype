@@ -252,6 +252,11 @@ extern int test_persist_htlc_origin_round_trip(void);
 extern int test_persist_client_invoice_round_trip(void);
 extern int test_persist_counter_round_trip(void);
 
+/* Tier 1: Demo Protections */
+extern int test_factory_lifecycle_daemon_check(void);
+extern int test_breach_detect_old_commitment(void);
+extern int test_dw_counter_tracks_advance(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -459,6 +464,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_persist_htlc_origin_round_trip);
     RUN_TEST(test_persist_client_invoice_round_trip);
     RUN_TEST(test_persist_counter_round_trip);
+
+    printf("\n=== Demo Protections (Tier 1) ===\n");
+    RUN_TEST(test_factory_lifecycle_daemon_check);
+    RUN_TEST(test_breach_detect_old_commitment);
+    RUN_TEST(test_dw_counter_tracks_advance);
 }
 
 static void run_regtest_tests(void) {
@@ -503,8 +513,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-23)\n");
-    printf("===================================\n");
+    printf("SuperScalar Test Suite (Phase 1-23 + Tier 1)\n");
+    printf("=============================================\n");
 
     if (run_unit) run_unit_tests();
     if (run_regtest) run_regtest_tests();

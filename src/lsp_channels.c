@@ -1,5 +1,6 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/persist.h"
+#include "superscalar/factory.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1269,6 +1270,15 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    "(height=%d)\n", n_failed, c, height);
                         }
                     }
+                    /* Factory lifecycle monitoring */
+                    factory_state_t fstate = factory_get_state(
+                        &lsp->factory, (uint32_t)height);
+                    if (fstate == FACTORY_DYING)
+                        printf("LSP: factory DYING (%u blocks to expiry)\n",
+                               factory_blocks_until_expired(&lsp->factory,
+                                                            (uint32_t)height));
+                    else if (fstate == FACTORY_EXPIRED)
+                        printf("LSP: factory EXPIRED at height %d\n", height);
                 }
             }
             continue;
