@@ -29,7 +29,7 @@ System dependency:
 
 ## Test
 
-143 tests (124 unit + 19 regtest integration).
+152 tests (133 unit + 19 regtest integration).
 
 ```bash
 # unit tests (no bitcoind needed)
@@ -57,10 +57,10 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover protocol |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, key turnover tracking, migration |
-| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 36 message types, message logging callback |
+| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 39 message types, message logging callback |
 | `lsp` | lsp.c | LSP server: accept clients, factory creation ceremony, cooperative close |
-| `client` | client.c | Client: connect to LSP, factory ceremony, channel operations, close |
-| `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close, watchtower |
+| `client` | client.c | Client: connect to LSP, factory ceremony, channel operations, factory rotation, close |
+| `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close, watchtower, multi-factory monitoring |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
 | `persist` | persist.c | SQLite3 persistence: 16 tables (factories, channels, HTLCs, revocations, nonce pools, old commitments, wire messages, tree nodes, ladder factories, dw counter, departed clients, invoices, HTLC origins, client invoices, id counters) |
@@ -321,6 +321,31 @@ Monitors the blockchain for revoked commitment transactions:
 - **Client wiring**: persist client invoices on creation, deactivate on preimage consumption, reload on daemon startup
 - **Dashboard**: 6 new queries, demo data, and display sections for all new tables
 - 143/143 tests pass (124 unit + 19 regtest)
+
+### Tier 1: Demo Protections
+- `--breach-test`: broadcast revoked commitment after demo, trigger penalty tx
+- `--test-expiry`: mine past CLTV timeout, recover via timeout script path
+- `--test-distrib`: mine past CLTV, broadcast pre-signed distribution tx
+- `--test-turnover`: PTLC key turnover for all clients (local keypairs), cooperative close
+- Factory lifecycle integration: `factory_set_lifecycle()` on factory creation, state monitoring in daemon loop
+- 146/146 tests pass (127 unit + 19 regtest)
+
+### Tier 2: Daemon Feature Wiring
+- Ladder manager wired into LSP daemon loop: block-height polling, state transition logging
+- Distribution tx construction and auto-broadcast on FACTORY_EXPIRED
+- Departed client persistence: `persist_save_departed_client()` for crash recovery
+- DW counter advancement logged and persisted during daemon block monitoring
+- 149/149 tests pass (130 unit + 19 regtest)
+
+### Tier 3: Factory Rotation + PTLC Wire Protocol
+- **3 new PTLC wire messages**: MSG_PTLC_PRESIG (0x4C), MSG_PTLC_ADAPTED_SIG (0x4D), MSG_PTLC_COMPLETE (0x4E)
+- **PTLC key turnover over wire**: LSP sends adaptor pre-signature, client adapts with secret key, LSP extracts key
+- **Factory rotation**: `client_do_factory_rotation()` — condensed factory creation without HELLO handshake
+- **Client daemon handling**: MSG_PTLC_PRESIG (adapt + send sig) and MSG_FACTORY_PROPOSE (rotation) in daemon callback
+- **Multi-factory monitoring**: daemon loop tracks all ladder factory slots, not just factories[0]
+- **`--test-rotation` flag**: full SuperScalar lifecycle demo:
+  Factory 0 → payments → PTLC turnover over wire → ladder close → Factory 1 creation → payment → cooperative close
+- 152/152 tests pass (133 unit + 19 regtest)
 
 ## License
 
