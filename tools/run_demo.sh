@@ -71,13 +71,17 @@ wait_for_pid() {
 # ---------------------------------------------------------------------------
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_DIR="$SCRIPT_DIR/../build"
-export LD_LIBRARY_PATH="$BUILD_DIR/_deps/secp256k1-zkp-build/src:$BUILD_DIR/_deps/cjson-build"
+LIB_PATH="$BUILD_DIR/_deps/secp256k1-zkp-build/src:$BUILD_DIR/_deps/cjson-build"
+export LD_LIBRARY_PATH="$LIB_PATH"
+export DYLD_LIBRARY_PATH="$LIB_PATH"  # macOS
 
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
 PORT=9735
 AMOUNT=100000
+NETWORK="regtest"
+CLI_ARGS="-regtest"
 
 CLIENT1_KEY="2222222222222222222222222222222222222222222222222222222222222222"
 CLIENT2_KEY="3333333333333333333333333333333333333333333333333333333333333333"
@@ -131,7 +135,7 @@ cleanup() {
     done
     wait 2>/dev/null || true
     if [ "$STARTED_BITCOIND" = "1" ]; then
-        bitcoin-cli -regtest stop 2>/dev/null || true
+        bitcoin-cli $CLI_ARGS stop 2>/dev/null || true
         ok "Stopped bitcoind"
     fi
     ok "Cleanup complete"
@@ -181,12 +185,12 @@ ok "bitcoin-cli available"
 # ---------------------------------------------------------------------------
 # Start bitcoind if needed
 # ---------------------------------------------------------------------------
-if ! bitcoin-cli -regtest getblockchaininfo >/dev/null 2>&1; then
-    step "Starting bitcoind -regtest..."
-    bitcoind -regtest -daemon -fallbackfee=0.00001 -txindex=1 2>/dev/null
+if ! bitcoin-cli $CLI_ARGS getblockchaininfo >/dev/null 2>&1; then
+    step "Starting bitcoind $CLI_ARGS..."
+    bitcoind $CLI_ARGS -daemon -fallbackfee=0.00001 -txindex=1 2>/dev/null
     STARTED_BITCOIND=1
     sleep 2
-    if ! bitcoin-cli -regtest getblockchaininfo >/dev/null 2>&1; then
+    if ! bitcoin-cli $CLI_ARGS getblockchaininfo >/dev/null 2>&1; then
         fail "Could not start bitcoind"
         exit 1
     fi
@@ -196,17 +200,18 @@ else
 fi
 
 # Ensure wallet exists
-if ! bitcoin-cli -regtest -rpcwallet=superscalar_lsp getbalance >/dev/null 2>&1; then
-    bitcoin-cli -regtest createwallet superscalar_lsp >/dev/null 2>&1 || true
+if ! bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getbalance >/dev/null 2>&1; then
+    bitcoin-cli $CLI_ARGS createwallet superscalar_lsp >/dev/null 2>&1 || true
     ok "Created wallet 'superscalar_lsp'"
 fi
 
-# Fund wallet if needed
-BALANCE=$(bitcoin-cli -regtest -rpcwallet=superscalar_lsp getbalance 2>/dev/null || echo "0")
-if [ "$(echo "$BALANCE < 1" | bc 2>/dev/null || echo 1)" = "1" ]; then
+# Fund wallet if needed (use integer comparison to avoid bc dependency)
+BALANCE=$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getbalance 2>/dev/null || echo "0")
+BALANCE_INT=$(printf '%.0f' "$BALANCE" 2>/dev/null || echo "0")
+if [ "$BALANCE_INT" -lt 1 ] 2>/dev/null; then
     step "Funding wallet..."
-    ADDR=$(bitcoin-cli -regtest -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)
-    bitcoin-cli -regtest generatetoaddress 101 "$ADDR" >/dev/null 2>&1
+    ADDR=$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)
+    bitcoin-cli $CLI_ARGS generatetoaddress 101 "$ADDR" >/dev/null 2>&1
     ok "Mined 101 blocks, wallet funded"
 fi
 
@@ -218,20 +223,20 @@ run_lsp_clients() {
     local label="$2"
     local lsp_pid c1_pid c2_pid c3_pid c4_pid
 
-    step "Starting LSP: $LSP_BIN --regtest --port $PORT --clients 4 --amount $AMOUNT $lsp_flags"
-    $LSP_BIN --regtest --port $PORT --clients 4 --amount $AMOUNT $lsp_flags &
+    step "Starting LSP: $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT $lsp_flags"
+    $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT $lsp_flags &
     lsp_pid=$!
     PIDS+=($lsp_pid)
     sleep 2
 
     step "Starting 4 clients..."
-    $CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --daemon &
+    $CLIENT_BIN --seckey $CLIENT1_KEY --port $PORT --network $NETWORK --daemon &
     c1_pid=$!; PIDS+=($c1_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --daemon &
+    $CLIENT_BIN --seckey $CLIENT2_KEY --port $PORT --network $NETWORK --daemon &
     c2_pid=$!; PIDS+=($c2_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --daemon &
+    $CLIENT_BIN --seckey $CLIENT3_KEY --port $PORT --network $NETWORK --daemon &
     c3_pid=$!; PIDS+=($c3_pid); sleep 0.3
-    $CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --daemon &
+    $CLIENT_BIN --seckey $CLIENT4_KEY --port $PORT --network $NETWORK --daemon &
     c4_pid=$!; PIDS+=($c4_pid)
 
     wait_for_pid "$lsp_pid" "$label"
@@ -277,7 +282,7 @@ Factory creation takes 3 round-trips:
     fi
 
     # Mine a block to confirm the close tx
-    bitcoin-cli -regtest generatetoaddress 1 "$(bitcoin-cli -regtest -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
+    bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
     sleep 1
 fi
 
@@ -309,7 +314,7 @@ compares against mempool/chain transactions every 5 seconds."
         fi
     fi
 
-    bitcoin-cli -regtest generatetoaddress 1 "$(bitcoin-cli -regtest -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
+    bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
     sleep 1
 fi
 
@@ -339,7 +344,7 @@ overlapping factory lifetimes ensure zero downtime for clients."
         TOTAL_FAIL=$((TOTAL_FAIL + 1))
     fi
 
-    bitcoin-cli -regtest generatetoaddress 1 "$(bitcoin-cli -regtest -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
+    bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" >/dev/null 2>&1 || true
     sleep 1
 fi
 
@@ -386,7 +391,8 @@ fi
 # Disarm trap for clean exit
 trap - EXIT
 if [ "$STARTED_BITCOIND" = "1" ]; then
-    bitcoin-cli -regtest stop 2>/dev/null || true
+    bitcoin-cli $CLI_ARGS stop 2>/dev/null || true
 fi
 
 exit $TOTAL_FAIL
+

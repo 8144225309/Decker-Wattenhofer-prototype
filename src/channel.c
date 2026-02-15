@@ -293,6 +293,10 @@ void channel_set_shachain_seed(channel_t *ch, const unsigned char *seed32) {
     memcpy(ch->shachain_seed, seed32, 32);
 }
 
+void channel_set_remote_shachain_seed(channel_t *ch, const unsigned char *seed32) {
+    memcpy(ch->remote_shachain_seed, seed32, 32);
+}
+
 int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_num,
                                       secp256k1_pubkey *point_out) {
     uint64_t index = ((UINT64_C(1) << 48) - 1) - commitment_num;
@@ -464,6 +468,38 @@ int channel_build_commitment_tx(const channel_t *ch,
         reverse_bytes(txid_out32, 32);
 
     return 1;
+}
+
+int channel_build_commitment_tx_for_remote(const channel_t *ch,
+                                             tx_buf_t *unsigned_tx_out,
+                                             unsigned char *txid_out32) {
+    /* Create a shallow copy with local/remote swapped to represent
+       the remote party's view of their own commitment transaction. */
+    channel_t rv = *ch;
+
+    /* Use remote's shachain seed for their per-commitment point */
+    memcpy(rv.shachain_seed, ch->remote_shachain_seed, 32);
+
+    /* Swap amounts */
+    rv.local_amount = ch->remote_amount;
+    rv.remote_amount = ch->local_amount;
+
+    /* Swap basepoints: remote's "local" = our "remote" and vice versa */
+    rv.local_delayed_payment_basepoint = ch->remote_delayed_payment_basepoint;
+    rv.remote_revocation_basepoint = ch->local_revocation_basepoint;
+    rv.remote_payment_basepoint = ch->local_payment_basepoint;
+    rv.local_htlc_basepoint = ch->remote_htlc_basepoint;
+    rv.remote_htlc_basepoint = ch->local_htlc_basepoint;
+
+    /* Flip HTLC directions: what we offered, they received */
+    for (size_t i = 0; i < rv.n_htlcs; i++) {
+        if (rv.htlcs[i].direction == HTLC_OFFERED)
+            rv.htlcs[i].direction = HTLC_RECEIVED;
+        else
+            rv.htlcs[i].direction = HTLC_OFFERED;
+    }
+
+    return channel_build_commitment_tx(&rv, unsigned_tx_out, txid_out32);
 }
 
 int channel_sign_commitment(const channel_t *ch,
@@ -688,11 +724,13 @@ int channel_create_commitment_partial_sig(
     uint32_t nidx = (uint32_t)ch->remote_nonce_next;
     if (nidx >= ch->remote_nonce_count) return 0;
 
-    /* 2. Build commitment tx and compute sighash */
+    /* 2. Build the REMOTE's commitment tx and compute sighash.
+       In Lightning protocol, COMMITMENT_SIGNED contains a signature
+       for the remote party's commitment transaction. */
     tx_buf_t unsigned_tx;
     tx_buf_init(&unsigned_tx, 512);
     unsigned char txid[32];
-    if (!channel_build_commitment_tx(ch, &unsigned_tx, txid)) {
+    if (!channel_build_commitment_tx_for_remote(ch, &unsigned_tx, txid)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }

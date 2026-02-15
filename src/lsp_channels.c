@@ -162,28 +162,30 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
 
-        /* Set up basepoints using deterministic derivation from LSP seckey.
-           Use SHA256(lsp_seckey || "payment" || client_idx) etc. */
+        /* Set up basepoints using deterministic derivation from LSP pubkey.
+           Use SHA256(lsp_pk_ser || tag) — same scheme as client's remote
+           basepoint derivation so both sides agree on the same keys. */
+        unsigned char lsp_pk_ser[33];
+        size_t lpk_len = 33;
+        secp256k1_ec_pubkey_serialize(ctx, lsp_pk_ser, &lpk_len, &lsp_pubkey,
+                                       SECP256K1_EC_COMPRESSED);
+
         unsigned char payment_secret[32], delayed_secret[32], revocation_secret[32];
         unsigned char htlc_secret[32];
         {
-            unsigned char buf[32 + 16];
-            memcpy(buf, lsp_seckey32, 32);
+            unsigned char buf[33 + 16];
+            memcpy(buf, lsp_pk_ser, 33);
 
-            memcpy(buf + 32, "payment\0\0\0\0\0\0\0\0", 8);
-            buf[40] = (unsigned char)c;
+            memcpy(buf + 33, "payment\0", 8);
             sha256(buf, 41, payment_secret);
 
-            memcpy(buf + 32, "delayed\0\0\0\0\0\0\0\0", 8);
-            buf[40] = (unsigned char)c;
+            memcpy(buf + 33, "delayed\0", 8);
             sha256(buf, 41, delayed_secret);
 
-            memcpy(buf + 32, "revocatn", 8);
-            buf[40] = (unsigned char)c;
+            memcpy(buf + 33, "revocatn", 8);
             sha256(buf, 41, revocation_secret);
 
-            memcpy(buf + 32, "htlcbase", 8);
-            buf[40] = (unsigned char)c;
+            memcpy(buf + 33, "htlcbase", 8);
             sha256(buf, 41, htlc_secret);
         }
 
@@ -230,15 +232,15 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         channel_set_remote_basepoints(&entry->channel, &rpay, &rdelay, &rrevoc);
         channel_set_remote_htlc_basepoint(&entry->channel, &rhtlc);
 
-        /* Shachain seed: deterministic from LSP key + channel_id */
+        /* Shachain seed: deterministic from LSP pubkey (reproducible by client) */
         unsigned char seed[32];
-        {
-            unsigned char buf[33];
-            memcpy(buf, lsp_seckey32, 32);
-            buf[32] = (unsigned char)c;
-            sha256(buf, 33, seed);
-        }
+        sha256(lsp_pk_ser, 33, seed);
         channel_set_shachain_seed(&entry->channel, seed);
+
+        /* Store client's shachain seed so we can build their commitment tx */
+        unsigned char client_seed[32];
+        sha256(client_pk_ser, 33, client_seed);
+        channel_set_remote_shachain_seed(&entry->channel, client_seed);
 
         memset(payment_secret, 0, 32);
         memset(delayed_secret, 0, 32);
@@ -1773,32 +1775,32 @@ int lsp_channels_run_demo_sequence(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     lsp_channels_print_balances(mgr);
 
     /* Payment 1: Client 1 pays Client 2 */
-    printf("--- Payment 1: Client 1 -> Client 2 (10,000 sats) ---\n");
-    if (!lsp_channels_initiate_payment(mgr, lsp, 0, 1, 10000)) {
+    printf("--- Payment 1: Client 1 -> Client 2 (1,000 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 0, 1, 1000)) {
         fprintf(stderr, "LSP demo: payment 1 failed\n");
         return 0;
     }
     lsp_channels_print_balances(mgr);
 
     /* Payment 2: Client 3 pays Client 1 */
-    printf("--- Payment 2: Client 3 -> Client 1 (5,000 sats) ---\n");
-    if (!lsp_channels_initiate_payment(mgr, lsp, 2, 0, 5000)) {
+    printf("--- Payment 2: Client 3 -> Client 1 (1,500 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 2, 0, 1500)) {
         fprintf(stderr, "LSP demo: payment 2 failed\n");
         return 0;
     }
     lsp_channels_print_balances(mgr);
 
     /* Payment 3: Client 4 pays Client 3 */
-    printf("--- Payment 3: Client 4 -> Client 3 (7,500 sats) ---\n");
-    if (!lsp_channels_initiate_payment(mgr, lsp, 3, 2, 7500)) {
+    printf("--- Payment 3: Client 4 -> Client 3 (2,000 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 3, 2, 2000)) {
         fprintf(stderr, "LSP demo: payment 3 failed\n");
         return 0;
     }
     lsp_channels_print_balances(mgr);
 
     /* Payment 4: Client 2 pays Client 4 */
-    printf("--- Payment 4: Client 2 -> Client 4 (3,000 sats) ---\n");
-    if (!lsp_channels_initiate_payment(mgr, lsp, 1, 3, 3000)) {
+    printf("--- Payment 4: Client 2 -> Client 4 (1,000 sats) ---\n");
+    if (!lsp_channels_initiate_payment(mgr, lsp, 1, 3, 1000)) {
         fprintf(stderr, "LSP demo: payment 4 failed\n");
         return 0;
     }

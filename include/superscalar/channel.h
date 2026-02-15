@@ -62,6 +62,7 @@ typedef struct {
 
     /* Per-commitment state */
     unsigned char shachain_seed[32];
+    unsigned char remote_shachain_seed[32];  /* remote party's seed (for _for_remote) */
     shachain_t received_secrets;
     uint64_t commitment_number;
 
@@ -138,6 +139,7 @@ void channel_set_remote_basepoints(channel_t *ch,
                                      const secp256k1_pubkey *revocation);
 
 void channel_set_shachain_seed(channel_t *ch, const unsigned char *seed32);
+void channel_set_remote_shachain_seed(channel_t *ch, const unsigned char *seed32);
 
 int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_num,
                                       secp256k1_pubkey *point_out);
@@ -150,6 +152,13 @@ int channel_get_per_commitment_secret(const channel_t *ch, uint64_t commitment_n
 int channel_build_commitment_tx(const channel_t *ch,
                                   tx_buf_t *unsigned_tx_out,
                                   unsigned char *txid_out32);
+
+/* Build the remote party's commitment tx (for distributed signing).
+   Swaps local/remote basepoints, amounts, HTLC directions, and uses
+   remote_shachain_seed for the per-commitment point. */
+int channel_build_commitment_tx_for_remote(const channel_t *ch,
+                                             tx_buf_t *unsigned_tx_out,
+                                             unsigned char *txid_out32);
 
 int channel_sign_commitment(const channel_t *ch,
                               tx_buf_t *signed_tx_out,

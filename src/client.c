@@ -100,17 +100,9 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     channel_set_local_basepoints(ch, pay_sec, delay_sec, revoc_sec);
     channel_set_local_htlc_basepoint(ch, htlc_sec);
 
-    /* Client remote basepoints (LSP's derivation from lsp_seckey + client_idx).
-       We don't know the LSP's secret key, but we can derive the same public keys.
-       The LSP derives from SHA256(lsp_seckey || tag || client_idx).
-       We don't have lsp_seckey, so we compute public keys from the LSP's pubkey
-       using the same scheme the LSP uses.
-
-       PROBLEM: We can't derive the same secret keys as the LSP.
-       SOLUTION: For PoC, we don't actually need to verify commitment signatures
-       (we use dummy sigs). The basepoints are only needed for penalty enforcement
-       which isn't exercised in this PoC. Set them to dummy values derived from
-       the LSP pubkey so the structure is valid. */
+    /* Client remote basepoints: derive from LSP pubkey using shared scheme.
+       Both LSP and client use SHA256(lsp_pk_ser || tag) for LSP's basepoints,
+       ensuring both sides build identical commitment transactions. */
     unsigned char lsp_pk_ser[33];
     pk_len = 33;
     secp256k1_ec_pubkey_serialize(ctx, lsp_pk_ser, &pk_len, lsp_pubkey,
@@ -132,14 +124,15 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     channel_set_remote_basepoints(ch, &rpay_pk, &rdelay_pk, &rrevoc_pk);
     channel_set_remote_htlc_basepoint(ch, &rhtlc_pk);
 
-    /* Shachain seed (client side) */
+    /* Shachain seed (client side): SHA256(client_pk_ser) */
     unsigned char seed[32];
-    {
-        unsigned char buf[33];
-        memcpy(buf, client_pk_ser, 33);
-        sha256(buf, 33, seed);
-    }
+    sha256(client_pk_ser, 33, seed);
     channel_set_shachain_seed(ch, seed);
+
+    /* Store LSP's shachain seed so we know their per-commitment scheme */
+    unsigned char lsp_seed[32];
+    sha256(lsp_pk_ser, 33, lsp_seed);
+    channel_set_remote_shachain_seed(ch, lsp_seed);
 
     memset(my_seckey, 0, 32);
     memset(pay_sec, 0, 32);
@@ -215,8 +208,13 @@ int client_handle_add_htlc(channel_t *ch, const wire_msg_t *msg) {
 
     uint64_t amount_sats = amount_msat / 1000;
     uint64_t new_id;
-    /* From client's perspective, LSP offered this HTLC to us = received HTLC */
-    if (!channel_add_htlc(ch, HTLC_RECEIVED, amount_sats, payment_hash,
+
+    /* If dest_client field is present, we're the sender (LSP is routing
+       our payment). Otherwise we're the receiver. */
+    cJSON *dest = cJSON_GetObjectItem(msg->json, "dest_client");
+    htlc_direction_t dir = dest ? HTLC_OFFERED : HTLC_RECEIVED;
+
+    if (!channel_add_htlc(ch, dir, amount_sats, payment_hash,
                            cltv_expiry, &new_id))
         return 0;
 

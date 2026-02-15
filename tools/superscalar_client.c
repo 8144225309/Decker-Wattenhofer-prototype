@@ -334,8 +334,17 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             break;
 
-        case MSG_UPDATE_FULFILL_HTLC:
-            printf("Client %u: payment fulfilled!\n", my_index);
+        case MSG_UPDATE_FULFILL_HTLC: {
+            /* Parse and apply the HTLC fulfill to update channel state */
+            uint64_t ful_htlc_id;
+            unsigned char ful_preimage[32];
+            if (wire_parse_update_fulfill_htlc(msg.json, &ful_htlc_id, ful_preimage)) {
+                channel_fulfill_htlc(ch, ful_htlc_id, ful_preimage);
+                printf("Client %u: HTLC %llu fulfilled\n",
+                       my_index, (unsigned long long)ful_htlc_id);
+            } else {
+                fprintf(stderr, "Client %u: bad FULFILL_HTLC\n", my_index);
+            }
             cJSON_Delete(msg.json);
             /* Handle follow-up COMMITMENT_SIGNED */
             if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
@@ -348,6 +357,7 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     ch->local_amount, ch->remote_amount, ch->commitment_number);
             }
             break;
+        }
 
         case MSG_CLOSE_PROPOSE:
             printf("Client %u: received CLOSE_PROPOSE in daemon mode\n", my_index);

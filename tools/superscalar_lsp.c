@@ -1214,7 +1214,7 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair dk[FACTORY_MAX_SIGNERS];
         dk[0] = lsp_kp;
         {
-            static const unsigned char fill[4] = { 0x21, 0x32, 0x43, 0x54 };
+            static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
             for (int ci = 0; ci < n_clients; ci++) {
                 unsigned char ds[32];
                 memset(ds, fill[ci], 32);
@@ -1299,7 +1299,7 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
         all_kps[0] = lsp_kp;
         {
-            static const unsigned char fill[4] = { 0x21, 0x32, 0x43, 0x54 };
+            static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
             for (int ci = 0; ci < n_clients; ci++) {
                 unsigned char ds[32];
                 memset(ds, fill[ci], 32);
@@ -1463,7 +1463,7 @@ int main(int argc, char *argv[]) {
         secp256k1_keypair rot_kps[FACTORY_MAX_SIGNERS];
         rot_kps[0] = lsp_kp;
         {
-            static const unsigned char fill[4] = { 0x21, 0x32, 0x43, 0x54 };
+            static const unsigned char fill[4] = { 0x22, 0x33, 0x44, 0x55 };
             for (int ci = 0; ci < n_clients; ci++) {
                 unsigned char ds[32];
                 memset(ds, fill[ci], 32);

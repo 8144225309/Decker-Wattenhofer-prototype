@@ -13,9 +13,10 @@ set -e
 # Configuration — edit these paths for your environment
 # ==========================================================================
 
-BTCBIN="/home/obscurity/superscalar-ln/bin"
-CLNDIR="/home/obscurity/cln-test-8849/lightning"
-SCBIN="/mnt/c/pirq2/Decker-Wattenhofer/superscalar/build"
+BTCBIN="${BTCBIN:-$(dirname "$(command -v bitcoin-cli 2>/dev/null || echo /usr/local/bin/bitcoin-cli)")}"
+CLNDIR="${CLNDIR:-$(dirname "$(command -v lightningd 2>/dev/null || echo /usr/local/bin/lightningd)")/..}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+SCBIN="${SCBIN:-$SCRIPT_DIR/../build}"
 DATADIR="/tmp/superscalar-signet"
 RPCUSER="superscalar"
 RPCPASS="superscalar123"
