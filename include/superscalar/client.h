@@ -67,6 +67,19 @@ int client_run_reconnect(secp256k1_context *ctx,
                            client_channel_cb_t channel_cb,
                            void *user_data);
 
+/* Perform factory rotation: create a new factory from an already-received
+   FACTORY_PROPOSE message (no HELLO handshake).
+   Overwrites factory_out and channel_out with the new factory/channel.
+   Returns 1 on success. */
+int client_do_factory_rotation(int fd, secp256k1_context *ctx,
+                                const secp256k1_keypair *keypair,
+                                uint32_t my_index,
+                                size_t n_participants,
+                                const secp256k1_pubkey *all_pubkeys,
+                                factory_t *factory_out,
+                                channel_t *channel_out,
+                                const wire_msg_t *initial_propose);
+
 /* --- Client-side channel message handlers --- */
 
 /* Send ADD_HTLC to LSP for payment to dest_client.

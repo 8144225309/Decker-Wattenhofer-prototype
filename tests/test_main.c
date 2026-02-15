@@ -262,6 +262,11 @@ extern int test_ladder_daemon_integration(void);
 extern int test_distribution_tx_amounts(void);
 extern int test_turnover_extract_and_close(void);
 
+/* Tier 3: Factory Rotation */
+extern int test_ptlc_wire_round_trip(void);
+extern int test_ptlc_wire_over_socket(void);
+extern int test_multi_factory_ladder_monitor(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -479,6 +484,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ladder_daemon_integration);
     RUN_TEST(test_distribution_tx_amounts);
     RUN_TEST(test_turnover_extract_and_close);
+
+    printf("\n=== Factory Rotation (Tier 3) ===\n");
+    RUN_TEST(test_ptlc_wire_round_trip);
+    RUN_TEST(test_ptlc_wire_over_socket);
+    RUN_TEST(test_multi_factory_ladder_monitor);
 }
 
 static void run_regtest_tests(void) {
@@ -523,7 +533,7 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-23 + Tier 1-2)\n");
+    printf("SuperScalar Test Suite (Phase 1-23 + Tier 1-3)\n");
     printf("===============================================\n");
 
     if (run_unit) run_unit_tests();

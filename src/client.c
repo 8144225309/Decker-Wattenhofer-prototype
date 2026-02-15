@@ -417,6 +417,228 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
     return 1;
 }
 
+/* --- Factory rotation (condensed factory creation without HELLO) --- */
+
+int client_do_factory_rotation(int fd, secp256k1_context *ctx,
+                                const secp256k1_keypair *keypair,
+                                uint32_t my_index,
+                                size_t n_participants,
+                                const secp256k1_pubkey *all_pubkeys,
+                                factory_t *factory_out,
+                                channel_t *channel_out,
+                                const wire_msg_t *initial_propose) {
+    secp256k1_pubkey my_pubkey;
+    secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
+    wire_msg_t msg;
+
+    /* Parse FACTORY_PROPOSE from initial_propose */
+    const cJSON *pj = initial_propose->json;
+    cJSON *fv = cJSON_GetObjectItem(pj, "funding_vout");
+    cJSON *fa = cJSON_GetObjectItem(pj, "funding_amount");
+    cJSON *sb = cJSON_GetObjectItem(pj, "step_blocks");
+    cJSON *sp = cJSON_GetObjectItem(pj, "states_per_layer");
+    cJSON *ct = cJSON_GetObjectItem(pj, "cltv_timeout");
+    cJSON *fp = cJSON_GetObjectItem(pj, "fee_per_tx");
+    if (!fv || !fa || !sb || !sp || !ct || !fp) {
+        fprintf(stderr, "Client %u: malformed FACTORY_PROPOSE in rotation\n", my_index);
+        return 0;
+    }
+
+    unsigned char funding_txid[32];
+    wire_json_get_hex(pj, "funding_txid", funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+    uint32_t funding_vout = (uint32_t)fv->valuedouble;
+    uint64_t funding_amount = (uint64_t)fa->valuedouble;
+    unsigned char funding_spk[34];
+    size_t spk_len = (size_t)wire_json_get_hex(pj, "funding_spk", funding_spk, 34);
+    uint16_t step_blocks = (uint16_t)sb->valuedouble;
+    uint32_t states_per_layer = (uint32_t)sp->valuedouble;
+    uint32_t cltv_timeout = (uint32_t)ct->valuedouble;
+    uint64_t fee_per_tx = (uint64_t)fp->valuedouble;
+
+    /* Build factory locally */
+    factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
+                              step_blocks, states_per_layer);
+    factory_out->cltv_timeout = cltv_timeout;
+    factory_out->fee_per_tx = fee_per_tx;
+    factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
+                        funding_spk, spk_len);
+
+    if (!factory_build_tree(factory_out) || !factory_sessions_init(factory_out)) {
+        fprintf(stderr, "Client %u: rotation factory build/init failed\n", my_index);
+        return 0;
+    }
+
+    /* Generate nonces */
+    unsigned char my_seckey[32];
+    secp256k1_keypair_sec(ctx, my_seckey, keypair);
+
+    size_t my_node_count = 0;
+    for (size_t i = 0; i < factory_out->n_nodes; i++)
+        if (factory_find_signer_slot(factory_out, i, my_index) >= 0)
+            my_node_count++;
+
+    secp256k1_musig_secnonce *secnonces =
+        (secp256k1_musig_secnonce *)calloc(my_node_count, sizeof(secp256k1_musig_secnonce));
+    wire_bundle_entry_t *nonce_entries =
+        (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+    if (my_node_count > 0 && (!secnonces || !nonce_entries)) {
+        free(secnonces); free(nonce_entries);
+        memset(my_seckey, 0, 32);
+        return 0;
+    }
+
+    size_t nonce_count = 0;
+    for (size_t i = 0; i < factory_out->n_nodes; i++) {
+        int slot = factory_find_signer_slot(factory_out, i, my_index);
+        if (slot < 0) continue;
+        secp256k1_musig_pubnonce pubnonce;
+        if (!musig_generate_nonce(ctx, &secnonces[nonce_count], &pubnonce,
+                                   my_seckey, &my_pubkey,
+                                   &factory_out->nodes[i].keyagg.cache)) {
+            fprintf(stderr, "Client %u: rotation nonce gen failed\n", my_index);
+            free(secnonces); free(nonce_entries);
+            memset(my_seckey, 0, 32);
+            return 0;
+        }
+        unsigned char nonce_ser[66];
+        musig_pubnonce_serialize(ctx, nonce_ser, &pubnonce);
+        nonce_entries[nonce_count].node_idx = (uint32_t)i;
+        nonce_entries[nonce_count].signer_slot = (uint32_t)slot;
+        memcpy(nonce_entries[nonce_count].data, nonce_ser, 66);
+        nonce_entries[nonce_count].data_len = 66;
+        nonce_count++;
+    }
+    memset(my_seckey, 0, 32);
+
+    /* Send NONCE_BUNDLE */
+    cJSON *bundle = wire_build_nonce_bundle(nonce_entries, nonce_count);
+    if (!wire_send(fd, MSG_NONCE_BUNDLE, bundle)) {
+        cJSON_Delete(bundle); free(secnonces); free(nonce_entries); return 0;
+    }
+    cJSON_Delete(bundle);
+
+    /* Receive ALL_NONCES */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_ALL_NONCES) {
+        if (msg.json) cJSON_Delete(msg.json);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    if (!factory_sessions_init(factory_out)) {
+        cJSON_Delete(msg.json); free(secnonces); free(nonce_entries); return 0;
+    }
+    {
+        cJSON *nonces_arr = cJSON_GetObjectItem(msg.json, "nonces");
+        wire_bundle_entry_t all_entries[256];
+        size_t n_all = wire_parse_bundle(nonces_arr, all_entries, 256, 66);
+        for (size_t e = 0; e < n_all; e++) {
+            secp256k1_musig_pubnonce pn;
+            if (!musig_pubnonce_parse(ctx, &pn, all_entries[e].data)) continue;
+            factory_session_set_nonce(factory_out, all_entries[e].node_idx,
+                                     all_entries[e].signer_slot, &pn);
+        }
+    }
+    cJSON_Delete(msg.json);
+
+    if (!factory_sessions_finalize(factory_out)) {
+        free(secnonces); free(nonce_entries); return 0;
+    }
+
+    /* Create and send partial sigs */
+    {
+        wire_bundle_entry_t *psig_entries =
+            (wire_bundle_entry_t *)calloc(my_node_count, sizeof(wire_bundle_entry_t));
+        size_t psig_count = 0, snidx = 0;
+        for (size_t i = 0; i < factory_out->n_nodes; i++) {
+            int slot = factory_find_signer_slot(factory_out, i, my_index);
+            if (slot < 0) continue;
+            secp256k1_musig_partial_sig psig;
+            if (!musig_create_partial_sig(ctx, &psig, &secnonces[snidx],
+                                           keypair, &factory_out->nodes[i].signing_session)) {
+                free(psig_entries); free(secnonces); free(nonce_entries); return 0;
+            }
+            unsigned char psig_ser[32];
+            musig_partial_sig_serialize(ctx, psig_ser, &psig);
+            psig_entries[psig_count].node_idx = (uint32_t)i;
+            psig_entries[psig_count].signer_slot = (uint32_t)slot;
+            memcpy(psig_entries[psig_count].data, psig_ser, 32);
+            psig_entries[psig_count].data_len = 32;
+            psig_count++; snidx++;
+        }
+        bundle = wire_build_psig_bundle(psig_entries, psig_count);
+        int ok = wire_send(fd, MSG_PSIG_BUNDLE, bundle);
+        cJSON_Delete(bundle); free(psig_entries);
+        if (!ok) { free(secnonces); free(nonce_entries); return 0; }
+    }
+
+    /* Receive FACTORY_READY */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_FACTORY_READY) {
+        if (msg.json) cJSON_Delete(msg.json);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    cJSON_Delete(msg.json);
+
+    /* Receive CHANNEL_READY */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_CHANNEL_READY) {
+        if (msg.json) cJSON_Delete(msg.json);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    {
+        uint32_t channel_id;
+        uint64_t bl, br;
+        wire_parse_channel_ready(msg.json, &channel_id, &bl, &br);
+        cJSON_Delete(msg.json);
+        printf("Client %u: rotation channel %u ready (local=%llu, remote=%llu)\n",
+               my_index, channel_id, (unsigned long long)bl, (unsigned long long)br);
+    }
+
+    /* Initialize client-side channel */
+    if (!client_init_channel(channel_out, ctx, factory_out, keypair, my_index)) {
+        free(secnonces); free(nonce_entries); return 0;
+    }
+
+    /* Nonce exchange */
+    if (!wire_recv(fd, &msg) || check_msg_error(&msg) || msg.msg_type != MSG_CHANNEL_NONCES) {
+        if (msg.json) cJSON_Delete(msg.json);
+        free(secnonces); free(nonce_entries); return 0;
+    }
+    {
+        uint32_t nonce_ch_id;
+        unsigned char lsp_nonces[MUSIG_NONCE_POOL_MAX][66];
+        size_t lsp_nonce_count;
+        if (!wire_parse_channel_nonces(msg.json, &nonce_ch_id,
+                                         lsp_nonces, MUSIG_NONCE_POOL_MAX,
+                                         &lsp_nonce_count)) {
+            cJSON_Delete(msg.json); free(secnonces); free(nonce_entries); return 0;
+        }
+        cJSON_Delete(msg.json);
+
+        if (!channel_init_nonce_pool(channel_out, lsp_nonce_count)) {
+            free(secnonces); free(nonce_entries); return 0;
+        }
+
+        size_t my_nonce_count = channel_out->local_nonce_pool.count;
+        unsigned char (*my_pubnonces_ser)[66] =
+            (unsigned char (*)[66])calloc(my_nonce_count, 66);
+        for (size_t i = 0; i < my_nonce_count; i++)
+            musig_pubnonce_serialize(ctx, my_pubnonces_ser[i],
+                &channel_out->local_nonce_pool.nonces[i].pubnonce);
+
+        cJSON *nonce_reply = wire_build_channel_nonces(
+            0, (const unsigned char (*)[66])my_pubnonces_ser, my_nonce_count);
+        int ok = wire_send(fd, MSG_CHANNEL_NONCES, nonce_reply);
+        cJSON_Delete(nonce_reply); free(my_pubnonces_ser);
+        if (!ok) { free(secnonces); free(nonce_entries); return 0; }
+
+        channel_set_remote_pubnonces(channel_out,
+            (const unsigned char (*)[66])lsp_nonces, lsp_nonce_count);
+    }
+
+    free(secnonces);
+    free(nonce_entries);
+    printf("Client %u: factory rotation complete\n", my_index);
+    return 1;
+}
+
 /* --- Main ceremony (factory creation + optional channels + close) --- */
 
 int client_run_with_channels(secp256k1_context *ctx,

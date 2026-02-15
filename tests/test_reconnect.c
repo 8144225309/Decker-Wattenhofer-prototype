@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <sys/socket.h>
+#include <sys/wait.h>
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 extern void sha256_tagged(const char *, const unsigned char *, size_t,
@@ -1840,6 +1841,184 @@ int test_turnover_extract_and_close(void) {
     TEST_ASSERT(close_tx.len > 0, "close TX non-empty");
 
     tx_buf_free(&close_tx);
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ============================================================ */
+/* Tier 3: Factory Rotation tests                                */
+/* ============================================================ */
+
+/* Test: PTLC wire message round-trip (build + parse) */
+int test_ptlc_wire_round_trip(void) {
+    /* PTLC_PRESIG round-trip */
+    unsigned char presig[64], msg32[32];
+    memset(presig, 0xAA, 64);
+    memset(msg32, 0xBB, 32);
+    int parity = 1;
+
+    cJSON *j = wire_build_ptlc_presig(presig, parity, msg32);
+    TEST_ASSERT(j != NULL, "build presig");
+
+    unsigned char presig2[64], msg2[32];
+    int parity2;
+    TEST_ASSERT(wire_parse_ptlc_presig(j, presig2, &parity2, msg2),
+                "parse presig");
+    TEST_ASSERT_MEM_EQ(presig, presig2, 64, "presig match");
+    TEST_ASSERT_EQ(parity, parity2, "parity match");
+    TEST_ASSERT_MEM_EQ(msg32, msg2, 32, "turnover_msg match");
+    cJSON_Delete(j);
+
+    /* PTLC_ADAPTED_SIG round-trip */
+    unsigned char asig[64];
+    memset(asig, 0xCC, 64);
+    j = wire_build_ptlc_adapted_sig(asig);
+    TEST_ASSERT(j != NULL, "build adapted_sig");
+
+    unsigned char asig2[64];
+    TEST_ASSERT(wire_parse_ptlc_adapted_sig(j, asig2), "parse adapted_sig");
+    TEST_ASSERT_MEM_EQ(asig, asig2, 64, "adapted_sig match");
+    cJSON_Delete(j);
+
+    /* PTLC_COMPLETE round-trip */
+    j = wire_build_ptlc_complete();
+    TEST_ASSERT(j != NULL, "build complete");
+    cJSON_Delete(j);
+
+    return 1;
+}
+
+/* Test: PTLC wire messages over socket pair */
+int test_ptlc_wire_over_socket(void) {
+    int sv[2];
+    if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+        printf("  SKIP: socketpair not available\n");
+        return 1;
+    }
+
+    unsigned char presig[64], msg32[32];
+    memset(presig, 0xDE, 64);
+    memset(msg32, 0xAD, 32);
+    int parity = 0;
+
+    pid_t pid = fork();
+    if (pid == 0) {
+        /* Child: acts as client — recv PRESIG, send ADAPTED_SIG, recv COMPLETE */
+        close(sv[0]);
+        int fd = sv[1];
+
+        wire_msg_t m;
+        if (!wire_recv(fd, &m)) _exit(1);
+        if (m.msg_type != MSG_PTLC_PRESIG) { cJSON_Delete(m.json); _exit(2); }
+
+        unsigned char p[64], t[32];
+        int par;
+        if (!wire_parse_ptlc_presig(m.json, p, &par, t)) { cJSON_Delete(m.json); _exit(3); }
+        cJSON_Delete(m.json);
+
+        /* Send adapted sig (just echo presig as demo) */
+        unsigned char adapted[64];
+        memcpy(adapted, p, 64);
+        adapted[0] ^= 0xFF;  /* modify to simulate adaptation */
+        cJSON *reply = wire_build_ptlc_adapted_sig(adapted);
+        if (!wire_send(fd, MSG_PTLC_ADAPTED_SIG, reply)) { cJSON_Delete(reply); _exit(4); }
+        cJSON_Delete(reply);
+
+        /* Recv COMPLETE */
+        if (!wire_recv(fd, &m)) _exit(5);
+        if (m.msg_type != MSG_PTLC_COMPLETE) { cJSON_Delete(m.json); _exit(6); }
+        cJSON_Delete(m.json);
+
+        close(fd);
+        _exit(0);
+    }
+
+    /* Parent: acts as LSP — send PRESIG, recv ADAPTED_SIG, send COMPLETE */
+    close(sv[1]);
+    int fd = sv[0];
+
+    cJSON *presig_msg = wire_build_ptlc_presig(presig, parity, msg32);
+    TEST_ASSERT(wire_send(fd, MSG_PTLC_PRESIG, presig_msg), "send presig");
+    cJSON_Delete(presig_msg);
+
+    wire_msg_t resp;
+    TEST_ASSERT(wire_recv(fd, &resp), "recv adapted_sig");
+    TEST_ASSERT_EQ(resp.msg_type, MSG_PTLC_ADAPTED_SIG, "adapted_sig type");
+
+    unsigned char adapted[64];
+    TEST_ASSERT(wire_parse_ptlc_adapted_sig(resp.json, adapted), "parse adapted");
+    /* Verify child modified byte 0 */
+    TEST_ASSERT_EQ(adapted[0], presig[0] ^ 0xFF, "adapted byte 0 modified");
+    cJSON_Delete(resp.json);
+
+    cJSON *complete = wire_build_ptlc_complete();
+    TEST_ASSERT(wire_send(fd, MSG_PTLC_COMPLETE, complete), "send complete");
+    cJSON_Delete(complete);
+
+    close(fd);
+
+    int status;
+    waitpid(pid, &status, 0);
+    TEST_ASSERT(WIFEXITED(status) && WEXITSTATUS(status) == 0, "child exited ok");
+
+    return 1;
+}
+
+/* Test: multi-factory ladder monitor — verify state transitions for 2 factories */
+int test_multi_factory_ladder_monitor(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    unsigned char lsp_sec[32];
+    memset(lsp_sec, 0x10, 32);
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 20, 10);  /* active=20, dying=10 */
+
+    /* Create 4 client keypairs */
+    secp256k1_keypair client_kps[4];
+    static const unsigned char fills[4] = { 0x21, 0x32, 0x43, 0x54 };
+    for (int i = 0; i < 4; i++) {
+        unsigned char sec[32];
+        memset(sec, fills[i], 32);
+        secp256k1_keypair_create(ctx, &client_kps[i], sec);
+    }
+
+    /* Factory 0: created at block 100 */
+    unsigned char txid0[32];
+    memset(txid0, 0xF0, 32);
+    unsigned char spk[34] = {0x51, 0x20};
+    memset(spk + 2, 0xAA, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4,
+                100000, txid0, 0, spk, 34), "create factory 0");
+    lad.factories[0].factory.created_block = 100;
+
+    /* Factory 1: created at block 110 */
+    unsigned char txid1[32];
+    memset(txid1, 0xF1, 32);
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4,
+                100000, txid1, 0, spk, 34), "create factory 1");
+    lad.factories[1].factory.created_block = 110;
+
+    TEST_ASSERT_EQ(lad.n_factories, 2, "2 factories");
+
+    /* Advance to 120: factory 0 DYING (100+20=120), factory 1 ACTIVE (110+20=130) */
+    ladder_advance_block(&lad, 120);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "f0 DYING at 120");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_ACTIVE, "f1 ACTIVE at 120");
+
+    /* Advance to 130: factory 0 EXPIRED (100+20+10=130), factory 1 DYING (110+20=130) */
+    ladder_advance_block(&lad, 130);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 EXPIRED at 130");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_DYING, "f1 DYING at 130");
+
+    /* Advance to 140: both EXPIRED */
+    ladder_advance_block(&lad, 140);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 EXPIRED at 140");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_EXPIRED, "f1 EXPIRED at 140");
+
     ladder_free(&lad);
     secp256k1_context_destroy(ctx);
     return 1;

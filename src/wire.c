@@ -90,6 +90,9 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x49: return "RECONNECT_ACK";
     case 0x4A: return "CREATE_INVOICE";
     case 0x4B: return "INVOICE_CREATED";
+    case 0x4C: return "PTLC_PRESIG";
+    case 0x4D: return "PTLC_ADAPTED_SIG";
+    case 0x4E: return "PTLC_COMPLETE";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
@@ -1011,6 +1014,47 @@ int wire_parse_invoice_created(const cJSON *json,
         return 0;
     *amount_msat = (uint64_t)am->valuedouble;
     return 1;
+}
+
+/* --- PTLC key turnover messages (Tier 3) --- */
+
+cJSON *wire_build_ptlc_presig(const unsigned char *presig64,
+                               int nonce_parity,
+                               const unsigned char *turnover_msg32) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "presig", presig64, 64);
+    cJSON_AddNumberToObject(j, "nonce_parity", nonce_parity);
+    wire_json_add_hex(j, "turnover_msg", turnover_msg32, 32);
+    return j;
+}
+
+int wire_parse_ptlc_presig(const cJSON *json, unsigned char *presig64,
+                            int *nonce_parity, unsigned char *turnover_msg32) {
+    cJSON *np = cJSON_GetObjectItem(json, "nonce_parity");
+    if (!np || !cJSON_IsNumber(np))
+        return 0;
+    if (wire_json_get_hex(json, "presig", presig64, 64) != 64)
+        return 0;
+    if (wire_json_get_hex(json, "turnover_msg", turnover_msg32, 32) != 32)
+        return 0;
+    *nonce_parity = (int)np->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_ptlc_adapted_sig(const unsigned char *adapted_sig64) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "adapted_sig", adapted_sig64, 64);
+    return j;
+}
+
+int wire_parse_ptlc_adapted_sig(const cJSON *json, unsigned char *adapted_sig64) {
+    if (wire_json_get_hex(json, "adapted_sig", adapted_sig64, 64) != 64)
+        return 0;
+    return 1;
+}
+
+cJSON *wire_build_ptlc_complete(void) {
+    return cJSON_CreateObject();
 }
 
 /* --- Bundle parsing --- */

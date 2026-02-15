@@ -1282,51 +1282,57 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     else if (fstate == FACTORY_EXPIRED)
                         printf("LSP: factory EXPIRED at height %d\n", height);
 
-                    /* Ladder state tracking (Tier 2) */
+                    /* Ladder state tracking (Tier 2 → Tier 3: multi-factory) */
                     if (mgr->ladder) {
                         ladder_t *lad = (ladder_t *)mgr->ladder;
-                        factory_state_t old_st = lad->n_factories > 0 ?
-                            lad->factories[0].cached_state : FACTORY_ACTIVE;
+                        /* Save old states */
+                        factory_state_t old_states[LADDER_MAX_FACTORIES];
+                        for (size_t fi = 0; fi < lad->n_factories; fi++)
+                            old_states[fi] = lad->factories[fi].cached_state;
+
                         ladder_advance_block(lad, (uint32_t)height);
-                        if (lad->n_factories > 0 &&
-                            lad->factories[0].cached_state != old_st) {
-                            const char *st_names[] = {
-                                "ACTIVE", "DYING", "EXPIRED" };
-                            int si = (int)lad->factories[0].cached_state;
-                            const char *st_str = (si >= 0 && si <= 2) ?
-                                st_names[si] : "UNKNOWN";
-                            printf("LSP: ladder factory 0 -> %s at height %d\n",
-                                   st_str, height);
-                            if (mgr->persist) {
-                                const char *ps[] = {
-                                    "active", "dying", "expired" };
-                                persist_save_ladder_factory(
-                                    (persist_t *)mgr->persist,
-                                    0, (si >= 0 && si <= 2) ? ps[si] : "unknown",
-                                    lad->factories[0].is_funded,
-                                    lad->factories[0].is_initialized,
-                                    lad->factories[0].n_departed,
-                                    lad->factories[0].factory.created_block,
-                                    lad->factories[0].factory.active_blocks,
-                                    lad->factories[0].factory.dying_blocks);
-                            }
-                            /* Auto-broadcast distribution TX on EXPIRED */
-                            ladder_factory_t *lf = &lad->factories[0];
-                            if (lf->cached_state == FACTORY_EXPIRED &&
-                                lf->distribution_tx.len > 0 &&
-                                mgr->watchtower && mgr->watchtower->rt) {
-                                char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
-                                if (dhex) {
-                                    extern void hex_encode(const unsigned char *,
-                                                           size_t, char *);
-                                    hex_encode(lf->distribution_tx.data,
-                                               lf->distribution_tx.len, dhex);
-                                    char dtxid[65];
-                                    if (regtest_send_raw_tx(mgr->watchtower->rt,
-                                                             dhex, dtxid))
-                                        printf("LSP: distribution TX broadcast: %s\n",
-                                               dtxid);
-                                    free(dhex);
+
+                        for (size_t fi = 0; fi < lad->n_factories; fi++) {
+                            ladder_factory_t *lf = &lad->factories[fi];
+                            if (lf->cached_state != old_states[fi]) {
+                                const char *st_names[] = {
+                                    "ACTIVE", "DYING", "EXPIRED" };
+                                int si = (int)lf->cached_state;
+                                const char *st_str = (si >= 0 && si <= 2) ?
+                                    st_names[si] : "UNKNOWN";
+                                printf("LSP: ladder factory %zu -> %s at height %d\n",
+                                       fi, st_str, height);
+                                if (mgr->persist) {
+                                    const char *ps[] = {
+                                        "active", "dying", "expired" };
+                                    persist_save_ladder_factory(
+                                        (persist_t *)mgr->persist,
+                                        (uint32_t)lf->factory_id,
+                                        (si >= 0 && si <= 2) ? ps[si] : "unknown",
+                                        lf->is_funded,
+                                        lf->is_initialized,
+                                        lf->n_departed,
+                                        lf->factory.created_block,
+                                        lf->factory.active_blocks,
+                                        lf->factory.dying_blocks);
+                                }
+                                /* Auto-broadcast distribution TX on EXPIRED */
+                                if (lf->cached_state == FACTORY_EXPIRED &&
+                                    lf->distribution_tx.len > 0 &&
+                                    mgr->watchtower && mgr->watchtower->rt) {
+                                    char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
+                                    if (dhex) {
+                                        extern void hex_encode(const unsigned char *,
+                                                               size_t, char *);
+                                        hex_encode(lf->distribution_tx.data,
+                                                   lf->distribution_tx.len, dhex);
+                                        char dtxid[65];
+                                        if (regtest_send_raw_tx(mgr->watchtower->rt,
+                                                                 dhex, dtxid))
+                                            printf("LSP: distribution TX broadcast: %s\n",
+                                                   dtxid);
+                                        free(dhex);
+                                    }
                                 }
                             }
                         }

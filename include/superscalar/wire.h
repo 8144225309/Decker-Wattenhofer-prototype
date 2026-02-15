@@ -49,6 +49,11 @@
 #define MSG_CREATE_INVOICE      0x4A  /* LSP → Client: please create invoice */
 #define MSG_INVOICE_CREATED     0x4B  /* Client → LSP: here's the payment_hash */
 
+/* PTLC key turnover messages (Tier 3) */
+#define MSG_PTLC_PRESIG         0x4C  /* LSP → Client: adaptor pre-signature */
+#define MSG_PTLC_ADAPTED_SIG    0x4D  /* Client → LSP: adapted signature */
+#define MSG_PTLC_COMPLETE       0x4E  /* LSP → Client: turnover acknowledged */
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
@@ -317,6 +322,24 @@ cJSON *wire_build_invoice_created(const unsigned char *payment_hash32,
 int wire_parse_invoice_created(const cJSON *json,
                                  unsigned char *payment_hash32,
                                  uint64_t *amount_msat);
+
+/* --- PTLC key turnover messages (Tier 3) --- */
+
+/* LSP → Client: PTLC_PRESIG {presig, nonce_parity, turnover_msg} */
+cJSON *wire_build_ptlc_presig(const unsigned char *presig64,
+                               int nonce_parity,
+                               const unsigned char *turnover_msg32);
+
+int wire_parse_ptlc_presig(const cJSON *json, unsigned char *presig64,
+                            int *nonce_parity, unsigned char *turnover_msg32);
+
+/* Client → LSP: PTLC_ADAPTED_SIG {adapted_sig} */
+cJSON *wire_build_ptlc_adapted_sig(const unsigned char *adapted_sig64);
+
+int wire_parse_ptlc_adapted_sig(const cJSON *json, unsigned char *adapted_sig64);
+
+/* LSP → Client: PTLC_COMPLETE {} */
+cJSON *wire_build_ptlc_complete(void);
 
 /* --- Bundle parsing --- */
 

@@ -60,6 +60,7 @@ static void usage(const char *prog) {
         "  --test-expiry       After demo: mine past CLTV, recover via timeout script\n"
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
+        "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -314,6 +315,7 @@ int main(int argc, char *argv[]) {
     int test_expiry = 0;
     int test_distrib = 0;
     int test_turnover = 0;
+    int test_rotation = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -360,6 +362,8 @@ int main(int argc, char *argv[]) {
             test_distrib = 1;
         else if (strcmp(argv[i], "--test-turnover") == 0)
             test_turnover = 1;
+        else if (strcmp(argv[i], "--test-rotation") == 0)
+            test_rotation = 1;
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -727,7 +731,7 @@ int main(int argc, char *argv[]) {
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
-        test_distrib || test_turnover) {
+        test_distrib || test_turnover || test_rotation) {
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
@@ -1442,6 +1446,288 @@ int main(int argc, char *argv[]) {
         report_add_string(&rpt, "result", "turnover_test_complete");
         report_close(&rpt);
         if (use_db) persist_close(&db);
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
+    /* === Factory Rotation Test (Tier 3) === */
+    if (test_rotation && channels_active) {
+        printf("\n=== FACTORY ROTATION TEST ===\n");
+
+        /* --- Phase A: PTLC key turnover over wire --- */
+        printf("Phase A: PTLC key turnover for Factory 0\n");
+
+        /* Build demo keypairs (same as --test-turnover) */
+        secp256k1_keypair rot_kps[FACTORY_MAX_SIGNERS];
+        rot_kps[0] = lsp_kp;
+        {
+            static const unsigned char fill[4] = { 0x21, 0x32, 0x43, 0x54 };
+            for (int ci = 0; ci < n_clients; ci++) {
+                unsigned char ds[32];
+                memset(ds, fill[ci], 32);
+                secp256k1_keypair_create(ctx, &rot_kps[ci + 1], ds);
+            }
+        }
+
+        secp256k1_pubkey rot_pks[FACTORY_MAX_SIGNERS];
+        for (size_t ti = 0; ti < n_total; ti++)
+            secp256k1_keypair_pub(ctx, &rot_pks[ti], &rot_kps[ti]);
+
+        musig_keyagg_t rot_ka;
+        musig_aggregate_keys(ctx, &rot_ka, rot_pks, n_total);
+
+        unsigned char turnover_msg[32];
+        sha256_tagged("turnover", (const unsigned char *)"turnover", 8, turnover_msg);
+
+        for (int ci = 0; ci < n_clients; ci++) {
+            uint32_t pidx = (uint32_t)(ci + 1);
+            secp256k1_pubkey client_pk = rot_pks[pidx];
+
+            unsigned char presig[64];
+            int nonce_parity;
+            musig_keyagg_t ka_copy = rot_ka;
+            if (!adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                                                  turnover_msg, rot_kps, n_total,
+                                                  &ka_copy, NULL, &client_pk)) {
+                fprintf(stderr, "ROTATION: presig failed client %d\n", ci);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            /* Send PTLC_PRESIG to client */
+            cJSON *pm = wire_build_ptlc_presig(presig, nonce_parity, turnover_msg);
+            if (!wire_send(lsp.client_fds[ci], MSG_PTLC_PRESIG, pm)) {
+                cJSON_Delete(pm);
+                fprintf(stderr, "ROTATION: send presig failed client %d\n", ci);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            cJSON_Delete(pm);
+
+            /* Recv PTLC_ADAPTED_SIG from client */
+            wire_msg_t resp;
+            if (!wire_recv(lsp.client_fds[ci], &resp) ||
+                resp.msg_type != MSG_PTLC_ADAPTED_SIG) {
+                if (resp.json) cJSON_Delete(resp.json);
+                fprintf(stderr, "ROTATION: no adapted_sig from client %d\n", ci);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            unsigned char adapted_sig[64];
+            if (!wire_parse_ptlc_adapted_sig(resp.json, adapted_sig)) {
+                cJSON_Delete(resp.json);
+                fprintf(stderr, "ROTATION: parse adapted_sig failed client %d\n", ci);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            cJSON_Delete(resp.json);
+
+            /* Extract client's secret key */
+            unsigned char extracted[32];
+            if (!adaptor_extract_secret(ctx, extracted, adapted_sig, presig,
+                                          nonce_parity)) {
+                fprintf(stderr, "ROTATION: extract failed client %d\n", ci);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            if (!adaptor_verify_extracted_key(ctx, extracted, &client_pk)) {
+                fprintf(stderr, "ROTATION: verify failed client %d\n", ci);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            ladder_record_key_turnover(&lad, 0, pidx, extracted);
+            if (use_db)
+                persist_save_departed_client(&db, 0, pidx, extracted);
+
+            /* Send PTLC_COMPLETE */
+            cJSON *cm = wire_build_ptlc_complete();
+            wire_send(lsp.client_fds[ci], MSG_PTLC_COMPLETE, cm);
+            cJSON_Delete(cm);
+
+            printf("  Client %d: key extracted via wire PTLC\n", ci + 1);
+        }
+
+        /* --- Phase B: Ladder close of Factory 0 --- */
+        printf("Phase B: Ladder close of Factory 0\n");
+        if (!ladder_can_close(&lad, 0)) {
+            fprintf(stderr, "ROTATION: ladder_can_close returned false\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
+        uint64_t rot_per = (lsp.factory.funding_amount_sats - 500) / n_total;
+        for (size_t ti = 0; ti < n_total; ti++) {
+            rot_outputs[ti].amount_sats = rot_per;
+            memcpy(rot_outputs[ti].script_pubkey, fund_spk, 34);
+            rot_outputs[ti].script_pubkey_len = 34;
+        }
+        rot_outputs[n_total - 1].amount_sats =
+            lsp.factory.funding_amount_sats - 500 - rot_per * (n_total - 1);
+
+        tx_buf_t rot_close_tx;
+        tx_buf_init(&rot_close_tx, 512);
+        if (!ladder_build_close(&lad, 0, &rot_close_tx, rot_outputs, n_total)) {
+            fprintf(stderr, "ROTATION: ladder_build_close failed\n");
+            tx_buf_free(&rot_close_tx);
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        char *rc_hex = malloc(rot_close_tx.len * 2 + 1);
+        hex_encode(rot_close_tx.data, rot_close_tx.len, rc_hex);
+        char rc_txid[65];
+        int rc_sent = regtest_send_raw_tx(&rt, rc_hex, rc_txid);
+        free(rc_hex);
+        tx_buf_free(&rot_close_tx);
+
+        if (!rc_sent) {
+            fprintf(stderr, "ROTATION: Factory 0 close TX broadcast failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+        printf("  Factory 0 closed: %s\n", rc_txid);
+
+        /* --- Phase C: Create Factory 1 --- */
+        printf("Phase C: Creating Factory 1\n");
+
+        /* Fund new factory (same address since same participants) */
+        char fund2_txid_hex[65];
+        if (is_regtest) {
+            if (!regtest_fund_address(&rt, fund_addr, funding_sats, fund2_txid_hex)) {
+                fprintf(stderr, "ROTATION: fund Factory 1 failed\n");
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            regtest_mine_blocks(&rt, 1, mine_addr);
+        }
+
+        unsigned char fund2_txid[32];
+        hex_decode(fund2_txid_hex, fund2_txid, 32);
+        reverse_bytes(fund2_txid, 32);
+
+        uint64_t fund2_amount = 0;
+        unsigned char fund2_spk[256];
+        size_t fund2_spk_len = 0;
+        uint32_t fund2_vout = 0;
+        for (uint32_t v = 0; v < 4; v++) {
+            regtest_get_tx_output(&rt, fund2_txid_hex, v,
+                                  &fund2_amount, fund2_spk, &fund2_spk_len);
+            if (fund2_spk_len == 34 && memcmp(fund2_spk, fund_spk, 34) == 0) {
+                fund2_vout = v;
+                break;
+            }
+        }
+        if (fund2_amount == 0) {
+            fprintf(stderr, "ROTATION: no funding output for Factory 1\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        /* Free old factory in lsp before reusing */
+        factory_free(&lsp.factory);
+
+        /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients,
+           who handle it in their MSG_FACTORY_PROPOSE daemon callback) */
+        if (!lsp_run_factory_creation(&lsp,
+                                       fund2_txid, fund2_vout,
+                                       fund2_amount,
+                                       fund_spk, 34,
+                                       step_blocks, 4)) {
+            fprintf(stderr, "ROTATION: Factory 1 creation failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        /* Set lifecycle for Factory 1 */
+        {
+            int cur_h = regtest_get_block_height(&rt);
+            if (cur_h > 0) {
+                factory_set_lifecycle(&lsp.factory, (uint32_t)cur_h, 20, 10);
+                lsp.factory.cltv_timeout = (uint32_t)cur_h + 35;
+            }
+        }
+
+        /* Store in ladder slot 1 */
+        {
+            ladder_factory_t *lf1 = &lad.factories[1];
+            lf1->factory = lsp.factory;
+            lf1->factory_id = lad.next_factory_id++;
+            lf1->is_initialized = 1;
+            lf1->is_funded = 1;
+            lf1->cached_state = FACTORY_ACTIVE;
+            tx_buf_init(&lf1->distribution_tx, 256);
+            lad.n_factories = 2;
+        }
+        printf("  Factory 1 created and stored in ladder slot 1\n");
+
+        /* Initialize new channel manager + send CHANNEL_READY */
+        lsp_channel_mgr_t mgr2;
+        if (!lsp_channels_init(&mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
+            fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        if (!lsp_channels_send_ready(&mgr2, &lsp)) {
+            fprintf(stderr, "ROTATION: send_ready for Factory 1 failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        printf("  Factory 1 channels ready\n");
+
+        /* --- Phase D: Payment + cooperative close on Factory 1 --- */
+        printf("Phase D: Payment on Factory 1\n");
+
+        /* Run one payment: client 0 → client 1 */
+        if (!lsp_channels_initiate_payment(&mgr2, &lsp, 0, 1, 1000)) {
+            fprintf(stderr, "ROTATION: payment on Factory 1 failed\n");
+            /* Non-fatal — continue to close */
+        } else {
+            printf("  Payment: client 1 -> client 2: 1000 sats\n");
+            lsp_channels_print_balances(&mgr2);
+        }
+
+        /* Cooperative close of Factory 1 */
+        tx_output_t close2_outputs[FACTORY_MAX_SIGNERS];
+        size_t n_close2 = lsp_channels_build_close_outputs(&mgr2, &lsp.factory,
+                                                             close2_outputs, 500);
+        tx_buf_t close2_tx;
+        tx_buf_init(&close2_tx, 512);
+        if (!lsp_run_cooperative_close(&lsp, &close2_tx, close2_outputs, n_close2)) {
+            fprintf(stderr, "ROTATION: cooperative close of Factory 1 failed\n");
+            tx_buf_free(&close2_tx);
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+
+        char *c2_hex = malloc(close2_tx.len * 2 + 1);
+        hex_encode(close2_tx.data, close2_tx.len, c2_hex);
+        char c2_txid[65];
+        int c2_sent = regtest_send_raw_tx(&rt, c2_hex, c2_txid);
+        free(c2_hex);
+        tx_buf_free(&close2_tx);
+
+        if (!c2_sent) {
+            fprintf(stderr, "ROTATION: Factory 1 close TX broadcast failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+
+        printf("  Factory 1 closed: %s\n", c2_txid);
+        printf("\n=== FACTORY ROTATION TEST PASSED ===\n");
+
+        report_add_string(&rpt, "result", "rotation_test_complete");
+        report_close(&rpt);
+        if (use_db) persist_close(&db);
+        tx_buf_free(&lad.factories[0].distribution_tx);
+        tx_buf_free(&lad.factories[1].distribution_tx);
         lsp_cleanup(&lsp);
         memset(lsp_seckey, 0, 32);
         secp256k1_context_destroy(ctx);

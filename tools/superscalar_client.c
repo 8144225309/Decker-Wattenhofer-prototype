@@ -5,6 +5,7 @@
 #include "superscalar/report.h"
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
+#include "superscalar/adaptor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -408,6 +409,74 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                                            (size_t)client_idx);
                 wire_send(fd, MSG_REGISTER_INVOICE, reg);
                 cJSON_Delete(reg);
+            }
+            break;
+        }
+
+        case MSG_PTLC_PRESIG: {
+            /* LSP sends adaptor pre-signature for PTLC key turnover */
+            unsigned char presig[64], turnover_msg[32];
+            int nonce_parity;
+            if (!wire_parse_ptlc_presig(msg.json, presig, &nonce_parity, turnover_msg)) {
+                fprintf(stderr, "Client %u: bad PTLC_PRESIG\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
+
+            /* Adapt with our secret key */
+            unsigned char my_seckey[32];
+            secp256k1_keypair_sec(ctx, my_seckey, keypair);
+            unsigned char adapted_sig[64];
+            if (!adaptor_adapt(ctx, adapted_sig, presig, my_seckey, nonce_parity)) {
+                fprintf(stderr, "Client %u: adaptor_adapt failed\n", my_index);
+                memset(my_seckey, 0, 32);
+                break;
+            }
+            memset(my_seckey, 0, 32);
+
+            /* Send adapted signature back */
+            cJSON *reply = wire_build_ptlc_adapted_sig(adapted_sig);
+            wire_send(fd, MSG_PTLC_ADAPTED_SIG, reply);
+            cJSON_Delete(reply);
+
+            /* Receive PTLC_COMPLETE acknowledgement */
+            wire_msg_t complete_msg;
+            if (wire_recv(fd, &complete_msg)) {
+                if (complete_msg.msg_type == MSG_PTLC_COMPLETE)
+                    printf("Client %u: PTLC departure complete\n", my_index);
+                cJSON_Delete(complete_msg.json);
+            }
+            break;
+        }
+
+        case MSG_FACTORY_PROPOSE: {
+            /* LSP initiates factory rotation — create new factory */
+            printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
+
+            /* Save pubkeys from current factory */
+            secp256k1_pubkey saved_pubkeys[FACTORY_MAX_SIGNERS];
+            for (size_t pi = 0; pi < n_participants; pi++)
+                saved_pubkeys[pi] = factory->pubkeys[pi];
+
+            /* Free old factory */
+            factory_free(factory);
+
+            /* Run rotation ceremony */
+            if (!client_do_factory_rotation(fd, ctx, keypair, my_index,
+                                             n_participants, saved_pubkeys,
+                                             factory, ch, &msg)) {
+                fprintf(stderr, "Client %u: factory rotation failed\n", my_index);
+                cJSON_Delete(msg.json);
+                return 0;
+            }
+            cJSON_Delete(msg.json);
+
+            /* Persist new factory + channel if DB available */
+            if (cbd && cbd->db) {
+                persist_save_factory(cbd->db, factory, ctx, 0);
+                persist_save_channel(cbd->db, ch, 0, my_index - 1);
+                printf("Client %u: persisted rotated factory + channel\n", my_index);
             }
             break;
         }
