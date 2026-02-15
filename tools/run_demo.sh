@@ -78,7 +78,7 @@ export DYLD_LIBRARY_PATH="$LIB_PATH"  # macOS
 LSP_BIN="$BUILD_DIR/superscalar_lsp"
 CLIENT_BIN="$BUILD_DIR/superscalar_client"
 
-PORT=9735
+PORT=${SUPERSCALAR_PORT:-9735}
 AMOUNT=100000
 NETWORK="regtest"
 CLI_ARGS="-regtest"

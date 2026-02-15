@@ -221,8 +221,10 @@ int test_lsp_channel_init(void) {
         TEST_ASSERT(entry->channel.funding_amount > 0, "funding_amount > 0");
         TEST_ASSERT(entry->channel.local_amount > 0, "local_amount > 0");
         TEST_ASSERT(entry->channel.remote_amount > 0, "remote_amount > 0");
+        /* local + remote = funding_amount - commit_fee (154 sats at 1 sat/vB) */
+        uint64_t commit_fee = (1000 * 154 + 999) / 1000;
         TEST_ASSERT_EQ(entry->channel.local_amount + entry->channel.remote_amount,
-                        entry->channel.funding_amount, "balance sum");
+                        entry->channel.funding_amount - commit_fee, "balance sum");
     }
 
     factory_free(&f);

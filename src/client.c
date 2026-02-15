@@ -59,15 +59,19 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     /* LSP pubkey (participant 0) */
     const secp256k1_pubkey *lsp_pubkey = &factory->pubkeys[0];
 
-    uint64_t local_amount = funding_amount / 2;
-    uint64_t remote_amount = funding_amount - local_amount;
+    /* Commitment tx fee: 154 vbytes at 1 sat/vB = 154 sats.
+       Must match lsp_channels_init so both sides agree on amounts. */
+    uint64_t commit_fee = (1000 * 154 + 999) / 1000;
+    uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
+    uint64_t local_amount = usable / 2;
+    uint64_t remote_amount = usable - local_amount;
 
     /* From client perspective: local = client, remote = LSP.
        But channel balances should match LSP's view. The LSP has:
-         lsp.local_amount = funding/2, lsp.remote_amount = funding - funding/2
+         lsp.local_amount = usable/2, lsp.remote_amount = usable - usable/2
        Client should have the mirror:
-         client.local_amount = funding - funding/2 (= lsp.remote_amount)
-         client.remote_amount = funding/2 (= lsp.local_amount) */
+         client.local_amount = usable - usable/2 (= lsp.remote_amount)
+         client.remote_amount = usable/2 (= lsp.local_amount) */
 
     if (!channel_init(ch, ctx, my_seckey, &my_pubkey, lsp_pubkey,
                        funding_txid, vout, funding_amount,

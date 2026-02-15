@@ -272,13 +272,19 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
             return 0;
         }
 
-        /* Mine blocks to satisfy relative timelock for next child */
-        uint32_t nseq = node->nsequence;
+        /* Mine blocks to satisfy relative timelock for next child.
+         * The NEXT node's nSequence is the relative delay from THIS node's
+         * confirmation. If this is the last node, just confirm it (1 block). */
         int blocks_to_mine;
-        if (nseq == NSEQUENCE_DISABLE_BIP68) {
-            blocks_to_mine = 1;  /* no relative timelock, just confirm */
+        if (i + 1 < f->n_nodes) {
+            uint32_t child_nseq = f->nodes[i + 1].nsequence;
+            if (child_nseq == NSEQUENCE_DISABLE_BIP68) {
+                blocks_to_mine = 1;
+            } else {
+                blocks_to_mine = (int)(child_nseq & 0xFFFF) + 1;
+            }
         } else {
-            blocks_to_mine = (int)(nseq & 0xFFFF) + 1;
+            blocks_to_mine = 1;  /* last node, just confirm */
         }
         regtest_mine_blocks(rt, blocks_to_mine, mine_addr);
 
@@ -808,8 +814,10 @@ int main(int argc, char *argv[]) {
         report_channel_state(&rpt, "channels_initial", &mgr);
         report_flush(&rpt);
 
-        /* Initialize watchtower for breach detection */
-        watchtower_t wt;
+        /* Initialize watchtower for breach detection.
+         * Use static to avoid stack corruption (watchtower_t is ~6.5KB). */
+        static watchtower_t wt;
+        memset(&wt, 0, sizeof(wt));
         watchtower_init(&wt, mgr.n_channels, &rt, &fee_est,
                           use_db ? &db : NULL);
         for (size_t c = 0; c < mgr.n_channels; c++)
@@ -909,26 +917,30 @@ int main(int argc, char *argv[]) {
         }
         printf("Factory tree confirmed on-chain.\n");
 
-        /* Rebuild old commitment #0 (the pre-payment state, now revoked) */
+        /* Rebuild old REMOTE commitment #0 (the one the client holds,
+         * now revoked — this is what would appear on-chain in a breach) */
         channel_t *ch0 = &mgr.entries[0].channel;
         uint64_t saved_num = ch0->commitment_number;
         uint64_t saved_local = ch0->local_amount;
         uint64_t saved_remote = ch0->remote_amount;
+        size_t saved_n_htlcs = ch0->n_htlcs;
 
-        /* Temporarily revert to commitment #0 */
+        /* Temporarily revert to commitment #0 with no HTLCs */
         ch0->commitment_number = 0;
         ch0->local_amount = init_local;
         ch0->remote_amount = init_remote;
+        ch0->n_htlcs = 0;
 
         tx_buf_t old_commit_tx;
         tx_buf_init(&old_commit_tx, 512);
         unsigned char old_txid[32];
-        int built = channel_build_commitment_tx(ch0, &old_commit_tx, old_txid);
+        int built = channel_build_commitment_tx_for_remote(ch0, &old_commit_tx, old_txid);
 
         /* Restore current state */
         ch0->commitment_number = saved_num;
         ch0->local_amount = saved_local;
         ch0->remote_amount = saved_remote;
+        ch0->n_htlcs = saved_n_htlcs;
 
         if (!built) {
             fprintf(stderr, "BREACH TEST: failed to rebuild old commitment\n");
