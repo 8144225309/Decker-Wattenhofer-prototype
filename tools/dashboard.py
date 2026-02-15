@@ -213,6 +213,8 @@ def collect_demo():
     if c%13==0: _ev(f"Nonce pool replenished: CH{random.randint(0,3)} +16 nonces")
     if c%17==0: _ev(f"Bridge: inbound HTLC from CLN, hash={_rh(8)}...")
     if c%19==0: _ev(f"Forward: {random.randint(100,5000)} msat via {_rh(8)}...")
+    if c%23==0: _ev(f"PTLC presig sent to Client {random.randint(1,4)}")
+    if c%29==0: _ev(f"PTLC adapted sig received, key extracted for Client {random.randint(1,4)}")
     ft=_rh(64); cb=h-500; ct=cb+1008; db_=cb+4320; spl=4; nl=2; te=spl**nl; ce=7
     parts=[{"factory_id":0,"slot":i,"pubkey":("02"if i%2==0 else"03")+_rh(64)} for i in range(5)]
     node_a_id = "02a1b2c3d4e5f678" + _rh(48)
@@ -254,8 +256,8 @@ def collect_demo():
                 ],
                 "wire_messages":[
                     {"id":i+1,"timestamp":int(t)-300+i*10,"direction":"recv" if i%2==0 else "sent",
-                     "msg_type":[0x01,0x02,0x10,0x11,0x12,0x13,0x14,0x30,0x31,0x32,0x33,0x34,0x32,0x33,0x31,0x32,0x33,0x34,0x32,0x33,0x38,0x40,0x41,0x42,0x43,0x48,0x49,0x4A,0x4B,0xFF][i%30],
-                     "msg_name":["HELLO","HELLO_ACK","FACTORY_PROPOSE","NONCE_BUNDLE","ALL_NONCES","PSIG_BUNDLE","FACTORY_READY","CHANNEL_READY","UPDATE_ADD_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","UPDATE_FULFILL_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","UPDATE_ADD_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","UPDATE_FULFILL_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","REGISTER_INVOICE","BRIDGE_HELLO","BRIDGE_HELLO_ACK","BRIDGE_ADD_HTLC","BRIDGE_FULFILL_HTLC","RECONNECT","RECONNECT_ACK","CREATE_INVOICE","INVOICE_CREATED","ERROR"][i%30],
+                     "msg_type":[0x01,0x02,0x10,0x11,0x12,0x13,0x14,0x30,0x31,0x32,0x33,0x34,0x32,0x33,0x31,0x32,0x33,0x34,0x32,0x33,0x38,0x40,0x41,0x42,0x43,0x48,0x49,0x4A,0x4B,0x4C,0x4D,0x4E,0xFF][i%33],
+                     "msg_name":["HELLO","HELLO_ACK","FACTORY_PROPOSE","NONCE_BUNDLE","ALL_NONCES","PSIG_BUNDLE","FACTORY_READY","CHANNEL_READY","UPDATE_ADD_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","UPDATE_FULFILL_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","UPDATE_ADD_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","UPDATE_FULFILL_HTLC","COMMITMENT_SIGNED","REVOKE_AND_ACK","REGISTER_INVOICE","BRIDGE_HELLO","BRIDGE_HELLO_ACK","BRIDGE_ADD_HTLC","BRIDGE_FULFILL_HTLC","RECONNECT","RECONNECT_ACK","CREATE_INVOICE","INVOICE_CREATED","PTLC_PRESIG","PTLC_ADAPTED_SIG","PTLC_COMPLETE","ERROR"][i%33],
                      "peer":["client_0","client_0","client_0","client_1","client_2","client_3","client_0","client_1","client_2","client_3","client_0","client_1","client_2","client_3","bridge","client_0"][i%16],
                      "payload_summary":'{"example":"data_'+str(i)+'"}'}
                     for i in range(25)
@@ -674,6 +676,7 @@ function rProtocol(D){
   if(n.startsWith('CLOSE'))return'color:#d2a8ff';
   if(n.startsWith('HELLO')||n.startsWith('RECONNECT'))return'color:#79c0ff';
   if(n.startsWith('INVOICE')||n.startsWith('CREATE_INVOICE')||n.startsWith('REGISTER'))return'color:#d29922';
+  if(n.startsWith('PTLC'))return'color:#e6db74';
   if(n==='ERROR')return'color:#f85149';
   return'color:#8b949e';
  };
