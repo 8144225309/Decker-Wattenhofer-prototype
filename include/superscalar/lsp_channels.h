@@ -55,6 +55,9 @@ typedef struct {
 
     /* Persistence (Phase 23) */
     void *persist;  /* persist_t* or NULL — avoids header dependency */
+
+    /* Ladder manager (Tier 2) */
+    void *ladder;   /* ladder_t* or NULL — avoids header dependency */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

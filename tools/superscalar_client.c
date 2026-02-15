@@ -224,6 +224,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
 
     printf("Client %u: daemon mode active (Ctrl+C to stop)\n", my_index);
 
+    /* Log factory lifecycle once (Tier 2) */
+    if (factory && factory->active_blocks > 0) {
+        printf("Client %u: factory lifecycle: active %u blocks, dying %u blocks\n",
+               my_index, factory->active_blocks, factory->dying_blocks);
+    }
+
     while (!g_shutdown) {
         fd_set rfds;
         FD_ZERO(&rfds);

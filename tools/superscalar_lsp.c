@@ -9,6 +9,8 @@
 #include "superscalar/keyfile.h"
 #include "superscalar/dw_state.h"
 #include "superscalar/tapscript.h"
+#include "superscalar/ladder.h"
+#include "superscalar/adaptor.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -56,6 +58,8 @@ static void usage(const char *prog) {
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
         "  --breach-test       After demo: broadcast revoked commitment, trigger penalty\n"
         "  --test-expiry       After demo: mine past CLTV, recover via timeout script\n"
+        "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
+        "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -308,6 +312,8 @@ int main(int argc, char *argv[]) {
     const char *rpcpassword = NULL;
     int breach_test = 0;
     int test_expiry = 0;
+    int test_distrib = 0;
+    int test_turnover = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -350,6 +356,10 @@ int main(int argc, char *argv[]) {
             breach_test = 1;
         else if (strcmp(argv[i], "--test-expiry") == 0)
             test_expiry = 1;
+        else if (strcmp(argv[i], "--test-distrib") == 0)
+            test_distrib = 1;
+        else if (strcmp(argv[i], "--test-turnover") == 0)
+            test_turnover = 1;
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -665,6 +675,28 @@ int main(int argc, char *argv[]) {
     /* Set fee estimator on factory (for computed fees) */
     lsp.factory.fee = &fee_est;
 
+    /* === Ladder manager initialization (Tier 2) === */
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 20, 10);
+    {
+        int cur_h = regtest_get_block_height(&rt);
+        if (cur_h > 0) lad.current_block = (uint32_t)cur_h;
+    }
+    /* Populate slot 0 with the existing factory (shallow copy) */
+    {
+        ladder_factory_t *lf = &lad.factories[0];
+        lf->factory = lsp.factory;
+        lf->factory_id = lad.next_factory_id++;
+        lf->is_initialized = 1;
+        lf->is_funded = 1;
+        lf->cached_state = factory_get_state(&lsp.factory,
+                                               lad.current_block);
+        tx_buf_init(&lf->distribution_tx, 256);
+        lad.n_factories = 1;
+    }
+    printf("LSP: ladder initialized (factory 0 at slot 0, state=%d)\n",
+           (int)lad.factories[0].cached_state);
+
     /* Persist factory + tree nodes + DW counter */
     if (use_db) {
         if (!persist_save_factory(&db, &lsp.factory, ctx, 0))
@@ -674,6 +706,10 @@ int main(int argc, char *argv[]) {
         /* Save initial DW counter state (Phase 23) */
         uint32_t init_layers[] = {4, 4};  /* states_per_layer for each DW layer */
         persist_save_dw_counter(&db, 0, 0, 2, init_layers);
+        /* Save ladder factory state (Tier 2) */
+        persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
+            lsp.factory.created_block, lsp.factory.active_blocks,
+            lsp.factory.dying_blocks);
     }
 
     /* Report: factory tree */
@@ -690,7 +726,8 @@ int main(int argc, char *argv[]) {
     lsp_channel_mgr_t mgr;
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
-    if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry) {
+    if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
+        test_distrib || test_turnover) {
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
@@ -774,6 +811,9 @@ int main(int argc, char *argv[]) {
         for (size_t c = 0; c < mgr.n_channels; c++)
             watchtower_set_channel(&wt, c, &mgr.entries[c].channel);
         mgr.watchtower = &wt;
+
+        /* Wire ladder into channel manager (Tier 2) */
+        mgr.ladder = &lad;
 
         if (n_payments > 0) {
             printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
@@ -1153,6 +1193,253 @@ int main(int argc, char *argv[]) {
 
         /* Skip cooperative close — factory already spent */
         report_add_string(&rpt, "result", "expiry_test_complete");
+        report_close(&rpt);
+        if (use_db) persist_close(&db);
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
+    /* === Distribution TX Test: mine past CLTV, broadcast distribution TX === */
+    if (test_distrib && channels_active) {
+        printf("\n=== DISTRIBUTION TX TEST ===\n");
+
+        /* Build distribution TX with demo keypairs (LSP has all keys in demo) */
+        factory_t df = lsp.factory;
+        secp256k1_keypair dk[FACTORY_MAX_SIGNERS];
+        dk[0] = lsp_kp;
+        {
+            static const unsigned char fill[4] = { 0x21, 0x32, 0x43, 0x54 };
+            for (int ci = 0; ci < n_clients; ci++) {
+                unsigned char ds[32];
+                memset(ds, fill[ci], 32);
+                secp256k1_keypair_create(ctx, &dk[ci + 1], ds);
+            }
+        }
+        memcpy(df.keypairs, dk, n_total * sizeof(secp256k1_keypair));
+
+        /* Equal-split outputs */
+        tx_output_t dist_outputs[FACTORY_MAX_SIGNERS];
+        uint64_t dist_per = (df.funding_amount_sats - 500) / n_total;
+        for (size_t di = 0; di < n_total; di++) {
+            dist_outputs[di].amount_sats = dist_per;
+            memcpy(dist_outputs[di].script_pubkey, fund_spk, 34);
+            dist_outputs[di].script_pubkey_len = 34;
+        }
+        dist_outputs[n_total - 1].amount_sats =
+            df.funding_amount_sats - 500 - dist_per * (n_total - 1);
+
+        tx_buf_t dist_tx;
+        tx_buf_init(&dist_tx, 512);
+        unsigned char dist_txid[32];
+        if (!factory_build_distribution_tx(&df, &dist_tx, dist_txid,
+                                             dist_outputs, n_total,
+                                             lsp.factory.cltv_timeout)) {
+            fprintf(stderr, "DISTRIBUTION TX TEST: build failed\n");
+            tx_buf_free(&dist_tx);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("Distribution TX built (%zu bytes)\n", dist_tx.len);
+
+        /* Store in ladder slot */
+        lad.factories[0].distribution_tx = dist_tx;
+
+        /* Mine past CLTV timeout */
+        int cur_h = regtest_get_block_height(&rt);
+        int blocks_to_cltv = (int)lsp.factory.cltv_timeout - cur_h;
+        if (blocks_to_cltv > 0) {
+            printf("Mining %d blocks to reach CLTV timeout %u...\n",
+                   blocks_to_cltv, lsp.factory.cltv_timeout);
+            regtest_mine_blocks(&rt, blocks_to_cltv, mine_addr);
+        }
+
+        /* Broadcast distribution TX */
+        char *dt_hex = malloc(dist_tx.len * 2 + 1);
+        hex_encode(dist_tx.data, dist_tx.len, dt_hex);
+        char dt_txid_str[65];
+        int dt_sent = regtest_send_raw_tx(&rt, dt_hex, dt_txid_str);
+        free(dt_hex);
+
+        if (!dt_sent) {
+            fprintf(stderr, "DISTRIBUTION TX TEST: broadcast failed\n");
+            tx_buf_free(&lad.factories[0].distribution_tx);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+
+        printf("Distribution TX broadcast: %s\n", dt_txid_str);
+        printf("=== DISTRIBUTION TX TEST PASSED ===\n\n");
+
+        report_add_string(&rpt, "result", "distrib_test_complete");
+        report_close(&rpt);
+        if (use_db) persist_close(&db);
+        tx_buf_free(&lad.factories[0].distribution_tx);
+        lsp_cleanup(&lsp);
+        memset(lsp_seckey, 0, 32);
+        secp256k1_context_destroy(ctx);
+        return 0;
+    }
+
+    /* === PTLC Key Turnover Test === */
+    if (test_turnover && channels_active) {
+        printf("\n=== PTLC KEY TURNOVER TEST ===\n");
+
+        /* Build demo keypairs (same as test_ladder.c) */
+        secp256k1_keypair all_kps[FACTORY_MAX_SIGNERS];
+        all_kps[0] = lsp_kp;
+        {
+            static const unsigned char fill[4] = { 0x21, 0x32, 0x43, 0x54 };
+            for (int ci = 0; ci < n_clients; ci++) {
+                unsigned char ds[32];
+                memset(ds, fill[ci], 32);
+                secp256k1_keypair_create(ctx, &all_kps[ci + 1], ds);
+            }
+        }
+
+        /* We need the factory with real keypairs for signing */
+        factory_t tf = lsp.factory;
+        memcpy(tf.keypairs, all_kps, n_total * sizeof(secp256k1_keypair));
+
+        /* Build keyagg for the funding key (used as message) */
+        secp256k1_pubkey turnover_pks[FACTORY_MAX_SIGNERS];
+        for (size_t ti = 0; ti < n_total; ti++)
+            secp256k1_keypair_pub(ctx, &turnover_pks[ti], &all_kps[ti]);
+
+        musig_keyagg_t turnover_ka;
+        musig_aggregate_keys(ctx, &turnover_ka, turnover_pks, n_total);
+
+        /* Dummy message (hash of "turnover") */
+        unsigned char turnover_msg[32];
+        sha256_tagged("turnover", (const unsigned char *)"turnover", 8,
+                       turnover_msg);
+
+        /* For each client: adaptor presig → adapt → extract → verify → record */
+        for (int ci = 0; ci < n_clients; ci++) {
+            uint32_t participant_idx = (uint32_t)(ci + 1);
+            secp256k1_pubkey client_pk = turnover_pks[participant_idx];
+
+            /* Create turnover pre-signature with adaptor point = client pubkey */
+            unsigned char presig[64];
+            int nonce_parity;
+            musig_keyagg_t ka_copy = turnover_ka;
+            if (!adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                                                  turnover_msg, all_kps, n_total,
+                                                  &ka_copy, NULL, &client_pk)) {
+                fprintf(stderr, "TURNOVER TEST: presig failed for client %d\n", ci);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Client adapts with their secret key */
+            unsigned char client_sec[32];
+            secp256k1_keypair_sec(ctx, client_sec, &all_kps[participant_idx]);
+            unsigned char adapted_sig[64];
+            if (!adaptor_adapt(ctx, adapted_sig, presig, client_sec, nonce_parity)) {
+                fprintf(stderr, "TURNOVER TEST: adapt failed for client %d\n", ci);
+                memset(client_sec, 0, 32);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* LSP extracts client's secret key */
+            unsigned char extracted[32];
+            if (!adaptor_extract_secret(ctx, extracted, adapted_sig, presig,
+                                          nonce_parity)) {
+                fprintf(stderr, "TURNOVER TEST: extract failed for client %d\n", ci);
+                memset(client_sec, 0, 32);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Verify extracted key matches */
+            if (!adaptor_verify_extracted_key(ctx, extracted, &client_pk)) {
+                fprintf(stderr, "TURNOVER TEST: verify failed for client %d\n", ci);
+                memset(client_sec, 0, 32);
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            /* Record in ladder */
+            ladder_record_key_turnover(&lad, 0, participant_idx, extracted);
+
+            /* Persist departed client */
+            if (use_db)
+                persist_save_departed_client(&db, 0, participant_idx, extracted);
+
+            printf("  Client %d: key extracted and verified ✓\n", ci + 1);
+            memset(client_sec, 0, 32);
+        }
+
+        /* Verify all clients departed */
+        if (!ladder_can_close(&lad, 0)) {
+            fprintf(stderr, "TURNOVER TEST: ladder_can_close returned false\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        printf("All %d clients departed — ladder_can_close = true\n", n_clients);
+
+        /* Build close outputs (equal split) */
+        tx_output_t to_outputs[FACTORY_MAX_SIGNERS];
+        uint64_t to_per = (lsp.factory.funding_amount_sats - 500) / n_total;
+        for (size_t ti = 0; ti < n_total; ti++) {
+            to_outputs[ti].amount_sats = to_per;
+            memcpy(to_outputs[ti].script_pubkey, fund_spk, 34);
+            to_outputs[ti].script_pubkey_len = 34;
+        }
+        to_outputs[n_total - 1].amount_sats =
+            lsp.factory.funding_amount_sats - 500 - to_per * (n_total - 1);
+
+        /* Build cooperative close using extracted keys */
+        tx_buf_t turnover_close_tx;
+        tx_buf_init(&turnover_close_tx, 512);
+        if (!ladder_build_close(&lad, 0, &turnover_close_tx,
+                                  to_outputs, n_total)) {
+            fprintf(stderr, "TURNOVER TEST: ladder_build_close failed\n");
+            tx_buf_free(&turnover_close_tx);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+
+        /* Broadcast close TX */
+        char *tc_hex = malloc(turnover_close_tx.len * 2 + 1);
+        hex_encode(turnover_close_tx.data, turnover_close_tx.len, tc_hex);
+        char tc_txid_str[65];
+        int tc_sent = regtest_send_raw_tx(&rt, tc_hex, tc_txid_str);
+        free(tc_hex);
+        tx_buf_free(&turnover_close_tx);
+
+        if (!tc_sent) {
+            fprintf(stderr, "TURNOVER TEST: close TX broadcast failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+        regtest_mine_blocks(&rt, 1, mine_addr);
+
+        printf("Close TX broadcast: %s\n", tc_txid_str);
+        printf("=== PTLC KEY TURNOVER TEST PASSED ===\n\n");
+
+        report_add_string(&rpt, "result", "turnover_test_complete");
         report_close(&rpt);
         if (use_db) persist_close(&db);
         lsp_cleanup(&lsp);

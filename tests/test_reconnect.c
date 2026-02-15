@@ -1633,3 +1633,214 @@ int test_dw_counter_tracks_advance(void) {
 
     return 1;
 }
+
+/* ============================================================ */
+/* Tier 2: Daemon Feature Wiring tests                          */
+/* ============================================================ */
+
+#include "superscalar/ladder.h"
+#include "superscalar/adaptor.h"
+
+/* Test: ladder daemon integration — advance block, verify state transitions */
+int test_ladder_daemon_integration(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    unsigned char lsp_sec[32];
+    memset(lsp_sec, 0x10, 32);
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 20, 10);
+    lad.current_block = 100;
+
+    /* Manually populate slot 0 */
+    factory_t f;
+    memset(&f, 0, sizeof(f));
+    factory_set_lifecycle(&f, 100, 20, 10);
+
+    ladder_factory_t *lf = &lad.factories[0];
+    lf->factory = f;
+    lf->factory_id = lad.next_factory_id++;
+    lf->is_initialized = 1;
+    lf->is_funded = 1;
+    lf->cached_state = factory_get_state(&f, 100);
+    tx_buf_init(&lf->distribution_tx, 16);
+    lad.n_factories = 1;
+
+    TEST_ASSERT_EQ(lf->cached_state, FACTORY_ACTIVE, "initially ACTIVE");
+
+    /* Advance to block 120 → should transition to DYING */
+    ladder_advance_block(&lad, 120);
+    TEST_ASSERT_EQ(lf->cached_state, FACTORY_DYING, "DYING at 120");
+
+    /* Advance to block 130 → should transition to EXPIRED */
+    ladder_advance_block(&lad, 130);
+    TEST_ASSERT_EQ(lf->cached_state, FACTORY_EXPIRED, "EXPIRED at 130");
+
+    tx_buf_free(&lf->distribution_tx);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: distribution TX output amounts sum correctly */
+int test_distribution_tx_amounts(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    static const unsigned char seckeys[5][32] = {
+        { [0 ... 31] = 0x10 },
+        { [0 ... 31] = 0x21 },
+        { [0 ... 31] = 0x32 },
+        { [0 ... 31] = 0x43 },
+        { [0 ... 31] = 0x54 },
+    };
+    secp256k1_keypair kps[5];
+    for (int i = 0; i < 5; i++)
+        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 1, 4);
+
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0x01, 32);
+    memset(fake_spk, 0x51, 1);
+    fake_spk[1] = 0x20;
+    memset(fake_spk + 2, 0xAA, 32);
+    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
+    factory_set_lifecycle(&f, 100, 20, 10);
+    f.cltv_timeout = 135;
+
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    /* Advance counter to max for signing */
+    for (uint32_t i = 0; i < f.counter.total_states - 1; i++)
+        dw_counter_advance(&f.counter);
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Build distribution TX with equal split */
+    tx_output_t outputs[5];
+    uint64_t per = 100000 / 5;
+    for (int i = 0; i < 5; i++) {
+        outputs[i].amount_sats = per;
+        memcpy(outputs[i].script_pubkey, fake_spk, 34);
+        outputs[i].script_pubkey_len = 34;
+    }
+
+    tx_buf_t dist_tx;
+    tx_buf_init(&dist_tx, 512);
+    unsigned char dist_txid[32];
+    int ok = factory_build_distribution_tx(&f, &dist_tx, dist_txid,
+                                             outputs, 5, f.cltv_timeout);
+    TEST_ASSERT(ok, "distribution TX built");
+    TEST_ASSERT(dist_tx.len > 0, "distribution TX non-empty");
+
+    /* Verify total output amounts sum to 100000 */
+    uint64_t total = 0;
+    for (int i = 0; i < 5; i++)
+        total += outputs[i].amount_sats;
+    TEST_ASSERT_EQ(total, 100000, "outputs sum to funding amount");
+
+    tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: PTLC key turnover extract + ladder close */
+int test_turnover_extract_and_close(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    static const unsigned char seckeys[5][32] = {
+        { [0 ... 31] = 0x10 },
+        { [0 ... 31] = 0x21 },
+        { [0 ... 31] = 0x32 },
+        { [0 ... 31] = 0x43 },
+        { [0 ... 31] = 0x54 },
+    };
+    secp256k1_keypair kps[5];
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_keypair_create(ctx, &kps[i], seckeys[i]);
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+    }
+
+    /* Create ladder with one factory */
+    ladder_t lad;
+    ladder_init(&lad, ctx, &kps[0], 20, 10);
+    lad.current_block = 100;
+
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0x01, 32);
+    memset(fake_spk, 0x51, 1);
+    fake_spk[1] = 0x20;
+    memset(fake_spk + 2, 0xAA, 32);
+
+    TEST_ASSERT(ladder_create_factory(&lad, &kps[1], 4, 100000,
+                                        fake_txid, 0, fake_spk, 34),
+                "ladder_create_factory");
+
+    /* Build keyagg and message for turnover */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    unsigned char msg[32];
+    memset(msg, 0xAA, 32);
+
+    /* Do turnover for all 4 clients */
+    for (int ci = 0; ci < 4; ci++) {
+        uint32_t pidx = (uint32_t)(ci + 1);
+
+        unsigned char presig[64];
+        int nonce_parity;
+        musig_keyagg_t ka_copy = ka;
+        TEST_ASSERT(adaptor_create_turnover_presig(ctx, presig, &nonce_parity,
+                                                     msg, kps, 5, &ka_copy,
+                                                     NULL, &pks[pidx]),
+                    "presig");
+
+        unsigned char client_sec[32];
+        secp256k1_keypair_sec(ctx, client_sec, &kps[pidx]);
+
+        unsigned char adapted[64];
+        TEST_ASSERT(adaptor_adapt(ctx, adapted, presig, client_sec, nonce_parity),
+                    "adapt");
+
+        unsigned char extracted[32];
+        TEST_ASSERT(adaptor_extract_secret(ctx, extracted, adapted, presig,
+                                             nonce_parity),
+                    "extract");
+
+        TEST_ASSERT(adaptor_verify_extracted_key(ctx, extracted, &pks[pidx]),
+                    "verify");
+
+        TEST_ASSERT(ladder_record_key_turnover(&lad, 0, pidx, extracted),
+                    "record");
+
+        memset(client_sec, 0, 32);
+    }
+
+    /* Verify can close */
+    TEST_ASSERT(ladder_can_close(&lad, 0), "can_close");
+
+    /* Build close */
+    tx_output_t outputs[5];
+    uint64_t per = 100000 / 5;
+    unsigned char out_spk[34];
+    memset(out_spk, 0x51, 1);
+    out_spk[1] = 0x20;
+    memset(out_spk + 2, 0xBB, 32);
+    for (int i = 0; i < 5; i++) {
+        outputs[i].amount_sats = per;
+        memcpy(outputs[i].script_pubkey, out_spk, 34);
+        outputs[i].script_pubkey_len = 34;
+    }
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(ladder_build_close(&lad, 0, &close_tx, outputs, 5),
+                "ladder_build_close");
+    TEST_ASSERT(close_tx.len > 0, "close TX non-empty");
+
+    tx_buf_free(&close_tx);
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

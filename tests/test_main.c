@@ -257,6 +257,11 @@ extern int test_factory_lifecycle_daemon_check(void);
 extern int test_breach_detect_old_commitment(void);
 extern int test_dw_counter_tracks_advance(void);
 
+/* Tier 2: Daemon Feature Wiring */
+extern int test_ladder_daemon_integration(void);
+extern int test_distribution_tx_amounts(void);
+extern int test_turnover_extract_and_close(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -469,6 +474,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_lifecycle_daemon_check);
     RUN_TEST(test_breach_detect_old_commitment);
     RUN_TEST(test_dw_counter_tracks_advance);
+
+    printf("\n=== Daemon Feature Wiring (Tier 2) ===\n");
+    RUN_TEST(test_ladder_daemon_integration);
+    RUN_TEST(test_distribution_tx_amounts);
+    RUN_TEST(test_turnover_extract_and_close);
 }
 
 static void run_regtest_tests(void) {
@@ -513,8 +523,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-23 + Tier 1)\n");
-    printf("=============================================\n");
+    printf("SuperScalar Test Suite (Phase 1-23 + Tier 1-2)\n");
+    printf("===============================================\n");
 
     if (run_unit) run_unit_tests();
     if (run_regtest) run_regtest_tests();

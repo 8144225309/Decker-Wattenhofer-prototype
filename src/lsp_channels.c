@@ -1,6 +1,8 @@
 #include "superscalar/lsp_channels.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
+#include "superscalar/ladder.h"
+#include "superscalar/regtest.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -1279,6 +1281,56 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                             (uint32_t)height));
                     else if (fstate == FACTORY_EXPIRED)
                         printf("LSP: factory EXPIRED at height %d\n", height);
+
+                    /* Ladder state tracking (Tier 2) */
+                    if (mgr->ladder) {
+                        ladder_t *lad = (ladder_t *)mgr->ladder;
+                        factory_state_t old_st = lad->n_factories > 0 ?
+                            lad->factories[0].cached_state : FACTORY_ACTIVE;
+                        ladder_advance_block(lad, (uint32_t)height);
+                        if (lad->n_factories > 0 &&
+                            lad->factories[0].cached_state != old_st) {
+                            const char *st_names[] = {
+                                "ACTIVE", "DYING", "EXPIRED" };
+                            int si = (int)lad->factories[0].cached_state;
+                            const char *st_str = (si >= 0 && si <= 2) ?
+                                st_names[si] : "UNKNOWN";
+                            printf("LSP: ladder factory 0 -> %s at height %d\n",
+                                   st_str, height);
+                            if (mgr->persist) {
+                                const char *ps[] = {
+                                    "active", "dying", "expired" };
+                                persist_save_ladder_factory(
+                                    (persist_t *)mgr->persist,
+                                    0, (si >= 0 && si <= 2) ? ps[si] : "unknown",
+                                    lad->factories[0].is_funded,
+                                    lad->factories[0].is_initialized,
+                                    lad->factories[0].n_departed,
+                                    lad->factories[0].factory.created_block,
+                                    lad->factories[0].factory.active_blocks,
+                                    lad->factories[0].factory.dying_blocks);
+                            }
+                            /* Auto-broadcast distribution TX on EXPIRED */
+                            ladder_factory_t *lf = &lad->factories[0];
+                            if (lf->cached_state == FACTORY_EXPIRED &&
+                                lf->distribution_tx.len > 0 &&
+                                mgr->watchtower && mgr->watchtower->rt) {
+                                char *dhex = malloc(lf->distribution_tx.len * 2 + 1);
+                                if (dhex) {
+                                    extern void hex_encode(const unsigned char *,
+                                                           size_t, char *);
+                                    hex_encode(lf->distribution_tx.data,
+                                               lf->distribution_tx.len, dhex);
+                                    char dtxid[65];
+                                    if (regtest_send_raw_tx(mgr->watchtower->rt,
+                                                             dhex, dtxid))
+                                        printf("LSP: distribution TX broadcast: %s\n",
+                                               dtxid);
+                                    free(dhex);
+                                }
+                            }
+                        }
+                    }
                 }
             }
             continue;
