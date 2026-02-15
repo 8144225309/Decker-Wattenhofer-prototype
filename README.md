@@ -29,7 +29,7 @@ System dependency:
 
 ## Test
 
-137 tests (118 unit + 19 regtest integration).
+143 tests (124 unit + 19 regtest integration).
 
 ```bash
 # unit tests (no bitcoind needed)
@@ -63,7 +63,7 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 | `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close, watchtower |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
 | `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
-| `persist` | persist.c | SQLite3 persistence: 10 tables (factories, channels, HTLCs, revocations, nonce pools, old commitments, wire messages, tree nodes, ladder factories) |
+| `persist` | persist.c | SQLite3 persistence: 16 tables (factories, channels, HTLCs, revocations, nonce pools, old commitments, wire messages, tree nodes, ladder factories, dw counter, departed clients, invoices, HTLC origins, client invoices, id counters) |
 | `bridge` | bridge.c | CLN bridge daemon for Lightning Network connectivity |
 | `fee` | fee.c | Configurable fee estimation: penalty, HTLC, and factory tx fee computation |
 | `watchtower` | watchtower.c | Breach detection: monitors chain for revoked commitments, builds and broadcasts penalty txs |
@@ -245,7 +245,7 @@ Monitors the blockchain for revoked commitment transactions:
 - Nonce pool management for distributed 2-of-2 signing
 
 ### Phase 13: Persistence (SQLite)
-- 10 database tables: factories, factory_participants, channels, revocation_secrets, htlcs, nonce_pools, old_commitments, wire_messages, tree_nodes, ladder_factories
+- 16 database tables: factories, factory_participants, channels, revocation_secrets, htlcs, nonce_pools, old_commitments, wire_messages, tree_nodes, ladder_factories, dw_counter_state, departed_clients, invoice_registry, htlc_origins, client_invoices, id_counters
 - `--db PATH` flag on both LSP and client binaries
 - Full state round-trip: save and reload factory, channel, HTLC, and nonce pool state
 
@@ -313,6 +313,14 @@ Monitors the blockchain for revoked commitment transactions:
 - **Dashboard tree visualization**: interactive factory tree node layout + detail table
 - **Dashboard ladder section**: factory lifecycle progress bars (ACTIVE → DYING → EXPIRED)
 - 137/137 tests pass (118 unit + 19 regtest)
+
+### Phase 23: Persistence Hardening
+- **6 new SQLite tables**: dw_counter_state, departed_clients, invoice_registry, htlc_origins, client_invoices, id_counters
+- **14 new persist functions**: save/load/deactivate for DW counter epochs, departed client keys, invoice registry, HTLC origin tracking, client invoices, ID counters
+- **LSP wiring**: persist invoice registration, HTLC origin tracking, fulfillment deactivation, DW counter save on factory creation, startup reload from DB
+- **Client wiring**: persist client invoices on creation, deactivate on preimage consumption, reload on daemon startup
+- **Dashboard**: 6 new queries, demo data, and display sections for all new tables
+- 143/143 tests pass (124 unit + 19 regtest)
 
 ## License
 
