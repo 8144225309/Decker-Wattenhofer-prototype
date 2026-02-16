@@ -327,7 +327,7 @@ void channel_set_remote_basepoints(channel_t *ch,
 /* ---- Random basepoint generation ---- */
 
 #ifndef BASEPOINT_DIAG
-#define BASEPOINT_DIAG 1
+#define BASEPOINT_DIAG 0
 #endif
 
 int channel_generate_random_basepoints(channel_t *ch) {

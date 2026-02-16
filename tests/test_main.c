@@ -565,8 +565,8 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--all") == 0) { run_unit = 1; run_regtest = 1; }
     }
 
-    printf("SuperScalar Test Suite (Phase 1-23 + Tier 1-3)\n");
-    printf("===============================================\n");
+    printf("SuperScalar Test Suite\n");
+    printf("======================\n");
 
     if (run_unit) run_unit_tests();
     if (run_regtest) run_regtest_tests();

@@ -6,7 +6,7 @@
 #include <time.h>
 
 #ifndef BASEPOINT_DIAG
-#define BASEPOINT_DIAG 1
+#define BASEPOINT_DIAG 0
 #endif
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);

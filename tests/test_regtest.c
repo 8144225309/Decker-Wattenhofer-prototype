@@ -274,20 +274,331 @@ int test_regtest_basic_dw(void) {
     return 1;
 }
 
-/* Broadcast oldest state first, then newest. Newest should win. */
+/* Broadcast oldest state first — it confirms. Then try newest — double-spend.
+   Demonstrates DW invariant: old states have higher nSequence (longer delays). */
 int test_regtest_old_first_attack(void) {
-    printf("  TODO: requires basic DW to work first\n");
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_old_first");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair kps[2];
+    musig_keyagg_t keyagg;
+    char factory_addr[128];
+    char funding_txid[65];
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
+                "factory setup");
+
+    uint64_t fund_amount;
+    unsigned char fund_spk[34];
+    size_t fund_spk_len;
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    int found_vout = -1;
+    for (int v = 0; v < 2; v++) {
+        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
+                                   &fund_amount, fund_spk, &fund_spk_len)) {
+            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
+                found_vout = v;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find factory vout");
+
+    /* DW layer: step=1, max_states=4 */
+    dw_layer_t layer;
+    dw_layer_init(&layer, 1, 4);
+
+    /* Epoch 0 (oldest): nSeq = 1*(4-1-0) = 3 */
+    uint32_t old_nseq = dw_current_nsequence(&layer);
+
+    /* Advance to epoch 3 (newest): nSeq = 1*(4-1-3) = 0 */
+    dw_advance(&layer); dw_advance(&layer); dw_advance(&layer);
+    uint32_t new_nseq = dw_current_nsequence(&layer);
+
+    printf("  Old nSeq=%u, New nSeq=%u\n", old_nseq, new_nseq);
+    TEST_ASSERT(old_nseq > new_nseq, "old state has higher nSequence");
+
+    unsigned char out_seckey[32];
+    memset(out_seckey, 0x30, 32);
+    secp256k1_keypair out_kp;
+    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    secp256k1_xonly_pubkey out_xpk;
+    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+
+    uint64_t output_amount = fund_amount - 1000;
+
+    /* Mine enough blocks for old state's relative timelock */
+    regtest_mine_blocks(&rt, (int)old_nseq, mine_addr);
+
+    /* Broadcast OLD state tx (high nSequence) */
+    char old_txid[65];
+    int old_sent = build_and_broadcast_state_tx(
+        &rt, ctx, kps, &keyagg,
+        fund_txid_bytes, (uint32_t)found_vout,
+        fund_amount, fund_spk, fund_spk_len,
+        old_nseq, &out_xpk, output_amount, old_txid);
+    TEST_ASSERT(old_sent, "broadcast old state tx");
+    printf("  Old state tx in mempool: %s\n", old_txid);
+
+    /* Mine 1 block to confirm */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int old_conf = regtest_get_confirmations(&rt, old_txid);
+    TEST_ASSERT(old_conf > 0, "old state tx confirmed");
+
+    /* Try NEW state tx (low nSequence) — funding already spent */
+    char new_txid[65];
+    int new_sent = build_and_broadcast_state_tx(
+        &rt, ctx, kps, &keyagg,
+        fund_txid_bytes, (uint32_t)found_vout,
+        fund_amount, fund_spk, fund_spk_len,
+        new_nseq, &out_xpk, output_amount, new_txid);
+    TEST_ASSERT(!new_sent, "new state tx rejected (double-spend)");
+    printf("  New state tx correctly rejected (funding UTXO already spent)\n");
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 
-/* MuSig2 on-chain: covered by basic_dw test. */
+/* MuSig2 on-chain via split-round protocol (not the all-local convenience). */
 int test_regtest_musig_onchain(void) {
-    printf("  Covered by basic_dw test\n");
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_musig_oc");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair kps[2];
+    musig_keyagg_t keyagg;
+    char factory_addr[128];
+    char funding_txid[65];
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
+                "factory setup");
+
+    uint64_t fund_amount;
+    unsigned char fund_spk[34];
+    size_t fund_spk_len;
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    int found_vout = -1;
+    for (int v = 0; v < 2; v++) {
+        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
+                                   &fund_amount, fund_spk, &fund_spk_len)) {
+            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
+                found_vout = v;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find factory vout");
+
+    /* Build unsigned spending tx (nSequence=0) */
+    unsigned char out_seckey[32];
+    memset(out_seckey, 0x30, 32);
+    secp256k1_keypair out_kp;
+    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    secp256k1_xonly_pubkey out_xpk;
+    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+
+    tx_output_t output;
+    output.amount_sats = fund_amount - 1000;
+    build_p2tr_script_pubkey(output.script_pubkey, &out_xpk);
+    output.script_pubkey_len = 34;
+
+    tx_buf_t unsigned_buf;
+    tx_buf_init(&unsigned_buf, 256);
+
+    TEST_ASSERT(build_unsigned_tx(&unsigned_buf, NULL,
+                                   fund_txid_bytes, (uint32_t)found_vout,
+                                   0, &output, 1), "build unsigned tx");
+
+    unsigned char sighash[32];
+    TEST_ASSERT(compute_taproot_sighash(sighash, unsigned_buf.data, unsigned_buf.len,
+                                         0, fund_spk, fund_spk_len, fund_amount, 0),
+                "compute sighash");
+
+    /* --- Split-round MuSig2 --- */
+
+    /* Round 1: each signer generates a nonce */
+    secp256k1_pubkey pubkeys[2];
+    secp256k1_keypair_pub(ctx, &pubkeys[0], &kps[0]);
+    secp256k1_keypair_pub(ctx, &pubkeys[1], &kps[1]);
+
+    secp256k1_musig_secnonce secnonces[2];
+    secp256k1_musig_pubnonce pubnonces[2];
+
+    TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[0], &pubnonces[0],
+                                      lsp_seckey, &pubkeys[0], &keyagg.cache),
+                "nonce gen signer 0");
+    TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[1], &pubnonces[1],
+                                      client_seckey, &pubkeys[1], &keyagg.cache),
+                "nonce gen signer 1");
+
+    /* Round 1 finalize: collect pubnonces, apply taproot tweak */
+    musig_signing_session_t session;
+    musig_session_init(&session, &keyagg, 2);
+    TEST_ASSERT(musig_session_set_pubnonce(&session, 0, &pubnonces[0]),
+                "set pubnonce 0");
+    TEST_ASSERT(musig_session_set_pubnonce(&session, 1, &pubnonces[1]),
+                "set pubnonce 1");
+    TEST_ASSERT(musig_session_finalize_nonces(ctx, &session, sighash, NULL, NULL),
+                "finalize nonces");
+
+    /* Round 2: each signer creates + verifies partial sig */
+    secp256k1_musig_partial_sig psigs[2];
+    TEST_ASSERT(musig_create_partial_sig(ctx, &psigs[0], &secnonces[0], &kps[0], &session),
+                "partial sig 0");
+    TEST_ASSERT(musig_create_partial_sig(ctx, &psigs[1], &secnonces[1], &kps[1], &session),
+                "partial sig 1");
+    TEST_ASSERT(musig_verify_partial_sig(ctx, &psigs[0], &pubnonces[0], &pubkeys[0], &session),
+                "verify psig 0");
+    TEST_ASSERT(musig_verify_partial_sig(ctx, &psigs[1], &pubnonces[1], &pubkeys[1], &session),
+                "verify psig 1");
+
+    /* Aggregate into final 64-byte Schnorr sig */
+    unsigned char sig[64];
+    TEST_ASSERT(musig_aggregate_partial_sigs(ctx, sig, &session, psigs, 2),
+                "aggregate partial sigs");
+
+    /* Finalize tx and broadcast */
+    tx_buf_t signed_buf;
+    tx_buf_init(&signed_buf, 512);
+    TEST_ASSERT(finalize_signed_tx(&signed_buf, unsigned_buf.data, unsigned_buf.len, sig),
+                "finalize signed tx");
+
+    char *tx_hex = (char *)malloc(signed_buf.len * 2 + 1);
+    hex_encode(signed_buf.data, signed_buf.len, tx_hex);
+
+    char txid_out[65];
+    int sent = regtest_send_raw_tx(&rt, tx_hex, txid_out);
+    free(tx_hex);
+    tx_buf_free(&unsigned_buf);
+    tx_buf_free(&signed_buf);
+
+    TEST_ASSERT(sent, "broadcast split-round MuSig2 tx");
+    printf("  Split-round MuSig2 tx: %s\n", txid_out);
+
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, txid_out);
+    TEST_ASSERT(conf > 0, "split-round MuSig2 tx confirmed on-chain");
+    printf("  Confirmed (%d conf)\n", conf);
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }
 
-/* nSequence edge cases: nSequence = 1 (minimum relative timelock). */
+/* nSequence edge case: tx rejected before relative timelock, accepted after. */
 int test_regtest_nsequence_edge(void) {
-    printf("  TODO: nSequence edge cases\n");
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_nseq");
+
+    char mine_addr[128];
+    regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr));
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    secp256k1_keypair kps[2];
+    musig_keyagg_t keyagg;
+    char factory_addr[128];
+    char funding_txid[65];
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
+                "factory setup");
+
+    uint64_t fund_amount;
+    unsigned char fund_spk[34];
+    size_t fund_spk_len;
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    int found_vout = -1;
+    for (int v = 0; v < 2; v++) {
+        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
+                                   &fund_amount, fund_spk, &fund_spk_len)) {
+            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
+                found_vout = v;
+                break;
+            }
+        }
+    }
+    TEST_ASSERT(found_vout >= 0, "find factory vout");
+
+    /* DW layer: step=1, max_states=4, advance to state 1 */
+    dw_layer_t layer;
+    dw_layer_init(&layer, 1, 4);
+    dw_advance(&layer); /* state 1: nSeq = 1*(4-1-1) = 2 */
+    uint32_t nseq = dw_current_nsequence(&layer);
+    printf("  nSequence = %u\n", nseq);
+    TEST_ASSERT(nseq == 2, "intermediate state nSeq");
+
+    unsigned char out_seckey[32];
+    memset(out_seckey, 0x30, 32);
+    secp256k1_keypair out_kp;
+    secp256k1_keypair_create(ctx, &out_kp, out_seckey);
+    secp256k1_xonly_pubkey out_xpk;
+    secp256k1_keypair_xonly_pub(ctx, &out_xpk, NULL, &out_kp);
+
+    uint64_t output_amount = fund_amount - 1000;
+
+    /* Try broadcasting immediately — nSeq not satisfied */
+    char state_txid[65];
+    int sent = build_and_broadcast_state_tx(
+        &rt, ctx, kps, &keyagg,
+        fund_txid_bytes, (uint32_t)found_vout,
+        fund_amount, fund_spk, fund_spk_len,
+        nseq, &out_xpk, output_amount, state_txid);
+    TEST_ASSERT(!sent, "tx rejected before relative timelock met");
+    printf("  Correctly rejected (0/%u blocks)\n", nseq);
+
+    /* Mine exactly nSeq blocks to satisfy relative timelock */
+    regtest_mine_blocks(&rt, (int)nseq, mine_addr);
+
+    /* Broadcast again — should succeed now */
+    sent = build_and_broadcast_state_tx(
+        &rt, ctx, kps, &keyagg,
+        fund_txid_bytes, (uint32_t)found_vout,
+        fund_amount, fund_spk, fund_spk_len,
+        nseq, &out_xpk, output_amount, state_txid);
+    TEST_ASSERT(sent, "tx accepted after relative timelock met");
+    printf("  Accepted after %u blocks: %s\n", nseq, state_txid);
+
+    /* Mine 1 more block to confirm */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, state_txid);
+    TEST_ASSERT(conf > 0, "state tx confirmed");
+    printf("  Confirmed (%d conf)\n", conf);
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }
