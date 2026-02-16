@@ -55,7 +55,8 @@ typedef struct {
     uint32_t anchor_vout;       /* anchor output index (always 1) */
     uint64_t anchor_amount;     /* 330 sats */
     int cycles_in_mempool;      /* how many 5s cycles it's been stuck */
-    int bumped;                 /* already broadcast CPFP child */
+    int bump_count;             /* how many CPFP bumps attempted (max 3) */
+    int cycles_since_bump;      /* cycles since last bump attempt */
 } watchtower_pending_t;
 
 typedef struct {

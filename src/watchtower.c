@@ -24,9 +24,20 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     wt->fee = fee;
     wt->db = db;
 
-    /* Generate anchor keypair for CPFP fee bumping */
+    /* Load or generate anchor keypair for CPFP fee bumping.
+       If a persisted key exists, use it; otherwise generate fresh and save. */
     wt->ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    if (channel_read_random_bytes(wt->anchor_seckey, 32)) {
+    int have_anchor_key = 0;
+    if (db && db->db) {
+        have_anchor_key = persist_load_anchor_key(db, wt->anchor_seckey);
+    }
+    if (!have_anchor_key) {
+        have_anchor_key = channel_read_random_bytes(wt->anchor_seckey, 32);
+        if (have_anchor_key && db && db->db) {
+            persist_save_anchor_key(db, wt->anchor_seckey);
+        }
+    }
+    if (have_anchor_key) {
         if (secp256k1_keypair_create(wt->ctx, &wt->anchor_keypair, wt->anchor_seckey)) {
             secp256k1_keypair_xonly_pub(wt->ctx, &wt->anchor_xonly, NULL,
                                          &wt->anchor_keypair);
@@ -83,6 +94,26 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                         e->htlc_outputs, MAX_HTLCS);
                 }
             }
+        }
+
+        /* Load pending penalty entries for CPFP bump tracking */
+        char pending_txids[WATCHTOWER_MAX_PENDING][65];
+        uint32_t pending_vouts[WATCHTOWER_MAX_PENDING];
+        uint64_t pending_amounts[WATCHTOWER_MAX_PENDING];
+        int pending_cycles[WATCHTOWER_MAX_PENDING];
+        int pending_bumps[WATCHTOWER_MAX_PENDING];
+        size_t n_loaded = persist_load_pending(db, pending_txids,
+            pending_vouts, pending_amounts, pending_cycles, pending_bumps,
+            WATCHTOWER_MAX_PENDING);
+        for (size_t i = 0; i < n_loaded && wt->n_pending < WATCHTOWER_MAX_PENDING; i++) {
+            watchtower_pending_t *p = &wt->pending[wt->n_pending++];
+            strncpy(p->txid, pending_txids[i], 64);
+            p->txid[64] = '\0';
+            p->anchor_vout = pending_vouts[i];
+            p->anchor_amount = pending_amounts[i];
+            p->cycles_in_mempool = pending_cycles[i];
+            p->bump_count = pending_bumps[i];
+            p->cycles_since_bump = 0;
         }
     }
 
@@ -381,7 +412,8 @@ int watchtower_check(watchtower_t *wt) {
         }
         tx_buf_free(&penalty_tx);
 
-        /* Track in pending for CPFP bump if anchor is active */
+        /* Track in pending for CPFP bump if anchor is active.
+           NOTE: anchor_vout=1 must match channel_build_penalty_tx output order. */
         if (penalty_sent && wt->anchor_spk_len == 34 &&
             wt->n_pending < WATCHTOWER_MAX_PENDING) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
@@ -390,7 +422,12 @@ int watchtower_check(watchtower_t *wt) {
             p->anchor_vout = 1;
             p->anchor_amount = WATCHTOWER_ANCHOR_AMOUNT;
             p->cycles_in_mempool = 0;
-            p->bumped = 0;
+            p->bump_count = 0;
+            p->cycles_since_bump = 0;
+            if (wt->db && wt->db->db) {
+                persist_save_pending(wt->db, p->txid, p->anchor_vout,
+                                       p->anchor_amount, 0, 0);
+            }
         }
 
         /* Sweep HTLC outputs via penalty txs */
@@ -449,12 +486,18 @@ int watchtower_check(watchtower_t *wt) {
         int conf = regtest_get_confirmations(wt->rt, p->txid);
         if (conf > 0) {
             /* Confirmed — remove from pending (swap with last) */
+            if (wt->db && wt->db->db)
+                persist_delete_pending(wt->db, p->txid);
             wt->pending[i] = wt->pending[wt->n_pending - 1];
             wt->n_pending--;
             continue;
         }
         p->cycles_in_mempool++;
-        if (p->cycles_in_mempool >= 2 && !p->bumped) {
+        /* Bump if: stuck >= 2 cycles, under 3 bump attempts,
+           and enough cycles since last bump (first bump at cycle 2,
+           subsequent bumps every 6 cycles = ~30 seconds) */
+        if (p->cycles_in_mempool >= 2 && p->bump_count < 3 &&
+            (p->bump_count == 0 || p->cycles_since_bump >= 6)) {
             /* Stuck in mempool — attempt CPFP bump */
             tx_buf_t cpfp;
             tx_buf_init(&cpfp, 512);
@@ -465,8 +508,15 @@ int watchtower_check(watchtower_t *wt) {
                     hex_encode(cpfp.data, cpfp.len, cpfp_hex);
                     char cpfp_txid[65];
                     if (regtest_send_raw_tx(wt->rt, cpfp_hex, cpfp_txid)) {
-                        printf("  CPFP child broadcast: %s\n", cpfp_txid);
-                        p->bumped = 1;
+                        printf("  CPFP child broadcast (attempt %d): %s\n",
+                               p->bump_count + 1, cpfp_txid);
+                        p->bump_count++;
+                        p->cycles_since_bump = 0;
+                        if (wt->db && wt->db->db) {
+                            persist_save_pending(wt->db, p->txid,
+                                p->anchor_vout, p->anchor_amount,
+                                p->cycles_in_mempool, p->bump_count);
+                        }
                     } else {
                         fprintf(stderr, "  CPFP child broadcast failed\n");
                     }
@@ -475,6 +525,7 @@ int watchtower_check(watchtower_t *wt) {
             }
             tx_buf_free(&cpfp);
         }
+        p->cycles_since_bump++;
         i++;
     }
 
@@ -598,9 +649,11 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
 
     /* Decode txid hex strings to internal byte order */
     unsigned char anchor_txid[32], wallet_txid[32];
-    hex_decode(parent_txid, anchor_txid, 32);
+    if (hex_decode(parent_txid, anchor_txid, 32) != 32)
+        return 0;
     reverse_bytes(anchor_txid, 32);
-    hex_decode(wallet_txid_hex, wallet_txid, 32);
+    if (hex_decode(wallet_txid_hex, wallet_txid, 32) != 32)
+        return 0;
     reverse_bytes(wallet_txid, 32);
 
     /* Change output: wallet amount + anchor amount - fee, sent to a new wallet address */
@@ -729,16 +782,24 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     hex_decode(signed_hex, signed_bin, signed_bin_len);
     free(signed_hex);
 
-    /* Find witness section offset:
-       4 (version) + 2 (marker+flag) + 1 (vin_count=2) +
-       41*2 (inputs) + 1 (vout_count=1) + 9 + change_spk_len (output) */
-    size_t witness_offset = 4 + 2 + 1 + 41 + 41 + 1 + 9 + change_spk_len;
+    /* Find witness section offset by parsing the signed tx binary.
+       Layout: version(4) + marker(1) + flag(1) + vin_count(1) +
+       inputs(N*41) + vout_count(1) + outputs(variable).
+       Parse output lengths from the binary rather than assuming SPK sizes,
+       so this works for any change address type (P2TR, P2WPKH, etc.). */
+    size_t witness_offset = 4 + 2 + 1 + 41 * 2 + 1;  /* up to first output */
+    if (witness_offset < signed_bin_len) {
+        /* Parse each output: 8 (amount) + varint(spk_len) + spk_len */
+        uint8_t n_vout = signed_bin[4 + 2 + 1 + 41 * 2];
+        for (uint8_t v = 0; v < n_vout && witness_offset + 9 <= signed_bin_len; v++) {
+            uint8_t spk_byte = signed_bin[witness_offset + 8];
+            witness_offset += 8 + 1 + spk_byte;
+        }
+    }
 
     if (witness_offset >= signed_bin_len || signed_bin[witness_offset] != 0x00) {
         /* Unexpected format — wallet might have already filled input 0 witness,
            or layout differs. Fall back: try broadcasting as-is. */
-        hex_encode(signed_bin, signed_bin_len, (char *)malloc(signed_bin_len * 2 + 1));
-        /* Actually, just build cpfp_tx_out from signed_bin directly */
         tx_buf_reset(cpfp_tx_out);
         tx_buf_write_bytes(cpfp_tx_out, signed_bin, signed_bin_len);
         free(signed_bin);

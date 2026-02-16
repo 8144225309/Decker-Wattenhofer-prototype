@@ -256,4 +256,30 @@ int persist_save_counter(persist_t *p, const char *name, uint64_t value);
 uint64_t persist_load_counter(persist_t *p, const char *name,
                                uint64_t default_val);
 
+/* --- Watchtower anchor key persistence --- */
+
+/* Save the anchor secret key (32 bytes) to the watchtower_keys table.
+   On watchtower init, the anchor key is loaded if present; otherwise generated
+   fresh and saved. This prevents loss of unspent anchor outputs across restarts. */
+int persist_save_anchor_key(persist_t *p, const unsigned char *seckey32);
+
+/* Load the anchor secret key. Returns 1 if found, 0 if not. */
+int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out);
+
+/* --- Watchtower pending entry persistence --- */
+
+/* Save a pending penalty entry (for CPFP bump tracking across restarts). */
+int persist_save_pending(persist_t *p, const char *txid,
+                           uint32_t anchor_vout, uint64_t anchor_amount,
+                           int cycles_in_mempool, int bump_count);
+
+/* Load all pending entries. Returns count loaded. */
+size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
+                              uint32_t *vouts_out, uint64_t *amounts_out,
+                              int *cycles_out, int *bumps_out,
+                              size_t max_entries);
+
+/* Delete a pending entry by txid (e.g., after confirmation). */
+int persist_delete_pending(persist_t *p, const char *txid);
+
 #endif /* SUPERSCALAR_PERSIST_H */

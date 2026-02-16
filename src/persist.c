@@ -195,6 +195,17 @@ static const char *SCHEMA_SQL =
     "  remote_delayed_bp TEXT NOT NULL,"
     "  remote_revocation_bp TEXT NOT NULL,"
     "  remote_htlc_bp TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS watchtower_keys ("
+    "  key_name TEXT PRIMARY KEY,"
+    "  key_hex TEXT NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS watchtower_pending ("
+    "  txid TEXT PRIMARY KEY,"
+    "  anchor_vout INTEGER NOT NULL,"
+    "  anchor_amount INTEGER NOT NULL,"
+    "  cycles_in_mempool INTEGER NOT NULL DEFAULT 0,"
+    "  bump_count INTEGER NOT NULL DEFAULT 0"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -1739,4 +1750,130 @@ uint64_t persist_load_counter(persist_t *p, const char *name,
     uint64_t val = (uint64_t)sqlite3_column_int64(stmt, 0);
     sqlite3_finalize(stmt);
     return val;
+}
+
+/* --- Watchtower anchor key persistence --- */
+
+int persist_save_anchor_key(persist_t *p, const unsigned char *seckey32) {
+    if (!p || !p->db || !seckey32) return 0;
+
+    char key_hex[65];
+    hex_encode(seckey32, 32, key_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO watchtower_keys (key_name, key_hex) "
+        "VALUES ('anchor', ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, key_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_anchor_key(persist_t *p, unsigned char *seckey32_out) {
+    if (!p || !p->db || !seckey32_out) return 0;
+
+    const char *sql =
+        "SELECT key_hex FROM watchtower_keys WHERE key_name = 'anchor';";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+    int ok = 0;
+    if (hex && hex_decode(hex, seckey32_out, 32) == 32)
+        ok = 1;
+
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* --- Watchtower pending entry persistence --- */
+
+int persist_save_pending(persist_t *p, const char *txid,
+                           uint32_t anchor_vout, uint64_t anchor_amount,
+                           int cycles_in_mempool, int bump_count) {
+    if (!p || !p->db || !txid) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO watchtower_pending "
+        "(txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count) "
+        "VALUES (?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, txid, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)anchor_vout);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)anchor_amount);
+    sqlite3_bind_int(stmt, 4, cycles_in_mempool);
+    sqlite3_bind_int(stmt, 5, bump_count);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
+                              uint32_t *vouts_out, uint64_t *amounts_out,
+                              int *cycles_out, int *bumps_out,
+                              size_t max_entries) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "SELECT txid, anchor_vout, anchor_amount, cycles_in_mempool, bump_count "
+        "FROM watchtower_pending ORDER BY txid;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_entries) {
+        const char *txid = (const char *)sqlite3_column_text(stmt, 0);
+        if (txids_out && txid) {
+            strncpy(txids_out[count], txid, 64);
+            txids_out[count][64] = '\0';
+        }
+        if (vouts_out)
+            vouts_out[count] = (uint32_t)sqlite3_column_int(stmt, 1);
+        if (amounts_out)
+            amounts_out[count] = (uint64_t)sqlite3_column_int64(stmt, 2);
+        if (cycles_out)
+            cycles_out[count] = sqlite3_column_int(stmt, 3);
+        if (bumps_out)
+            bumps_out[count] = sqlite3_column_int(stmt, 4);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+int persist_delete_pending(persist_t *p, const char *txid) {
+    if (!p || !p->db || !txid) return 0;
+
+    const char *sql = "DELETE FROM watchtower_pending WHERE txid = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, txid, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
 }

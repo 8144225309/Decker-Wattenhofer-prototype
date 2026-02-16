@@ -551,7 +551,7 @@ int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
         if (spk_out && spk_len_out) {
             cJSON *spk = cJSON_GetObjectItem(utxo, "scriptPubKey");
             if (spk && cJSON_IsString(spk)) {
-                int decoded = hex_decode(spk->valuestring, spk_out, 256);
+                int decoded = hex_decode(spk->valuestring, spk_out, 64);
                 if (decoded > 0)
                     *spk_len_out = (size_t)decoded;
             }
@@ -574,6 +574,9 @@ char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
         size_t plen = strlen(unsigned_hex) + strlen(prevtxs_json) + 16;
         params = (char *)malloc(plen);
         if (!params) return NULL;
+        /* NOTE: Single-quote quoting works via popen()+sh on Unix/WSL but
+           would break on native Windows cmd.exe. Acceptable for now since
+           we only build/run via WSL. */
         snprintf(params, plen, "\"%s\" '%s'", unsigned_hex, prevtxs_json);
     } else {
         size_t plen = strlen(unsigned_hex) + 8;
@@ -592,6 +595,14 @@ char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
 
     cJSON *hex = cJSON_GetObjectItem(json, "hex");
     if (!hex || !cJSON_IsString(hex)) {
+        cJSON_Delete(json);
+        return NULL;
+    }
+
+    /* Check that signing actually completed — if the wallet can't sign
+       (wrong wallet, missing key), complete will be false */
+    cJSON *complete = cJSON_GetObjectItem(json, "complete");
+    if (!complete || !cJSON_IsTrue(complete)) {
         cJSON_Delete(json);
         return NULL;
     }

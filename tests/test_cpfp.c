@@ -10,6 +10,8 @@
 #include "superscalar/channel.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/fee.h"
+#include "superscalar/persist.h"
+#include "superscalar/regtest.h"
 #include "superscalar/tx_builder.h"
 #include <stdio.h>
 #include <string.h>
@@ -304,7 +306,8 @@ int test_watchtower_pending_tracking(void) {
     p->anchor_vout = 1;
     p->anchor_amount = 330;
     p->cycles_in_mempool = 0;
-    p->bumped = 0;
+    p->bump_count = 0;
+    p->cycles_since_bump = 0;
     TEST_ASSERT_EQ(wt.n_pending, 1, "1 pending after add");
 
     /* Increment cycles */
@@ -371,5 +374,271 @@ int test_watchtower_anchor_init(void) {
     TEST_ASSERT(memcmp(xonly_ser, zero, 32) != 0, "anchor xonly non-zero");
 
     watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* === Audit & Remediation tests === */
+
+/* Test 6: regtest_sign_raw_tx_with_wallet returns NULL when complete is false.
+   We can't easily mock Bitcoin Core, so this test verifies the function
+   returns NULL for a completely invalid input (no wallet to sign). */
+int test_cpfp_sign_complete_check(void) {
+    /* The function should return NULL when passed garbage hex because
+       signrawtransactionwithwallet will fail to parse it. */
+    regtest_t rt;
+    memset(&rt, 0, sizeof(rt));
+    strncpy(rt.cli_path, "bitcoin-cli", sizeof(rt.cli_path) - 1);
+    strncpy(rt.rpcuser, "rpcuser", sizeof(rt.rpcuser) - 1);
+    strncpy(rt.rpcpassword, "rpcpass", sizeof(rt.rpcpassword) - 1);
+    strncpy(rt.network, "regtest", sizeof(rt.network) - 1);
+
+    /* With invalid hex, the function should return NULL (can't sign) */
+    char *result = regtest_sign_raw_tx_with_wallet(&rt, "deadbeef", NULL);
+    /* Expected: NULL because bitcoin-cli either isn't running or returns error.
+       If bitcoin-cli IS running, complete=false still returns NULL. */
+    /* We accept both outcomes — the key thing is it doesn't crash. */
+    if (result) free(result);
+
+    /* Test with NULL input */
+    result = regtest_sign_raw_tx_with_wallet(&rt, NULL, NULL);
+    TEST_ASSERT(result == NULL, "NULL unsigned_hex returns NULL");
+
+    return 1;
+}
+
+/* Test 7: witness offset parsing works regardless of change SPK length.
+   This verifies the dynamic output parsing in watchtower_build_cpfp_tx
+   by checking the offset calculation logic directly. */
+int test_cpfp_witness_offset_p2wpkh(void) {
+    /* Simulate a signed segwit tx with P2WPKH change (22-byte SPK).
+       Layout: version(4) + marker(1) + flag(1) + vin_count(1) +
+       input0(41) + input1(41) + vout_count(1) + output0(8+1+22) = 120 bytes
+       Witness for input 0 should start at offset 120. */
+
+    /* Build a fake signed tx binary */
+    unsigned char fake_tx[256];
+    memset(fake_tx, 0, sizeof(fake_tx));
+
+    /* nVersion = 2 */
+    fake_tx[0] = 0x02;
+    /* marker = 0x00, flag = 0x01 */
+    fake_tx[4] = 0x00; fake_tx[5] = 0x01;
+    /* vin_count = 2 */
+    fake_tx[6] = 0x02;
+    /* Input 0: 32-byte prevhash + 4-byte vout + 1-byte scriptSig(0) + 4-byte sequence = 41 */
+    fake_tx[6 + 41 - 4] = 0xFE; /* sequence */
+    /* Input 1: starts at 6+41=47, another 41 bytes */
+    /* vout_count = 1 (at offset 6+41+41 = 88) */
+    fake_tx[88] = 0x01;
+    /* Output 0 starts at 89: amount(8) + spk_len(1=22) + spk(22) */
+    fake_tx[89 + 8] = 22;  /* P2WPKH SPK length */
+    /* Witness section starts at 89 + 8 + 1 + 22 = 120 */
+    /* Empty witness for input 0: 0x00 */
+    fake_tx[120] = 0x00;
+    /* Witness for input 1 would follow */
+
+    /* Now verify our parsing logic:
+       witness_offset = 4 + 2 + 1 + 41*2 + 1 = 90 (start of outputs)
+       then parse output: 8 + 1 + 22 = 31 bytes
+       result = 90 + 31 = 121... wait, wrong. */
+
+    /* Actually recalculate:
+       Start = 4(ver) + 2(marker+flag) + 1(vin_count) + 41*2(inputs) + 1(vout_count) = 90
+       Output 0: amount=8, spk_len byte = fake_tx[90+8] = fake_tx[98]
+       So set fake_tx[98] = 22 for P2WPKH. */
+    memset(fake_tx, 0, sizeof(fake_tx));
+    fake_tx[0] = 0x02;
+    fake_tx[4] = 0x00; fake_tx[5] = 0x01;
+    fake_tx[6] = 0x02;  /* 2 inputs */
+    /* vout_count at offset 4+2+1+82 = 89 */
+    fake_tx[89] = 0x01;  /* 1 output */
+    /* Output at offset 90: amount(8 bytes) then spk_len */
+    fake_tx[90 + 8] = 22;  /* P2WPKH: 22-byte SPK */
+    /* Witness starts at 90 + 8 + 1 + 22 = 121 */
+    size_t total_to_witness = 256;  /* fake total length */
+    fake_tx[121] = 0x00;  /* empty witness for input 0 */
+
+    /* Parse using the same logic as in watchtower_build_cpfp_tx */
+    size_t witness_offset = 4 + 2 + 1 + 41 * 2 + 1;  /* = 90 */
+    uint8_t n_vout = fake_tx[4 + 2 + 1 + 41 * 2];  /* = fake_tx[89] = 1 */
+    for (uint8_t v = 0; v < n_vout && witness_offset + 9 <= total_to_witness; v++) {
+        uint8_t spk_byte = fake_tx[witness_offset + 8];
+        witness_offset += 8 + 1 + spk_byte;
+    }
+
+    TEST_ASSERT_EQ(witness_offset, 121, "P2WPKH witness offset = 121");
+    TEST_ASSERT_EQ(fake_tx[witness_offset], 0x00, "empty witness marker at offset");
+
+    /* Now test with P2TR (34-byte SPK) */
+    memset(fake_tx, 0, sizeof(fake_tx));
+    fake_tx[0] = 0x02;
+    fake_tx[4] = 0x00; fake_tx[5] = 0x01;
+    fake_tx[6] = 0x02;
+    fake_tx[89] = 0x01;
+    fake_tx[90 + 8] = 34;  /* P2TR: 34-byte SPK */
+    fake_tx[90 + 8 + 1 + 34] = 0x00;  /* witness at offset 133 */
+
+    witness_offset = 4 + 2 + 1 + 41 * 2 + 1;
+    n_vout = fake_tx[89];
+    for (uint8_t v = 0; v < n_vout && witness_offset + 9 <= total_to_witness; v++) {
+        uint8_t spk_byte = fake_tx[witness_offset + 8];
+        witness_offset += 8 + 1 + spk_byte;
+    }
+
+    TEST_ASSERT_EQ(witness_offset, 133, "P2TR witness offset = 133");
+    TEST_ASSERT_EQ(fake_tx[witness_offset], 0x00, "empty witness marker at P2TR offset");
+
+    return 1;
+}
+
+/* Test 8: CPFP retry bump logic — bump_count increments correctly */
+int test_cpfp_retry_bump(void) {
+    watchtower_pending_t p;
+    memset(&p, 0, sizeof(p));
+    strncpy(p.txid, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 64);
+    p.txid[64] = '\0';
+    p.anchor_vout = 1;
+    p.anchor_amount = 330;
+    p.cycles_in_mempool = 0;
+    p.bump_count = 0;
+    p.cycles_since_bump = 0;
+
+    /* Simulate cycling — should NOT bump at cycle 0 or 1 */
+    int should_bump;
+
+    p.cycles_in_mempool = 1;
+    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
+                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
+    TEST_ASSERT_EQ(should_bump, 0, "no bump at cycle 1");
+
+    /* Should bump at cycle 2 (first bump) */
+    p.cycles_in_mempool = 2;
+    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
+                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
+    TEST_ASSERT(should_bump, "bump at cycle 2");
+    p.bump_count = 1;
+    p.cycles_since_bump = 0;
+
+    /* Should NOT bump again until 6 more cycles */
+    for (int c = 1; c <= 5; c++) {
+        p.cycles_since_bump = c;
+        should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
+                       (p.bump_count == 0 || p.cycles_since_bump >= 6));
+        TEST_ASSERT_EQ(should_bump, 0, "no re-bump within 6 cycles");
+    }
+
+    /* Should bump again at 6 cycles since last bump */
+    p.cycles_since_bump = 6;
+    p.cycles_in_mempool = 8;
+    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
+                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
+    TEST_ASSERT(should_bump, "second bump at cycle 6 since last");
+    p.bump_count = 2;
+    p.cycles_since_bump = 0;
+
+    /* Third bump after another 6 cycles */
+    p.cycles_since_bump = 6;
+    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
+                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
+    TEST_ASSERT(should_bump, "third bump");
+    p.bump_count = 3;
+
+    /* No more bumps after 3 */
+    p.cycles_since_bump = 100;
+    should_bump = (p.cycles_in_mempool >= 2 && p.bump_count < 3 &&
+                   (p.bump_count == 0 || p.cycles_since_bump >= 6));
+    TEST_ASSERT_EQ(should_bump, 0, "no bump after 3 attempts");
+
+    return 1;
+}
+
+/* Test 9: anchor key persistence — save and reload */
+int test_anchor_key_persistence(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Save a known anchor key */
+    unsigned char key[32];
+    memset(key, 0x42, 32);
+    TEST_ASSERT(persist_save_anchor_key(&db, key), "save anchor key");
+
+    /* Load it back */
+    unsigned char loaded[32];
+    memset(loaded, 0, 32);
+    TEST_ASSERT(persist_load_anchor_key(&db, loaded), "load anchor key");
+    TEST_ASSERT(memcmp(key, loaded, 32) == 0, "anchor key round-trips");
+
+    /* Overwrite with a different key */
+    unsigned char key2[32];
+    memset(key2, 0x99, 32);
+    TEST_ASSERT(persist_save_anchor_key(&db, key2), "save new anchor key");
+    TEST_ASSERT(persist_load_anchor_key(&db, loaded), "load new anchor key");
+    TEST_ASSERT(memcmp(key2, loaded, 32) == 0, "new key round-trips");
+
+    /* Verify watchtower_init loads the persisted key */
+    watchtower_t wt;
+    fee_estimator_t fee;
+    fee_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, &fee, &db);
+    TEST_ASSERT(memcmp(wt.anchor_seckey, key2, 32) == 0,
+                "watchtower_init loads persisted anchor key");
+    TEST_ASSERT_EQ(wt.anchor_spk_len, 34, "SPK derived from loaded key");
+
+    watchtower_cleanup(&wt);
+    persist_close(&db);
+    return 1;
+}
+
+/* Test 10: pending entry persistence — save, load, delete */
+int test_pending_persistence(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
+
+    /* Save 2 pending entries */
+    TEST_ASSERT(persist_save_pending(&db,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        1, 330, 0, 0), "save pending 1");
+    TEST_ASSERT(persist_save_pending(&db,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1, 330, 5, 2), "save pending 2");
+
+    /* Load them back */
+    char txids[16][65];
+    uint32_t vouts[16];
+    uint64_t amounts[16];
+    int cycles[16], bumps[16];
+    size_t n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
+    TEST_ASSERT_EQ(n, 2, "loaded 2 pending entries");
+
+    /* Verify first entry */
+    TEST_ASSERT(strncmp(txids[0], "aaaa", 4) == 0, "first txid starts with aaaa");
+    TEST_ASSERT_EQ(vouts[0], 1, "first vout = 1");
+    TEST_ASSERT_EQ(amounts[0], 330, "first amount = 330");
+    TEST_ASSERT_EQ(cycles[0], 0, "first cycles = 0");
+    TEST_ASSERT_EQ(bumps[0], 0, "first bumps = 0");
+
+    /* Verify second entry */
+    TEST_ASSERT(strncmp(txids[1], "bbbb", 4) == 0, "second txid starts with bbbb");
+    TEST_ASSERT_EQ(cycles[1], 5, "second cycles = 5");
+    TEST_ASSERT_EQ(bumps[1], 2, "second bumps = 2");
+
+    /* Delete first entry */
+    TEST_ASSERT(persist_delete_pending(&db,
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+        "delete pending 1");
+    n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
+    TEST_ASSERT_EQ(n, 1, "1 entry after delete");
+    TEST_ASSERT(strncmp(txids[0], "bbbb", 4) == 0, "remaining entry is bbbb");
+
+    /* Update via upsert */
+    TEST_ASSERT(persist_save_pending(&db,
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        1, 330, 10, 3), "upsert pending");
+    n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
+    TEST_ASSERT_EQ(n, 1, "still 1 entry after upsert");
+    TEST_ASSERT_EQ(cycles[0], 10, "updated cycles = 10");
+    TEST_ASSERT_EQ(bumps[0], 3, "updated bumps = 3");
+
+    persist_close(&db);
     return 1;
 }

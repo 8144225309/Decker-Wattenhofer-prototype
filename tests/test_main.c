@@ -292,6 +292,13 @@ extern int test_penalty_fee_updated(void);
 extern int test_watchtower_anchor_init(void);
 extern int test_regtest_cpfp_penalty_bump(void);
 
+/* CPFP Audit & Remediation */
+extern int test_cpfp_sign_complete_check(void);
+extern int test_cpfp_witness_offset_p2wpkh(void);
+extern int test_cpfp_retry_bump(void);
+extern int test_anchor_key_persistence(void);
+extern int test_pending_persistence(void);
+
 /* Edge Cases + Failure Modes */
 extern int test_dw_counter_single_state(void);
 extern int test_dw_delay_invariants(void);
@@ -549,6 +556,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_watchtower_pending_tracking);
     RUN_TEST(test_penalty_fee_updated);
     RUN_TEST(test_watchtower_anchor_init);
+
+    printf("\n=== CPFP Audit & Remediation ===\n");
+    RUN_TEST(test_cpfp_sign_complete_check);
+    RUN_TEST(test_cpfp_witness_offset_p2wpkh);
+    RUN_TEST(test_cpfp_retry_bump);
+    RUN_TEST(test_anchor_key_persistence);
+    RUN_TEST(test_pending_persistence);
 
     printf("\n=== Edge Cases + Failure Modes ===\n");
     RUN_TEST(test_dw_counter_single_state);
