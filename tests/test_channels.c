@@ -309,7 +309,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             printf("Client %u: SEND %llu sats to client %u\n",
                    my_index, (unsigned long long)act->amount_sats, act->dest_client);
 
-            if (!client_send_payment(fd, act->amount_sats, act->payment_hash,
+            if (!client_send_payment(fd, ch, act->amount_sats, act->payment_hash,
                                        500, act->dest_client)) {
                 fprintf(stderr, "Client %u: send_payment failed\n", my_index);
                 return 0;
@@ -337,6 +337,13 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
             if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
+                /* Update local channel state to match LSP */
+                uint64_t fulfill_htlc_id;
+                unsigned char fulfill_preimage[32];
+                if (wire_parse_update_fulfill_htlc(msg.json, &fulfill_htlc_id,
+                                                     fulfill_preimage)) {
+                    channel_fulfill_htlc(ch, fulfill_htlc_id, fulfill_preimage);
+                }
                 printf("Client %u: payment fulfilled!\n", my_index);
                 cJSON_Delete(msg.json);
             } else {
@@ -449,7 +456,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
         /* Client A (index 1): send payment to Client B (index 2, = client_idx 1) */
         printf("Client %u: sending 5000 sats to client 1\n", my_index);
 
-        if (!client_send_payment(fd, 5000, data->payment_hash, 500, 1)) {
+        if (!client_send_payment(fd, ch, 5000, data->payment_hash, 500, 1)) {
             fprintf(stderr, "Client %u: send_payment failed\n", my_index);
             return 0;
         }
@@ -475,6 +482,13 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             return 0;
         }
         if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
+            /* Update local channel state to match LSP */
+            uint64_t fulfill_htlc_id;
+            unsigned char fulfill_preimage[32];
+            if (wire_parse_update_fulfill_htlc(msg.json, &fulfill_htlc_id,
+                                                 fulfill_preimage)) {
+                channel_fulfill_htlc(ch, fulfill_htlc_id, fulfill_preimage);
+            }
             printf("Client %u: payment fulfilled!\n", my_index);
             cJSON_Delete(msg.json);
         } else {
@@ -674,7 +688,7 @@ int test_regtest_intra_factory_payment(void) {
     }
 
     char funding_txid_hex[65];
-    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.001, funding_txid_hex),
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, funding_txid_hex),
                 "fund factory");
     regtest_mine_blocks(&rt, 1, mine_addr);
 
@@ -759,11 +773,17 @@ int test_regtest_intra_factory_payment(void) {
         lsp_ok = 0;
     }
 
-    /* Initialize channel manager and send CHANNEL_READY */
+    /* Initialize channel manager, exchange basepoints, and send CHANNEL_READY */
     lsp_channel_mgr_t ch_mgr;
     if (lsp_ok) {
         if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
+            lsp_ok = 0;
+        }
+    }
+    if (lsp_ok) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+            fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_ok = 0;
         }
     }
@@ -835,8 +855,15 @@ int test_regtest_intra_factory_payment(void) {
                  -> local increased by 5000, remote decreased by 5000
                Channel B (LSP view): LSP sent 5000 to B
                  -> local decreased by 5000, remote increased by 5000 */
-            uint64_t a_orig = ch_a->funding_amount / 2;
-            uint64_t b_orig = ch_b->funding_amount / 2;
+            /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
+            uint64_t commit_fee_a = (1000 * 154 + 999) / 1000;
+            uint64_t usable_a = ch_a->funding_amount > commit_fee_a ?
+                                ch_a->funding_amount - commit_fee_a : 0;
+            uint64_t a_orig = usable_a / 2;
+            uint64_t commit_fee_b = (1000 * 154 + 999) / 1000;
+            uint64_t usable_b = ch_b->funding_amount > commit_fee_b ?
+                                ch_b->funding_amount - commit_fee_b : 0;
+            uint64_t b_orig = usable_b / 2;
 
             /* Check direction: on channel A, LSP received HTLC (local goes up) */
             if (ch_a->local_amount != a_orig + 5000) {
@@ -1033,7 +1060,7 @@ int test_regtest_multi_payment(void) {
     }
 
     char funding_txid_hex[65];
-    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.001, funding_txid_hex),
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.01, funding_txid_hex),
                 "fund factory");
     regtest_mine_blocks(&rt, 1, mine_addr);
 
@@ -1070,7 +1097,8 @@ int test_regtest_multi_payment(void) {
        Client A (0): SEND(B,2000), RECV(preimage4)
        Client B (1): RECV(preimage1), SEND(C,1500)
        Client C (2): RECV(preimage2), SEND(D,1000)
-       Client D (3): RECV(preimage3), SEND(A,500) */
+       Client D (3): RECV(preimage3), SEND(A,600)
+       (D→A changed from 500 to 600 to exceed CHANNEL_DUST_LIMIT_SATS=546) */
 
     /* Client A */
     scripted_action_t actions_a[2];
@@ -1109,7 +1137,7 @@ int test_regtest_multi_payment(void) {
     memcpy(actions_d[0].preimage, preimage3, 32);
     actions_d[1].type = ACTION_SEND;
     actions_d[1].dest_client = 0;  /* A */
-    actions_d[1].amount_sats = 500;
+    actions_d[1].amount_sats = 600;
     memcpy(actions_d[1].payment_hash, hash4, 32);
 
     multi_payment_data_t mp_data[4];
@@ -1159,11 +1187,17 @@ int test_regtest_multi_payment(void) {
         lsp_ok = 0;
     }
 
-    /* Initialize channel manager and send CHANNEL_READY */
+    /* Initialize channel manager, exchange basepoints, and send CHANNEL_READY */
     lsp_channel_mgr_t ch_mgr;
     if (lsp_ok) {
         if (!lsp_channels_init(&ch_mgr, ctx, &lsp.factory, seckeys[0], 4)) {
             fprintf(stderr, "LSP: channel init failed\n");
+            lsp_ok = 0;
+        }
+    }
+    if (lsp_ok) {
+        if (!lsp_channels_exchange_basepoints(&ch_mgr, &lsp)) {
+            fprintf(stderr, "LSP: basepoint exchange failed\n");
             lsp_ok = 0;
         }
     }
@@ -1191,23 +1225,29 @@ int test_regtest_multi_payment(void) {
         channel_t *ch_c = &ch_mgr.entries[2].channel;
         channel_t *ch_d = &ch_mgr.entries[3].channel;
 
-        uint64_t a_orig = ch_a->funding_amount / 2;
-        uint64_t b_orig = ch_b->funding_amount / 2;
-        uint64_t c_orig = ch_c->funding_amount / 2;
-        uint64_t d_orig = ch_d->funding_amount / 2;
+        /* Initial amounts match lsp_channels_init: deduct commit_fee, split */
+        uint64_t cfe = (1000 * 154 + 999) / 1000;
+        uint64_t a_orig = (ch_a->funding_amount > cfe ?
+                           ch_a->funding_amount - cfe : 0) / 2;
+        uint64_t b_orig = (ch_b->funding_amount > cfe ?
+                           ch_b->funding_amount - cfe : 0) / 2;
+        uint64_t c_orig = (ch_c->funding_amount > cfe ?
+                           ch_c->funding_amount - cfe : 0) / 2;
+        uint64_t d_orig = (ch_d->funding_amount > cfe ?
+                           ch_d->funding_amount - cfe : 0) / 2;
 
-        /* A: +2000 local (received from A), -500 local (sent to A) = net +1500 */
-        uint64_t exp_a_local = a_orig + 2000 - 500;
-        uint64_t exp_a_remote = a_orig - 2000 + 500;
+        /* A: +2000 local (received from A), -600 local (sent to A) = net +1400 */
+        uint64_t exp_a_local = a_orig + 2000 - 600;
+        uint64_t exp_a_remote = a_orig - 2000 + 600;
         /* B: -2000 local (sent to B), +1500 local (received from B) = net -500 */
         uint64_t exp_b_local = b_orig - 2000 + 1500;
         uint64_t exp_b_remote = b_orig + 2000 - 1500;
         /* C: -1500 local (sent to C), +1000 local (received from C) = net -500 */
         uint64_t exp_c_local = c_orig - 1500 + 1000;
         uint64_t exp_c_remote = c_orig + 1500 - 1000;
-        /* D: -1000 local (sent to D), +500 local (received from D) = net -500 */
-        uint64_t exp_d_local = d_orig - 1000 + 500;
-        uint64_t exp_d_remote = d_orig + 1000 - 500;
+        /* D: -1000 local (sent to D), +600 local (received from D) = net -400 */
+        uint64_t exp_d_local = d_orig - 1000 + 600;
+        uint64_t exp_d_remote = d_orig + 1000 - 600;
 
         printf("LSP: Channel A: local=%llu remote=%llu (exp %llu/%llu)\n",
                (unsigned long long)ch_a->local_amount,

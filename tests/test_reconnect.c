@@ -1203,10 +1203,6 @@ int test_watchtower_wired(void) {
     channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
     channel_set_remote_htlc_basepoint(&ch, &rhtlc);
 
-    unsigned char seed[32];
-    memset(seed, 0x50, 32);
-    channel_set_shachain_seed(&ch, seed);
-
     /* Init watchtower */
     watchtower_t wt;
     watchtower_init(&wt, 1, NULL, NULL, NULL);
@@ -1537,10 +1533,6 @@ int test_breach_detect_old_commitment(void) {
     memset(rs, 0x44, 32); secp256k1_ec_pubkey_create(ctx, &rhtlc, rs);
     channel_set_remote_basepoints(&ch, &rpay, &rdel, &rrev);
     channel_set_remote_htlc_basepoint(&ch, &rhtlc);
-
-    unsigned char seed[32];
-    memset(seed, 0x50, 32);
-    channel_set_shachain_seed(&ch, seed);
 
     /* Build commitment #0 and save its txid */
     tx_buf_t commit0_tx;

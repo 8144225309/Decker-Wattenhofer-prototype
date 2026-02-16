@@ -70,6 +70,12 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        const unsigned char *lsp_seckey32,
                        size_t n_clients);
 
+/* Exchange MSG_CHANNEL_BASEPOINTS with all clients.
+   Must be called after lsp_channels_init() and before lsp_channels_send_ready().
+   Sends LSP's basepoint pubkeys and receives client's basepoint pubkeys.
+   Returns 1 on success. */
+int lsp_channels_exchange_basepoints(lsp_channel_mgr_t *mgr, lsp_t *lsp);
+
 /* Send CHANNEL_READY to all clients. Returns 1 on success. */
 int lsp_channels_send_ready(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 

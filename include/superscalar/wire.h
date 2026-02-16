@@ -54,6 +54,9 @@
 #define MSG_PTLC_ADAPTED_SIG    0x4D  /* Client → LSP: adapted signature */
 #define MSG_PTLC_COMPLETE       0x4E  /* LSP → Client: turnover acknowledged */
 
+/* Basepoint exchange (Gap #1) */
+#define MSG_CHANNEL_BASEPOINTS  0x4F  /* Both: exchange channel basepoint pubkeys */
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
@@ -340,6 +343,31 @@ int wire_parse_ptlc_adapted_sig(const cJSON *json, unsigned char *adapted_sig64)
 
 /* LSP → Client: PTLC_COMPLETE {} */
 cJSON *wire_build_ptlc_complete(void);
+
+/* --- Basepoint exchange (Gap #1) --- */
+
+/* Both: CHANNEL_BASEPOINTS {channel_id, payment_basepoint, delayed_payment_basepoint,
+   revocation_basepoint, htlc_basepoint, first_per_commitment_point} */
+cJSON *wire_build_channel_basepoints(
+    uint32_t channel_id,
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *payment_basepoint,
+    const secp256k1_pubkey *delayed_payment_basepoint,
+    const secp256k1_pubkey *revocation_basepoint,
+    const secp256k1_pubkey *htlc_basepoint,
+    const secp256k1_pubkey *first_per_commitment_point,
+    const secp256k1_pubkey *second_per_commitment_point);
+
+int wire_parse_channel_basepoints(
+    const cJSON *json,
+    uint32_t *channel_id_out,
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *payment_bp_out,
+    secp256k1_pubkey *delayed_bp_out,
+    secp256k1_pubkey *revocation_bp_out,
+    secp256k1_pubkey *htlc_bp_out,
+    secp256k1_pubkey *first_pcp_out,
+    secp256k1_pubkey *second_pcp_out);
 
 /* --- Bundle parsing --- */
 

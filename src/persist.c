@@ -157,6 +157,18 @@ static const char *SCHEMA_SQL =
     "CREATE TABLE IF NOT EXISTS id_counters ("
     "  name TEXT PRIMARY KEY,"
     "  value INTEGER NOT NULL"
+    ");"
+    "CREATE TABLE IF NOT EXISTS local_pcs ("
+    "  channel_id INTEGER NOT NULL,"
+    "  commit_num INTEGER NOT NULL,"
+    "  secret TEXT NOT NULL,"
+    "  PRIMARY KEY (channel_id, commit_num)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS remote_pcps ("
+    "  channel_id INTEGER NOT NULL,"
+    "  commit_num INTEGER NOT NULL,"
+    "  point TEXT NOT NULL,"
+    "  PRIMARY KEY (channel_id, commit_num)"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -502,11 +514,15 @@ int persist_save_revocation(persist_t *p, uint32_t channel_id,
     return ok;
 }
 
-int persist_load_revocations(persist_t *p, uint32_t channel_id,
-                               shachain_t *chain) {
-    if (!p || !p->db || !chain) return 0;
+/* --- Revocation secrets (flat storage) --- */
 
-    shachain_init(chain);
+int persist_load_revocations_flat(persist_t *p, uint32_t channel_id,
+                                    unsigned char (*secrets_out)[32],
+                                    uint8_t *valid_out, size_t max,
+                                    size_t *count_out) {
+    if (!p || !p->db || !secrets_out || !valid_out) return 0;
+
+    memset(valid_out, 0, max);
 
     const char *sql =
         "SELECT commit_num, secret FROM revocation_secrets "
@@ -518,22 +534,135 @@ int persist_load_revocations(persist_t *p, uint32_t channel_id,
 
     sqlite3_bind_int(stmt, 1, (int)channel_id);
 
-    int count = 0;
+    size_t count = 0;
     while (sqlite3_step(stmt) == SQLITE_ROW) {
         uint64_t commit_num = (uint64_t)sqlite3_column_int64(stmt, 0);
         const char *hex = (const char *)sqlite3_column_text(stmt, 1);
-        if (!hex) continue;
+        if (!hex || commit_num >= max) continue;
 
-        unsigned char secret[32];
-        if (hex_decode(hex, secret, 32) != 32) continue;
-
-        uint64_t index = ((UINT64_C(1) << 48) - 1) - commit_num;
-        shachain_insert(chain, index, secret);
-        count++;
+        if (hex_decode(hex, secrets_out[commit_num], 32) == 32) {
+            valid_out[commit_num] = 1;
+            count++;
+        }
     }
 
     sqlite3_finalize(stmt);
+    if (count_out) *count_out = count;
     return 1;
+}
+
+/* --- Local per-commitment secrets --- */
+
+int persist_save_local_pcs(persist_t *p, uint32_t channel_id,
+                             uint64_t commit_num,
+                             const unsigned char *secret32) {
+    if (!p || !p->db || !secret32) return 0;
+
+    char secret_hex[65];
+    hex_encode(secret32, 32, secret_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO local_pcs "
+        "(channel_id, commit_num, secret) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+    sqlite3_bind_text(stmt, 3, secret_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_local_pcs(persist_t *p, uint32_t channel_id,
+                             unsigned char (*secrets_out)[32], size_t max,
+                             size_t *count_out) {
+    if (!p || !p->db || !secrets_out) return 0;
+
+    const char *sql =
+        "SELECT commit_num, secret FROM local_pcs "
+        "WHERE channel_id = ? ORDER BY commit_num ASC;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW) {
+        uint64_t commit_num = (uint64_t)sqlite3_column_int64(stmt, 0);
+        const char *hex = (const char *)sqlite3_column_text(stmt, 1);
+        if (!hex || commit_num >= max) continue;
+
+        if (hex_decode(hex, secrets_out[commit_num], 32) == 32)
+            count++;
+    }
+
+    sqlite3_finalize(stmt);
+    if (count_out) *count_out = count;
+    return 1;
+}
+
+/* --- Remote per-commitment points --- */
+
+int persist_save_remote_pcp(persist_t *p, uint32_t channel_id,
+                              uint64_t commit_num,
+                              const unsigned char *point33) {
+    if (!p || !p->db || !point33) return 0;
+
+    char point_hex[67];
+    hex_encode(point33, 33, point_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO remote_pcps "
+        "(channel_id, commit_num, point) VALUES (?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+    sqlite3_bind_text(stmt, 3, point_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_load_remote_pcp(persist_t *p, uint32_t channel_id,
+                              uint64_t commit_num,
+                              unsigned char *point33_out) {
+    if (!p || !p->db || !point33_out) return 0;
+
+    const char *sql =
+        "SELECT point FROM remote_pcps "
+        "WHERE channel_id = ? AND commit_num = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    const char *hex = (const char *)sqlite3_column_text(stmt, 0);
+    int ok = 0;
+    if (hex && hex_decode(hex, point33_out, 33) == 33)
+        ok = 1;
+
+    sqlite3_finalize(stmt);
+    return ok;
 }
 
 /* --- HTLC --- */

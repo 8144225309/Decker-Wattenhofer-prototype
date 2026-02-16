@@ -3,7 +3,6 @@
 
 #include "types.h"
 #include "musig.h"
-#include "shachain.h"
 #include "tapscript.h"
 #include "tx_builder.h"
 #include <secp256k1.h>
@@ -13,6 +12,7 @@
 #define MAX_HTLCS 16
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
+#define CHANNEL_MAX_SECRETS      256   /* max per-commitment secrets stored */
 
 typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
 typedef enum { HTLC_STATE_ACTIVE, HTLC_STATE_FULFILLED, HTLC_STATE_FAILED } htlc_state_t;
@@ -60,11 +60,21 @@ typedef struct {
     secp256k1_pubkey remote_revocation_basepoint;
     secp256k1_pubkey remote_htlc_basepoint;
 
-    /* Per-commitment state */
-    unsigned char shachain_seed[32];
-    unsigned char remote_shachain_seed[32];  /* remote party's seed (for _for_remote) */
-    shachain_t received_secrets;
     uint64_t commitment_number;
+
+    /* Per-commitment state (flat storage — random per-commitment secrets) */
+    unsigned char local_pcs[CHANNEL_MAX_SECRETS][32];
+    size_t n_local_pcs;
+
+    /* Two-slot ring buffer for remote per-commitment points.
+       Stores the two most recently received PCPs (e.g., cn=0 and cn=1 at init,
+       then cn=N and cn=N+1 after revoke_and_ack). */
+    secp256k1_pubkey remote_pcps[2];
+    uint64_t remote_pcp_nums[2];
+    uint8_t remote_pcp_valid[2];
+
+    unsigned char received_revocations[CHANNEL_MAX_SECRETS][32];
+    uint8_t received_revocation_valid[CHANNEL_MAX_SECRETS];
 
     /* Balance (satoshis) */
     uint64_t local_amount;
@@ -138,8 +148,39 @@ void channel_set_remote_basepoints(channel_t *ch,
                                      const secp256k1_pubkey *delayed_payment,
                                      const secp256k1_pubkey *revocation);
 
-void channel_set_shachain_seed(channel_t *ch, const unsigned char *seed32);
-void channel_set_remote_shachain_seed(channel_t *ch, const unsigned char *seed32);
+/* --- Per-commitment secret (flat storage) --- */
+
+/* Generate random per-commitment secret for commitment_num.
+   Increments n_local_pcs. Returns 1 on success. */
+int channel_generate_local_pcs(channel_t *ch, uint64_t commitment_num);
+
+/* Retrieve local per-commitment secret for commitment_num.
+   Returns 1 on success. */
+int channel_get_local_pcs(const channel_t *ch, uint64_t commitment_num,
+                           unsigned char *secret_out32);
+
+/* Set a specific local per-commitment secret (for tests/persistence). */
+void channel_set_local_pcs(channel_t *ch, uint64_t commitment_num,
+                            const unsigned char *secret32);
+
+/* Store remote's per-commitment point for a given commitment_num. */
+void channel_set_remote_pcp(channel_t *ch, uint64_t commitment_num,
+                             const secp256k1_pubkey *pcp);
+
+/* Get remote's per-commitment point for commitment_num.
+   For current: returns stored point.
+   For old (< remote_current_pcp_num): derives from received revocation secret.
+   Returns 1 on success. */
+int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
+                            secp256k1_pubkey *pcp_out);
+
+/* Store a received revocation secret at flat index. */
+int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
+                                      const unsigned char *secret32);
+
+/* Retrieve a received revocation secret. Returns 1 if valid. */
+int channel_get_received_revocation(const channel_t *ch, uint64_t commitment_num,
+                                      unsigned char *secret_out32);
 
 int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_num,
                                       secp256k1_pubkey *point_out);
@@ -155,7 +196,7 @@ int channel_build_commitment_tx(const channel_t *ch,
 
 /* Build the remote party's commitment tx (for distributed signing).
    Swaps local/remote basepoints, amounts, HTLC directions, and uses
-   remote_shachain_seed for the per-commitment point. */
+   the remote per-commitment point for key derivation. */
 int channel_build_commitment_tx_for_remote(const channel_t *ch,
                                              tx_buf_t *unsigned_tx_out,
                                              unsigned char *txid_out32);

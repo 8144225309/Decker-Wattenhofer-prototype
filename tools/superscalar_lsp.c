@@ -745,6 +745,13 @@ int main(int argc, char *argv[]) {
             secp256k1_context_destroy(ctx);
             return 1;
         }
+        if (!lsp_channels_exchange_basepoints(&mgr, &lsp)) {
+            fprintf(stderr, "LSP: basepoint exchange failed\n");
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
         /* Set persistence pointer (Phase 23) */
         mgr.persist = use_db ? &db : NULL;
 
@@ -1709,6 +1716,11 @@ int main(int argc, char *argv[]) {
         lsp_channel_mgr_t mgr2;
         if (!lsp_channels_init(&mgr2, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "ROTATION: channel init for Factory 1 failed\n");
+            lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx); return 1;
+        }
+        if (!lsp_channels_exchange_basepoints(&mgr2, &lsp)) {
+            fprintf(stderr, "ROTATION: basepoint exchange for Factory 1 failed\n");
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
         }

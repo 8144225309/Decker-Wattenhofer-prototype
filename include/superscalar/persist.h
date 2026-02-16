@@ -60,9 +60,36 @@ int persist_save_revocation(persist_t *p, uint32_t channel_id,
                               uint64_t commitment_number,
                               const unsigned char *secret32);
 
-/* Load all revocation secrets for a channel into a shachain. */
-int persist_load_revocations(persist_t *p, uint32_t channel_id,
-                               shachain_t *chain);
+/* Load revocation secrets into flat arrays. */
+int persist_load_revocations_flat(persist_t *p, uint32_t channel_id,
+                                    unsigned char (*secrets_out)[32],
+                                    uint8_t *valid_out, size_t max,
+                                    size_t *count_out);
+
+/* --- Local per-commitment secrets --- */
+
+/* Save a local per-commitment secret for a given channel and commitment number. */
+int persist_save_local_pcs(persist_t *p, uint32_t channel_id,
+                             uint64_t commit_num,
+                             const unsigned char *secret32);
+
+/* Load all local per-commitment secrets for a channel.
+   Stores into secrets_out[commit_num]. Returns count loaded via count_out. */
+int persist_load_local_pcs(persist_t *p, uint32_t channel_id,
+                             unsigned char (*secrets_out)[32], size_t max,
+                             size_t *count_out);
+
+/* --- Remote per-commitment points --- */
+
+/* Save a remote per-commitment point (33-byte compressed). */
+int persist_save_remote_pcp(persist_t *p, uint32_t channel_id,
+                              uint64_t commit_num,
+                              const unsigned char *point33);
+
+/* Load a remote per-commitment point. Returns 1 if found. */
+int persist_load_remote_pcp(persist_t *p, uint32_t channel_id,
+                              uint64_t commit_num,
+                              unsigned char *point33_out);
 
 /* --- HTLC persistence --- */
 

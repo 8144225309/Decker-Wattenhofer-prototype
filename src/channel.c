@@ -1,6 +1,9 @@
 #include "superscalar/channel.h"
 #include <string.h>
 #include <stdlib.h>
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 extern void sha256_tagged(const char *, const unsigned char *, size_t,
@@ -257,7 +260,10 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB */
     ch->commitment_number = 0;
 
-    shachain_init(&ch->received_secrets);
+    /* Generate random per-commitment secrets for cn=0 and cn=1.
+       cn=0 is needed for first commitment, cn=1 for first next_per_commitment_point. */
+    channel_generate_local_pcs(ch, 0);
+    channel_generate_local_pcs(ch, 1);
 
     return 1;
 }
@@ -289,20 +295,113 @@ void channel_set_remote_basepoints(channel_t *ch,
     ch->remote_revocation_basepoint = *revocation;
 }
 
-void channel_set_shachain_seed(channel_t *ch, const unsigned char *seed32) {
-    memcpy(ch->shachain_seed, seed32, 32);
+/* ---- Per-commitment secret flat storage ---- */
+
+static int read_random_bytes(unsigned char *buf, size_t len) {
+    int fd = open("/dev/urandom", O_RDONLY);
+    if (fd < 0) return 0;
+    ssize_t n = read(fd, buf, len);
+    close(fd);
+    return (n == (ssize_t)len);
 }
 
-void channel_set_remote_shachain_seed(channel_t *ch, const unsigned char *seed32) {
-    memcpy(ch->remote_shachain_seed, seed32, 32);
+int channel_generate_local_pcs(channel_t *ch, uint64_t commitment_num) {
+    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (!read_random_bytes(ch->local_pcs[commitment_num], 32))
+        return 0;
+    if (commitment_num + 1 > ch->n_local_pcs)
+        ch->n_local_pcs = (size_t)(commitment_num + 1);
+    return 1;
+}
+
+int channel_get_local_pcs(const channel_t *ch, uint64_t commitment_num,
+                           unsigned char *secret_out32) {
+    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (commitment_num >= ch->n_local_pcs) return 0;
+    memcpy(secret_out32, ch->local_pcs[commitment_num], 32);
+    return 1;
+}
+
+void channel_set_local_pcs(channel_t *ch, uint64_t commitment_num,
+                            const unsigned char *secret32) {
+    if (commitment_num >= CHANNEL_MAX_SECRETS) return;
+    memcpy(ch->local_pcs[commitment_num], secret32, 32);
+    if (commitment_num + 1 > ch->n_local_pcs)
+        ch->n_local_pcs = (size_t)(commitment_num + 1);
+}
+
+void channel_set_remote_pcp(channel_t *ch, uint64_t commitment_num,
+                             const secp256k1_pubkey *pcp) {
+    /* Check if this commitment_num already occupies a slot */
+    for (int i = 0; i < 2; i++) {
+        if (ch->remote_pcp_valid[i] && ch->remote_pcp_nums[i] == commitment_num) {
+            ch->remote_pcps[i] = *pcp;
+            return;
+        }
+    }
+    /* Find an empty slot */
+    for (int i = 0; i < 2; i++) {
+        if (!ch->remote_pcp_valid[i]) {
+            ch->remote_pcps[i] = *pcp;
+            ch->remote_pcp_nums[i] = commitment_num;
+            ch->remote_pcp_valid[i] = 1;
+            return;
+        }
+    }
+    /* Both slots occupied — evict the one with the smaller commitment_num */
+    int evict = (ch->remote_pcp_nums[0] <= ch->remote_pcp_nums[1]) ? 0 : 1;
+    ch->remote_pcps[evict] = *pcp;
+    ch->remote_pcp_nums[evict] = commitment_num;
+    ch->remote_pcp_valid[evict] = 1;
+}
+
+int channel_get_remote_pcp(const channel_t *ch, uint64_t commitment_num,
+                            secp256k1_pubkey *pcp_out) {
+    /* Check both stored slots */
+    for (int i = 0; i < 2; i++) {
+        if (ch->remote_pcp_valid[i] && ch->remote_pcp_nums[i] == commitment_num) {
+            *pcp_out = ch->remote_pcps[i];
+            return 1;
+        }
+    }
+    /* For old commitments, derive from received revocation secret */
+    uint64_t max_stored = 0;
+    for (int i = 0; i < 2; i++) {
+        if (ch->remote_pcp_valid[i] && ch->remote_pcp_nums[i] > max_stored)
+            max_stored = ch->remote_pcp_nums[i];
+    }
+    if (commitment_num < max_stored) {
+        unsigned char secret[32];
+        if (!channel_get_received_revocation(ch, commitment_num, secret))
+            return 0;
+        int ok = secp256k1_ec_pubkey_create(ch->ctx, pcp_out, secret);
+        memset(secret, 0, 32);
+        return ok;
+    }
+    return 0;
+}
+
+int channel_receive_revocation_flat(channel_t *ch, uint64_t commitment_num,
+                                      const unsigned char *secret32) {
+    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    memcpy(ch->received_revocations[commitment_num], secret32, 32);
+    ch->received_revocation_valid[commitment_num] = 1;
+    return 1;
+}
+
+int channel_get_received_revocation(const channel_t *ch, uint64_t commitment_num,
+                                      unsigned char *secret_out32) {
+    if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
+    if (!ch->received_revocation_valid[commitment_num]) return 0;
+    memcpy(secret_out32, ch->received_revocations[commitment_num], 32);
+    return 1;
 }
 
 int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_num,
                                       secp256k1_pubkey *point_out) {
-    uint64_t index = ((UINT64_C(1) << 48) - 1) - commitment_num;
     unsigned char secret[32];
-    shachain_from_seed(ch->shachain_seed, index, secret);
-
+    if (!channel_get_local_pcs(ch, commitment_num, secret))
+        return 0;
     int ok = secp256k1_ec_pubkey_create(ch->ctx, point_out, secret);
     memset(secret, 0, 32);
     return ok;
@@ -310,20 +409,24 @@ int channel_get_per_commitment_point(const channel_t *ch, uint64_t commitment_nu
 
 int channel_get_per_commitment_secret(const channel_t *ch, uint64_t commitment_num,
                                        unsigned char *secret_out32) {
-    uint64_t index = ((UINT64_C(1) << 48) - 1) - commitment_num;
-    shachain_from_seed(ch->shachain_seed, index, secret_out32);
-    return 1;
+    return channel_get_local_pcs(ch, commitment_num, secret_out32);
 }
 
 /* ---- Commitment TX ---- */
 
-int channel_build_commitment_tx(const channel_t *ch,
-                                  tx_buf_t *unsigned_tx_out,
-                                  unsigned char *txid_out32) {
+/* Internal implementation with optional pcp_override.
+   If pcp_override is non-NULL, use that PCP instead of looking up from local_pcs. */
+static int channel_build_commitment_tx_impl(const channel_t *ch,
+                                              tx_buf_t *unsigned_tx_out,
+                                              unsigned char *txid_out32,
+                                              const secp256k1_pubkey *pcp_override) {
     /* 1. Derive per_commitment_point */
     secp256k1_pubkey pcp;
-    if (!channel_get_per_commitment_point(ch, ch->commitment_number, &pcp))
+    if (pcp_override) {
+        pcp = *pcp_override;
+    } else if (!channel_get_per_commitment_point(ch, ch->commitment_number, &pcp)) {
         return 0;
+    }
 
     /* 2. Derive revocation pubkey (from remote's revocation_basepoint + our pcp) */
     secp256k1_pubkey revocation_pubkey;
@@ -470,15 +573,23 @@ int channel_build_commitment_tx(const channel_t *ch,
     return 1;
 }
 
+int channel_build_commitment_tx(const channel_t *ch,
+                                  tx_buf_t *unsigned_tx_out,
+                                  unsigned char *txid_out32) {
+    return channel_build_commitment_tx_impl(ch, unsigned_tx_out, txid_out32, NULL);
+}
+
 int channel_build_commitment_tx_for_remote(const channel_t *ch,
                                              tx_buf_t *unsigned_tx_out,
                                              unsigned char *txid_out32) {
+    /* Get the remote's per-commitment point */
+    secp256k1_pubkey remote_pcp;
+    if (!channel_get_remote_pcp(ch, ch->commitment_number, &remote_pcp))
+        return 0;
+
     /* Create a shallow copy with local/remote swapped to represent
        the remote party's view of their own commitment transaction. */
     channel_t rv = *ch;
-
-    /* Use remote's shachain seed for their per-commitment point */
-    memcpy(rv.shachain_seed, ch->remote_shachain_seed, 32);
 
     /* Swap amounts */
     rv.local_amount = ch->remote_amount;
@@ -499,7 +610,7 @@ int channel_build_commitment_tx_for_remote(const channel_t *ch,
             rv.htlcs[i].direction = HTLC_OFFERED;
     }
 
-    return channel_build_commitment_tx(&rv, unsigned_tx_out, txid_out32);
+    return channel_build_commitment_tx_impl(&rv, unsigned_tx_out, txid_out32, &remote_pcp);
 }
 
 int channel_sign_commitment(const channel_t *ch,
@@ -546,8 +657,7 @@ int channel_get_revocation_secret(const channel_t *ch, uint64_t old_commitment_n
 
 int channel_receive_revocation(channel_t *ch, uint64_t commitment_num,
                                  const unsigned char *secret32) {
-    uint64_t index = ((UINT64_C(1) << 48) - 1) - commitment_num;
-    return shachain_insert(&ch->received_secrets, index, secret32);
+    return channel_receive_revocation_flat(ch, commitment_num, secret32);
 }
 
 int channel_build_penalty_tx(const channel_t *ch,
@@ -558,10 +668,9 @@ int channel_build_penalty_tx(const channel_t *ch,
                                const unsigned char *to_local_spk,
                                size_t to_local_spk_len,
                                uint64_t old_commitment_num) {
-    /* 1. Retrieve per_commitment_secret from received_secrets */
-    uint64_t index = ((UINT64_C(1) << 48) - 1) - old_commitment_num;
+    /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
-    if (!shachain_derive(&ch->received_secrets, index, pcp_secret))
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
         return 0;
 
     /* 2. Compute per_commitment_point from secret */
@@ -931,6 +1040,7 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
         *htlc_id_out = h->id;
 
     ch->commitment_number++;
+    channel_generate_local_pcs(ch, ch->commitment_number + 1);
     return 1;
 }
 
@@ -964,6 +1074,7 @@ int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
     memcpy(h->payment_preimage, preimage32, 32);
     h->state = HTLC_STATE_FULFILLED;
     ch->commitment_number++;
+    channel_generate_local_pcs(ch, ch->commitment_number + 1);
     return 1;
 }
 
@@ -987,6 +1098,7 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
 
     h->state = HTLC_STATE_FAILED;
     ch->commitment_number++;
+    channel_generate_local_pcs(ch, ch->commitment_number + 1);
     return 1;
 }
 
@@ -1083,6 +1195,7 @@ int channel_update(channel_t *ch, int64_t delta_sats) {
     ch->local_amount = (uint64_t)((int64_t)ch->local_amount - delta_sats);
     ch->remote_amount = (uint64_t)((int64_t)ch->remote_amount + delta_sats);
     ch->commitment_number++;
+    channel_generate_local_pcs(ch, ch->commitment_number + 1);
     return 1;
 }
 
@@ -1423,10 +1536,9 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
     uint64_t old_commitment_num, size_t htlc_index)
 {
-    /* 1. Retrieve per_commitment_secret from received_secrets */
-    uint64_t index = ((UINT64_C(1) << 48) - 1) - old_commitment_num;
+    /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
-    if (!shachain_derive(&ch->received_secrets, index, pcp_secret))
+    if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
         return 0;
 
     /* 2. Compute per_commitment_point from secret */

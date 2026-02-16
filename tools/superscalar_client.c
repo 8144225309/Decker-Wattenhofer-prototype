@@ -62,7 +62,7 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             printf("Client %u: SEND %llu sats to client %u\n",
                    my_index, (unsigned long long)act->amount_sats, act->dest_client);
 
-            if (!client_send_payment(fd, act->amount_sats, act->payment_hash,
+            if (!client_send_payment(fd, ch, act->amount_sats, act->payment_hash,
                                        500, act->dest_client)) {
                 fprintf(stderr, "Client %u: send_payment failed\n", my_index);
                 return 0;
@@ -90,6 +90,13 @@ static int standalone_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                 return 0;
             }
             if (msg.msg_type == MSG_UPDATE_FULFILL_HTLC) {
+                /* Update local channel state to match LSP */
+                uint64_t fulfill_htlc_id;
+                unsigned char fulfill_preimage[32];
+                if (wire_parse_update_fulfill_htlc(msg.json, &fulfill_htlc_id,
+                                                     fulfill_preimage)) {
+                    channel_fulfill_htlc(ch, fulfill_htlc_id, fulfill_preimage);
+                }
                 printf("Client %u: payment fulfilled!\n", my_index);
                 cJSON_Delete(msg.json);
             } else {

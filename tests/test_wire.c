@@ -1,6 +1,7 @@
 #include "superscalar/factory.h"
 #include "superscalar/wire.h"
 #include "superscalar/lsp.h"
+#include "superscalar/lsp_channels.h"
 #include "superscalar/client.h"
 #include "superscalar/musig.h"
 #include "superscalar/regtest.h"
@@ -476,6 +477,128 @@ int test_wire_distributed_signing(void) {
     for (int p = 0; p < 5; p++)
         factory_free(&factories[p]);
     factory_free(&f_ref);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test: MSG_CHANNEL_BASEPOINTS wire round-trip ---- */
+
+int test_wire_channel_basepoints_round_trip(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Create 5 known pubkeys (payment, delayed, revocation, htlc, first_pcp) */
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        unsigned char sec[32];
+        memset(sec, 0x30 + i, 32);
+        TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &pks[i], sec),
+                    "create pubkey");
+    }
+
+    /* Generate a 6th pubkey for second_per_commitment_point */
+    {
+        unsigned char sec6[32] = { [0 ... 31] = 0x77 };
+        secp256k1_pubkey pk6;
+        secp256k1_ec_pubkey_create(ctx, &pk6, sec6);
+
+        /* Build message */
+        cJSON *j = wire_build_channel_basepoints(
+            42, ctx, &pks[0], &pks[1], &pks[2], &pks[3], &pks[4], &pk6);
+        TEST_ASSERT(j != NULL, "build_channel_basepoints");
+
+        /* Parse back */
+        uint32_t ch_id;
+        secp256k1_pubkey out[6];
+        TEST_ASSERT(wire_parse_channel_basepoints(j, &ch_id, ctx,
+                        &out[0], &out[1], &out[2], &out[3], &out[4], &out[5]),
+                    "parse_channel_basepoints");
+        cJSON_Delete(j);
+
+        TEST_ASSERT_EQ(ch_id, 42, "channel_id round-trip");
+
+        /* Verify all 6 pubkeys match */
+        secp256k1_pubkey expected[6];
+        for (int i = 0; i < 5; i++) expected[i] = pks[i];
+        expected[5] = pk6;
+        for (int i = 0; i < 6; i++) {
+            unsigned char ser1[33], ser2[33];
+            size_t l1 = 33, l2 = 33;
+            secp256k1_ec_pubkey_serialize(ctx, ser1, &l1, &expected[i],
+                                           SECP256K1_EC_COMPRESSED);
+            secp256k1_ec_pubkey_serialize(ctx, ser2, &l2, &out[i],
+                                           SECP256K1_EC_COMPRESSED);
+            TEST_ASSERT(memcmp(ser1, ser2, 33) == 0, "pubkey round-trip mismatch");
+        }
+    }
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Test: Basepoint independence after lsp_channels_init ---- */
+
+int test_basepoint_independence(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Create pubkeys */
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++) {
+        secp256k1_ec_pubkey_create(ctx, &pks[i], seckeys[i]);
+    }
+
+    /* Build a factory for testing */
+    factory_t f;
+    factory_init_from_pubkeys(&f, ctx, pks, 5, 10, 4);
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xDD, 32);
+
+    /* Create proper funding SPK */
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+    secp256k1_xonly_pubkey xonly;
+    xonly = ka.agg_pubkey;
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &xonly);
+    factory_set_funding(&f, fake_txid, 0, 1000000, fund_spk, 34);
+    factory_build_tree(&f);
+
+    /* Init LSP channel manager */
+    lsp_channel_mgr_t mgr;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, seckeys[0], 4),
+                "lsp_channels_init");
+
+    /* Verify remote basepoints are ZEROED (not populated by init) */
+    for (size_t c = 0; c < 4; c++) {
+        lsp_channel_entry_t *entry = &mgr.entries[c];
+        unsigned char ser[33];
+        size_t len = 33;
+        /* A zeroed secp256k1_pubkey won't serialize successfully,
+           so we check if the raw bytes are zero */
+        unsigned char zero[sizeof(secp256k1_pubkey)];
+        memset(zero, 0, sizeof(zero));
+        TEST_ASSERT(memcmp(&entry->channel.remote_payment_basepoint,
+                           zero, sizeof(secp256k1_pubkey)) == 0,
+                    "remote_payment_basepoint should be zeroed");
+        TEST_ASSERT(memcmp(&entry->channel.remote_delayed_payment_basepoint,
+                           zero, sizeof(secp256k1_pubkey)) == 0,
+                    "remote_delayed_payment_basepoint should be zeroed");
+        TEST_ASSERT(memcmp(&entry->channel.remote_revocation_basepoint,
+                           zero, sizeof(secp256k1_pubkey)) == 0,
+                    "remote_revocation_basepoint should be zeroed");
+    }
+
+    /* Verify local basepoints ARE populated */
+    for (size_t c = 0; c < 4; c++) {
+        unsigned char zero[sizeof(secp256k1_pubkey)];
+        memset(zero, 0, sizeof(zero));
+        TEST_ASSERT(memcmp(&mgr.entries[c].channel.local_payment_basepoint,
+                           zero, sizeof(secp256k1_pubkey)) != 0,
+                    "local_payment_basepoint should be populated");
+    }
+
+    factory_free(&f);
     secp256k1_context_destroy(ctx);
     return 1;
 }

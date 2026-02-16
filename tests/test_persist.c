@@ -103,41 +103,37 @@ int test_persist_channel_round_trip(void) {
     return 1;
 }
 
-/* ---- Test 3: Revocation secret save/load ---- */
+/* ---- Test 3: Revocation secret save/load (flat storage) ---- */
 
 int test_persist_revocation_round_trip(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, NULL), "open");
 
-    /* Generate proper shachain secrets from a seed */
-    unsigned char seed[32];
-    memset(seed, 0x42, 32);
-
+    /* Generate 3 revocation secrets */
     unsigned char sec0[32], sec1[32], sec2[32];
-    uint64_t idx0 = ((UINT64_C(1) << 48) - 1) - 0;
-    uint64_t idx1 = ((UINT64_C(1) << 48) - 1) - 1;
-    uint64_t idx2 = ((UINT64_C(1) << 48) - 1) - 2;
-
-    shachain_from_seed(seed, idx0, sec0);
-    shachain_from_seed(seed, idx1, sec1);
-    shachain_from_seed(seed, idx2, sec2);
+    memset(sec0, 0x42, 32);
+    memset(sec1, 0x43, 32);
+    memset(sec2, 0x44, 32);
 
     TEST_ASSERT(persist_save_revocation(&db, 0, 0, sec0), "save rev 0");
     TEST_ASSERT(persist_save_revocation(&db, 0, 1, sec1), "save rev 1");
     TEST_ASSERT(persist_save_revocation(&db, 0, 2, sec2), "save rev 2");
 
-    /* Load into shachain */
-    shachain_t chain;
-    TEST_ASSERT(persist_load_revocations(&db, 0, &chain), "load revocations");
+    /* Load into flat arrays */
+    unsigned char secrets[256][32];
+    uint8_t valid[256];
+    size_t count = 0;
+    TEST_ASSERT(persist_load_revocations_flat(&db, 0, secrets, valid, 256, &count),
+                "load revocations flat");
+    TEST_ASSERT(count == 3, "loaded 3 secrets");
 
-    /* Verify we can derive the secrets back */
-    unsigned char derived[32];
-    TEST_ASSERT(shachain_derive(&chain, idx0, derived), "derive 0");
-    TEST_ASSERT(memcmp(derived, sec0, 32) == 0, "secret 0 matches");
-    TEST_ASSERT(shachain_derive(&chain, idx1, derived), "derive 1");
-    TEST_ASSERT(memcmp(derived, sec1, 32) == 0, "secret 1 matches");
-    TEST_ASSERT(shachain_derive(&chain, idx2, derived), "derive 2");
-    TEST_ASSERT(memcmp(derived, sec2, 32) == 0, "secret 2 matches");
+    /* Verify secrets match */
+    TEST_ASSERT(valid[0] == 1, "slot 0 valid");
+    TEST_ASSERT(memcmp(secrets[0], sec0, 32) == 0, "secret 0 matches");
+    TEST_ASSERT(valid[1] == 1, "slot 1 valid");
+    TEST_ASSERT(memcmp(secrets[1], sec1, 32) == 0, "secret 1 matches");
+    TEST_ASSERT(valid[2] == 1, "slot 2 valid");
+    TEST_ASSERT(memcmp(secrets[2], sec2, 32) == 0, "secret 2 matches");
 
     persist_close(&db);
     return 1;

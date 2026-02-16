@@ -89,9 +89,6 @@ extern int test_regtest_timeout_spend(void);
 
 extern int test_shachain_generation(void);
 extern int test_shachain_derivation_property(void);
-extern int test_shachain_insert_derive(void);
-extern int test_shachain_compact_storage(void);
-extern int test_shachain_reject_bad_insert(void);
 
 extern int test_factory_l_stock_with_burn_path(void);
 extern int test_factory_burn_tx_construction(void);
@@ -105,6 +102,7 @@ extern int test_channel_update(void);
 extern int test_channel_revocation(void);
 extern int test_channel_penalty_tx(void);
 extern int test_regtest_channel_unilateral(void);
+extern int test_regtest_channel_penalty(void);
 
 extern int test_htlc_offered_scripts(void);
 extern int test_htlc_received_scripts(void);
@@ -267,6 +265,10 @@ extern int test_ptlc_wire_round_trip(void);
 extern int test_ptlc_wire_over_socket(void);
 extern int test_multi_factory_ladder_monitor(void);
 
+/* Basepoint Exchange (Gap #1) */
+extern int test_wire_channel_basepoints_round_trip(void);
+extern int test_basepoint_independence(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -316,12 +318,9 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tapscript_sighash);
     RUN_TEST(test_factory_tree_with_timeout);
 
-    printf("\n=== Shachain ===\n");
+    printf("\n=== Shachain (Factory) ===\n");
     RUN_TEST(test_shachain_generation);
     RUN_TEST(test_shachain_derivation_property);
-    RUN_TEST(test_shachain_insert_derive);
-    RUN_TEST(test_shachain_compact_storage);
-    RUN_TEST(test_shachain_reject_bad_insert);
 
     printf("\n=== Factory Shachain (L-Output Invalidation) ===\n");
     RUN_TEST(test_factory_l_stock_with_burn_path);
@@ -489,6 +488,10 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ptlc_wire_round_trip);
     RUN_TEST(test_ptlc_wire_over_socket);
     RUN_TEST(test_multi_factory_ladder_monitor);
+
+    printf("\n=== Basepoint Exchange (Gap #1) ===\n");
+    RUN_TEST(test_wire_channel_basepoints_round_trip);
+    RUN_TEST(test_basepoint_independence);
 }
 
 static void run_regtest_tests(void) {
@@ -502,6 +505,7 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_timeout_spend);
     RUN_TEST(test_regtest_burn_tx);
     RUN_TEST(test_regtest_channel_unilateral);
+    RUN_TEST(test_regtest_channel_penalty);
     RUN_TEST(test_regtest_htlc_success);
     RUN_TEST(test_regtest_htlc_timeout);
     RUN_TEST(test_regtest_factory_coop_close);

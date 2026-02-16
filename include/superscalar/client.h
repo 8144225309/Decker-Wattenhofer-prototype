@@ -83,9 +83,10 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
 /* --- Client-side channel message handlers --- */
 
 /* Send ADD_HTLC to LSP for payment to dest_client.
+   Adds the HTLC to the local channel state (HTLC_OFFERED) before sending.
    payment_hash: 32-byte hash (caller generates).
    Returns 1 on success. */
-int client_send_payment(int fd, uint64_t amount_sats,
+int client_send_payment(int fd, channel_t *ch, uint64_t amount_sats,
                          const unsigned char *payment_hash32,
                          uint32_t cltv_expiry, uint32_t dest_client);
 

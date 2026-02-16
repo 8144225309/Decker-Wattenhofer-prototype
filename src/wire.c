@@ -93,6 +93,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4C: return "PTLC_PRESIG";
     case 0x4D: return "PTLC_ADAPTED_SIG";
     case 0x4E: return "PTLC_COMPLETE";
+    case 0x4F: return "CHANNEL_BASEPOINTS";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
@@ -1055,6 +1056,81 @@ int wire_parse_ptlc_adapted_sig(const cJSON *json, unsigned char *adapted_sig64)
 
 cJSON *wire_build_ptlc_complete(void) {
     return cJSON_CreateObject();
+}
+
+/* --- Basepoint exchange (Gap #1) --- */
+
+cJSON *wire_build_channel_basepoints(
+    uint32_t channel_id,
+    const secp256k1_context *ctx,
+    const secp256k1_pubkey *payment_basepoint,
+    const secp256k1_pubkey *delayed_payment_basepoint,
+    const secp256k1_pubkey *revocation_basepoint,
+    const secp256k1_pubkey *htlc_basepoint,
+    const secp256k1_pubkey *first_per_commitment_point,
+    const secp256k1_pubkey *second_per_commitment_point) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "channel_id", channel_id);
+    char hex[67];
+    pubkey_to_hex(ctx, payment_basepoint, hex);
+    cJSON_AddStringToObject(j, "payment_basepoint", hex);
+    pubkey_to_hex(ctx, delayed_payment_basepoint, hex);
+    cJSON_AddStringToObject(j, "delayed_payment_basepoint", hex);
+    pubkey_to_hex(ctx, revocation_basepoint, hex);
+    cJSON_AddStringToObject(j, "revocation_basepoint", hex);
+    pubkey_to_hex(ctx, htlc_basepoint, hex);
+    cJSON_AddStringToObject(j, "htlc_basepoint", hex);
+    pubkey_to_hex(ctx, first_per_commitment_point, hex);
+    cJSON_AddStringToObject(j, "first_per_commitment_point", hex);
+    if (second_per_commitment_point) {
+        pubkey_to_hex(ctx, second_per_commitment_point, hex);
+        cJSON_AddStringToObject(j, "second_per_commitment_point", hex);
+    }
+    return j;
+}
+
+int wire_parse_channel_basepoints(
+    const cJSON *json,
+    uint32_t *channel_id_out,
+    const secp256k1_context *ctx,
+    secp256k1_pubkey *payment_bp_out,
+    secp256k1_pubkey *delayed_bp_out,
+    secp256k1_pubkey *revocation_bp_out,
+    secp256k1_pubkey *htlc_bp_out,
+    secp256k1_pubkey *first_pcp_out,
+    secp256k1_pubkey *second_pcp_out) {
+    cJSON *ci = cJSON_GetObjectItem(json, "channel_id");
+    if (!ci || !cJSON_IsNumber(ci)) return 0;
+    *channel_id_out = (uint32_t)ci->valuedouble;
+
+    cJSON *pb = cJSON_GetObjectItem(json, "payment_basepoint");
+    cJSON *db = cJSON_GetObjectItem(json, "delayed_payment_basepoint");
+    cJSON *rb = cJSON_GetObjectItem(json, "revocation_basepoint");
+    cJSON *hb = cJSON_GetObjectItem(json, "htlc_basepoint");
+    cJSON *fp = cJSON_GetObjectItem(json, "first_per_commitment_point");
+    if (!pb || !cJSON_IsString(pb) ||
+        !db || !cJSON_IsString(db) ||
+        !rb || !cJSON_IsString(rb) ||
+        !hb || !cJSON_IsString(hb) ||
+        !fp || !cJSON_IsString(fp))
+        return 0;
+
+    if (!hex_to_pubkey(ctx, payment_bp_out, pb->valuestring)) return 0;
+    if (!hex_to_pubkey(ctx, delayed_bp_out, db->valuestring)) return 0;
+    if (!hex_to_pubkey(ctx, revocation_bp_out, rb->valuestring)) return 0;
+    if (!hex_to_pubkey(ctx, htlc_bp_out, hb->valuestring)) return 0;
+    if (!hex_to_pubkey(ctx, first_pcp_out, fp->valuestring)) return 0;
+
+    /* second_per_commitment_point is optional (backward-compat) */
+    if (second_pcp_out) {
+        cJSON *sp = cJSON_GetObjectItem(json, "second_per_commitment_point");
+        if (sp && cJSON_IsString(sp)) {
+            if (!hex_to_pubkey(ctx, second_pcp_out, sp->valuestring)) return 0;
+        } else {
+            memset(second_pcp_out, 0, sizeof(secp256k1_pubkey));
+        }
+    }
+    return 1;
 }
 
 /* --- Bundle parsing --- */
