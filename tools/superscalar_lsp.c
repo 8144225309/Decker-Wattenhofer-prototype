@@ -592,7 +592,7 @@ int main(int argc, char *argv[]) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
         printf("LSP: waiting for funding tx confirmation on %s...\n", network);
-        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex, 600);
+        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex, 3600);
         if (conf < 1) {
             fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
             lsp_cleanup(&lsp);
@@ -1924,7 +1924,7 @@ int main(int argc, char *argv[]) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
         printf("LSP: waiting for close tx confirmation on %s...\n", network);
-        regtest_wait_for_confirmation(&rt, close_txid, 600);
+        regtest_wait_for_confirmation(&rt, close_txid, 3600);
     }
     tx_buf_free(&close_tx);
 

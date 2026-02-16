@@ -11,20 +11,18 @@ transaction is real (MuSig2 Schnorr, taproot key-path/script-path,
 BIP-68 nSequence). Bitcoin Core validates every signature when these
 txs are broadcast on regtest. The protocol mechanics are network-agnostic.
 
-## The one code fix
+## Code fix (done)
 
-### Confirmation timeout: 600s → 3600s
+### Confirmation timeout: 600s → 3600s — FIXED
 
-Two call sites hardcode a 600-second (10-minute) timeout for
-`regtest_wait_for_confirmation()`. Signet blocks arrive every ~10 minutes
-on average, so 600s leaves no margin for slow blocks.
+Both call sites now use 3600-second (1-hour) timeout for
+`regtest_wait_for_confirmation()`. This gives ~360 polling attempts
+at 10s intervals, comfortably covering signet block variance.
 
 ```
-superscalar_lsp.c:595  — funding tx confirmation wait
-superscalar_lsp.c:1927 — cooperative close confirmation wait
+superscalar_lsp.c:595  — funding tx confirmation wait   ✓
+superscalar_lsp.c:1927 — cooperative close confirmation  ✓
 ```
-
-Fix: change `600` to `3600` at both sites. One line each.
 
 ---
 
@@ -145,7 +143,7 @@ export LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build
 
 ## Pre-flight checklist
 
-- [ ] Patch confirmation timeout: 600 → 3600 at `superscalar_lsp.c:595` and `:1927`
+- [x] Patch confirmation timeout: 600 → 3600 at `superscalar_lsp.c:595` and `:1927`
 - [ ] `bitcoind -signet` running and fully synced (`verificationprogress: 1.0`)
 - [ ] `txindex=1` enabled in bitcoin.conf
 - [ ] Wallet funded with ≥0.001 BTC (confirmed)

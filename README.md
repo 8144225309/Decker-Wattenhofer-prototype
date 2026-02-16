@@ -191,52 +191,6 @@ The dashboard auto-refreshes every 5 seconds. Status indicators: green = healthy
 
 ---
 
-## Signet Deployment
-
-For a full signet deployment with CLN integration, use the step-by-step setup script:
-
-```bash
-bash tools/signet_setup.sh start-bitcoind    # Start bitcoind in signet mode
-bash tools/signet_setup.sh sync-status       # Wait for sync
-bash tools/signet_setup.sh create-wallet     # Create LSP wallet
-bash tools/signet_setup.sh check-balance     # Verify funding
-bash tools/signet_setup.sh start-cln-b       # Start CLN Node B (vanilla)
-bash tools/signet_setup.sh start-cln-a       # Start CLN Node A (with plugin)
-bash tools/signet_setup.sh open-channel      # Open A↔B channel
-bash tools/signet_setup.sh channel-status    # Verify channel
-bash tools/signet_setup.sh start-bridge      # Start SuperScalar↔CLN bridge
-bash tools/signet_setup.sh start-lsp         # Start SuperScalar LSP
-bash tools/signet_setup.sh start-client      # Start SuperScalar client
-bash tools/signet_setup.sh status            # Full system status
-bash tools/signet_setup.sh test-payment      # End-to-end payment test
-bash tools/signet_setup.sh stop-all          # Graceful shutdown
-```
-
-Edit the variables at the top of `signet_setup.sh` to match your environment:
-
-```bash
-BTCBIN="/usr/local/bin"           # Bitcoin binaries directory
-CLNDIR="/usr/local/libexec"       # CLN directory
-DATADIR="/tmp/superscalar-signet" # Data directory
-RPCUSER="superscalar"             # Bitcoin RPC user
-RPCPASS="superscalar123"          # Bitcoin RPC password
-```
-
-Then point the dashboard at your signet databases:
-
-```bash
-python3 tools/dashboard.py \
-  --lsp-db /tmp/superscalar-signet/lsp.db \
-  --client-db /tmp/superscalar-signet/client.db \
-  --btc-network signet \
-  --btc-rpcuser superscalar \
-  --btc-rpcpassword superscalar123 \
-  --cln-a-dir /tmp/superscalar-signet/cln-a \
-  --cln-b-dir /tmp/superscalar-signet/cln-b
-```
-
----
-
 ## Standalone Binaries
 
 ### superscalar_lsp

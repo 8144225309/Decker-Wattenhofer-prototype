@@ -25,15 +25,12 @@ standard operational setup (funded wallet, CLN nodes, ~30 min).
 Bitcoin Core RPC that works identically on regtest, signet, testnet,
 and mainnet. No network-specific code needed.
 
-### Funding confirmation — NEEDS FIX
+### Funding confirmation — FIXED
 
-`regtest_wait_for_confirmation()` is called with a **600-second timeout**
-(`superscalar_lsp.c:595` and `:1927`). On signet, blocks arrive every
-~10 minutes. The 600s timeout gives ~60 polling attempts at 10s intervals,
-which is usually enough for one block but leaves no margin.
-
-**Fix required**: Increase to 3600s (1 hour) or add a `--confirmation-timeout`
-CLI flag. This is a one-line change per call site.
+`regtest_wait_for_confirmation()` uses a 3600-second (1-hour) timeout
+(`superscalar_lsp.c:595` and `:1927`). This gives ~360 polling attempts
+at 10s intervals, comfortably covering signet's ~10-minute block times
+including variance.
 
 ### Factory creation protocol — READY
 
@@ -85,20 +82,14 @@ natural block (~10 min). No functional impact.
 ### Cooperative close — READY
 
 Close tx is broadcast via `sendrawtransaction`. Confirmation wait uses
-`regtest_wait_for_confirmation()` (same 600s timeout issue as funding).
+`regtest_wait_for_confirmation()` with the same 3600s timeout.
 
 ---
 
-## What would fail today (without the fix)
+## Known issues — NONE
 
-1. **Funding confirmation timeout**: `superscalar_lsp.c:595` — 600s may
-   not be enough if signet is slow. ~5% failure rate on typical signet,
-   higher during congestion.
-
-2. **Close confirmation timeout**: `superscalar_lsp.c:1927` — same 600s
-   issue for cooperative close wait.
-
-That's it. Everything else works.
+The confirmation timeout has been fixed (3600s). All components are
+signet-ready. See ROAD_TO_SIGNET.md for deployment instructions.
 
 ---
 
