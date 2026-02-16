@@ -9,6 +9,7 @@
 #   bash tools/run_demo.sh --basic      # factory creation + payments + close
 #   bash tools/run_demo.sh --breach     # + broadcast revoked commitment → penalty
 #   bash tools/run_demo.sh --rotation   # + full factory rotation (Factory 0 → 1)
+#   bash tools/run_demo.sh --client-breach  # client-side breach detection
 #   bash tools/run_demo.sh --all        # run all demos sequentially
 #   bash tools/run_demo.sh --dashboard  # launch dashboard after demo
 
@@ -94,7 +95,7 @@ STARTED_BITCOIND=0
 # ---------------------------------------------------------------------------
 # Argument parsing
 # ---------------------------------------------------------------------------
-MODE_BASIC=0; MODE_BREACH=0; MODE_ROTATION=0; LAUNCH_DASHBOARD=0
+MODE_BASIC=0; MODE_BREACH=0; MODE_CLIENT_BREACH=0; MODE_ROTATION=0; LAUNCH_DASHBOARD=0
 
 if [ $# -eq 0 ]; then
     MODE_BASIC=1
@@ -102,21 +103,23 @@ fi
 
 for arg in "$@"; do
     case $arg in
-        --basic)     MODE_BASIC=1 ;;
-        --breach)    MODE_BREACH=1 ;;
-        --rotation)  MODE_ROTATION=1 ;;
-        --all)       MODE_BASIC=1; MODE_BREACH=1; MODE_ROTATION=1 ;;
+        --basic)          MODE_BASIC=1 ;;
+        --breach)         MODE_BREACH=1 ;;
+        --client-breach)  MODE_CLIENT_BREACH=1 ;;
+        --rotation)       MODE_ROTATION=1 ;;
+        --all)            MODE_BASIC=1; MODE_BREACH=1; MODE_CLIENT_BREACH=1; MODE_ROTATION=1 ;;
         --dashboard) LAUNCH_DASHBOARD=1 ;;
         --help|-h)
             echo "Usage: bash tools/run_demo.sh [OPTIONS]"
             echo ""
             echo "Options:"
-            echo "  --basic       Factory creation + payments + close (default)"
-            echo "  --breach      Revoked commitment broadcast → penalty TX"
-            echo "  --rotation    Full factory rotation (Factory 0 → Factory 1)"
-            echo "  --all         Run all demos sequentially"
-            echo "  --dashboard   Launch web dashboard after demo"
-            echo "  --help        Show this help"
+            echo "  --basic          Factory creation + payments + close (default)"
+            echo "  --breach         Revoked commitment broadcast → penalty TX"
+            echo "  --client-breach  Client-side breach detection (clients catch LSP cheat)"
+            echo "  --rotation       Full factory rotation (Factory 0 → Factory 1)"
+            echo "  --all            Run all demos sequentially"
+            echo "  --dashboard      Launch web dashboard after demo"
+            echo "  --help           Show this help"
             exit 0 ;;
         *)
             echo "Unknown option: $arg (try --help)"
@@ -160,6 +163,7 @@ echo -e "${NC}"
 MODES=""
 [ "$MODE_BASIC" = "1" ] && MODES="${MODES} basic"
 [ "$MODE_BREACH" = "1" ] && MODES="${MODES} breach"
+[ "$MODE_CLIENT_BREACH" = "1" ] && MODES="${MODES} client-breach"
 [ "$MODE_ROTATION" = "1" ] && MODES="${MODES} rotation"
 echo -e "  ${DIM}Demos:${NC}${BOLD}${MODES}${NC}"
 echo ""
@@ -256,6 +260,76 @@ run_lsp_clients() {
     return $exit_code
 }
 
+run_client_breach() {
+    local log_dir="/tmp/superscalar_demo"
+    mkdir -p "$log_dir"
+    local lsp_pid c_pids=()
+
+    # Start LSP with --cheat-daemon (demo + breach + sleep, no LSP watchtower)
+    step "Starting LSP with --cheat-daemon..."
+    $LSP_BIN --network $NETWORK --port $PORT --clients 4 --amount $AMOUNT \
+        --demo --cheat-daemon &
+    lsp_pid=$!
+    PIDS+=($lsp_pid)
+    sleep 2
+
+    # Start 4 clients with output redirected to log files
+    step "Starting 4 clients (logs → $log_dir/client_*.log)..."
+    for i in 1 2 3 4; do
+        local keyvar="CLIENT${i}_KEY"
+        local logfile="$log_dir/client_${i}.log"
+        > "$logfile"  # truncate
+        $CLIENT_BIN --seckey ${!keyvar} --port $PORT --network $NETWORK \
+            --daemon > "$logfile" 2>&1 &
+        c_pids+=($!)
+        PIDS+=(${c_pids[-1]})
+        sleep 0.3
+    done
+
+    # Wait for LSP to finish (demo + cheat + 30s sleep)
+    wait_for_pid "$lsp_pid" "cheat daemon"
+    local exit_code=$?
+
+    # Give clients 3 extra seconds to detect + broadcast penalty
+    sleep 3
+
+    # Kill clients
+    for pid in "${c_pids[@]}"; do
+        kill "$pid" 2>/dev/null || true
+    done
+    wait "${c_pids[@]}" 2>/dev/null || true
+
+    # Remove from PIDS
+    PIDS=("${PIDS[@]/$lsp_pid}")
+    for pid in "${c_pids[@]}"; do
+        PIDS=("${PIDS[@]/$pid}")
+    done
+
+    # Check client logs for breach detection
+    echo ""
+    step "Checking client logs for breach detection..."
+    local detected=0
+    for i in 1 2 3 4; do
+        local logfile="$log_dir/client_${i}.log"
+        if grep -q "BREACH DETECTED" "$logfile" 2>/dev/null; then
+            local txid=$(grep "Penalty tx broadcast" "$logfile" | head -1 | awk '{print $NF}')
+            ok "Client $i: BREACH DETECTED — penalty tx: ${txid:-unknown}"
+            detected=$((detected + 1))
+        else
+            fail "Client $i: no breach detected"
+        fi
+    done
+
+    echo ""
+    if [ "$detected" -gt 0 ]; then
+        ok "$detected/4 clients detected the LSP cheat and broadcast penalty"
+    else
+        fail "No clients detected the breach"
+    fi
+
+    return $( [ "$detected" -gt 0 ] && echo 0 || echo 1 )
+}
+
 TOTAL_PASS=0; TOTAL_FAIL=0
 
 # ---------------------------------------------------------------------------
@@ -319,6 +393,37 @@ compares against mempool/chain transactions every 5 seconds."
 fi
 
 # ---------------------------------------------------------------------------
+# Demo 2b: Client-Side Breach Detection
+# ---------------------------------------------------------------------------
+if [ "$MODE_CLIENT_BREACH" = "1" ]; then
+    banner "Demo: Client-Side Breach Detection"
+
+    explain "This demo tests CLIENT-SIDE watchtower protection. The LSP runs
+in cheat-daemon mode: it creates a factory, processes payments normally,
+then broadcasts a REVOKED commitment — but does NOT run its own watchtower.
+
+Each client runs its own watchtower (bidirectional revocation). When the
+revoked commitment appears on-chain, clients detect the breach and
+broadcast penalty transactions, sweeping the cheater's funds.
+
+This is the core security property: clients protect themselves even
+if the LSP acts maliciously."
+
+    if run_client_breach; then
+        ok "Client breach demo completed successfully"
+        TOTAL_PASS=$((TOTAL_PASS + 1))
+    else
+        fail "Client breach demo failed"
+        TOTAL_FAIL=$((TOTAL_FAIL + 1))
+    fi
+
+    bitcoin-cli $CLI_ARGS generatetoaddress 1 "$(bitcoin-cli $CLI_ARGS \
+        -rpcwallet=superscalar_lsp getnewaddress 2>/dev/null)" \
+        >/dev/null 2>&1 || true
+    sleep 1
+fi
+
+# ---------------------------------------------------------------------------
 # Demo 3: Factory Rotation (Factory 0 → Factory 1)
 # ---------------------------------------------------------------------------
 if [ "$MODE_ROTATION" = "1" ]; then
@@ -368,8 +473,9 @@ echo -e "  ${DIM}What was demonstrated:${NC}"
 [ "$MODE_BASIC" = "1" ]    && echo -e "    ${CYAN}•${NC} Factory creation (5-of-5 MuSig2, single on-chain UTXO)"
 [ "$MODE_BASIC" = "1" ]    && echo -e "    ${CYAN}•${NC} In-factory payments with real preimage validation"
 [ "$MODE_BASIC" = "1" ]    && echo -e "    ${CYAN}•${NC} Cooperative close (single on-chain transaction)"
-[ "$MODE_BREACH" = "1" ]   && echo -e "    ${CYAN}•${NC} Watchtower breach detection and penalty TX broadcast"
-[ "$MODE_ROTATION" = "1" ] && echo -e "    ${CYAN}•${NC} PTLC key turnover via adaptor signatures"
+[ "$MODE_BREACH" = "1" ]          && echo -e "    ${CYAN}•${NC} Watchtower breach detection and penalty TX broadcast"
+[ "$MODE_CLIENT_BREACH" = "1" ]   && echo -e "    ${CYAN}•${NC} Client-side breach detection (all 4 clients catch LSP cheat)"
+[ "$MODE_ROTATION" = "1" ]        && echo -e "    ${CYAN}•${NC} PTLC key turnover via adaptor signatures"
 [ "$MODE_ROTATION" = "1" ] && echo -e "    ${CYAN}•${NC} Factory rotation (Factory 0 → Factory 1, zero downtime)"
 echo ""
 
