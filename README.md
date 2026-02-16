@@ -2,72 +2,283 @@
 
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
-## What This Is
-
 A Bitcoin channel factory protocol combining:
 
-- **Decker-Wattenhofer invalidation** — alternating kickoff/state transaction layers with decrementing nSequence relative timelocks
-- **Timeout-sig-trees** — N-of-N MuSig2 key-path spending with CLTV timeout script-path fallback
-- **Poon-Dryja payment channels** — standard Lightning channels at leaf outputs with HTLCs
-- **LSP + N clients** architecture — not symmetric N-of-N; the LSP participates in all branches
+- **Decker-Wattenhofer invalidation** — alternating kickoff/state layers with decrementing nSequence
+- **Timeout-sig-trees** — N-of-N MuSig2 key-path with CLTV timeout script-path fallback
+- **Poon-Dryja channels** — standard Lightning channels at leaf outputs with HTLCs
+- **LSP + N clients** — the LSP participates in every branch; no consensus changes required
 
-No consensus changes or soft forks required. Runs on Bitcoin today.
+## Quick Start
+
+```bash
+# Build (Linux/WSL — fetches secp256k1-zkp + cJSON automatically)
+mkdir -p build && cd build && cmake .. && make -j$(nproc)
+
+# Run the basic demo (needs bitcoind -regtest running)
+cd .. && bash tools/run_demo.sh --basic
+```
+
+If you don't have `bitcoind` running, `run_demo.sh` will start one for you.
 
 ## Build
 
-```
+```bash
 cd superscalar && mkdir -p build && cd build
 cmake .. && make -j$(nproc)
 ```
 
-Dependencies (auto-fetched via CMake FetchContent):
-- [secp256k1-zkp](https://github.com/BlockstreamResearch/secp256k1-zkp) — MuSig2, Schnorr signatures, extrakeys
-- [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing for bitcoin-cli output
+**Auto-fetched** (CMake FetchContent):
+- [secp256k1-zkp](https://github.com/BlockstreamResearch/secp256k1-zkp) — MuSig2, Schnorr, adaptor signatures
+- [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing
 
-System dependency:
-- SQLite3 — persistence layer
+**System dependency**: SQLite3
 
-## Test
+## Tests
 
-152 tests (133 unit + 19 regtest integration).
+153 tests (134 unit + 19 regtest integration).
 
 ```bash
-# unit tests (no bitcoind needed)
-LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_superscalar --unit
+cd build
 
-# integration tests (needs bitcoind -regtest)
-bitcoind -regtest -daemon -rpcuser=rpcuser -rpcpassword=rpcpass -fallbackfee=0.00001 -txindex=1
-LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_superscalar --regtest
+# Unit tests only (no bitcoind needed)
+LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build \
+  ./test_superscalar --unit
+
+# Integration tests (needs bitcoind -regtest)
+bitcoind -regtest -daemon -rpcuser=rpcuser -rpcpassword=rpcpass \
+  -fallbackfee=0.00001 -txindex=1
+LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build \
+  ./test_superscalar --regtest
 bitcoin-cli -regtest -rpcuser=rpcuser -rpcpassword=rpcpass stop
 
-# all tests
-LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_superscalar --all
+# All tests
+LD_LIBRARY_PATH=_deps/secp256k1-zkp-build/src:_deps/cjson-build \
+  ./test_superscalar --all
 ```
 
-## Modules
+---
 
-| Module | File | Purpose |
-|--------|------|---------|
-| `dw_state` | dw_state.c | nSequence state machine, odometer-style multi-layer counter |
-| `musig` | musig.c | MuSig2 key aggregation, 2-round signing, split-round protocol, nonce pools |
-| `tx_builder` | tx_builder.c | Raw Bitcoin tx serialization, BIP-341 key-path sighash, witness finalization |
-| `tapscript` | tapscript.c | TapLeaf/TapBranch hashing, CLTV timeout scripts, script-path sighash, control blocks |
-| `factory` | factory.c | Factory tree: build, sign, advance, timeout-sig-tree outputs, cooperative close |
-| `shachain` | shachain.c | BOLT #3 shachain algorithm, compact storage, epoch-to-index mapping |
-| `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs, cooperative close |
-| `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover protocol |
-| `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, key turnover tracking, migration |
-| `wire` | wire.c | TCP transport, length-prefixed JSON framing, 39 message types, message logging callback |
-| `lsp` | lsp.c | LSP server: accept clients, factory creation ceremony, cooperative close |
-| `client` | client.c | Client: connect to LSP, factory ceremony, channel operations, factory rotation, close |
-| `lsp_channels` | lsp_channels.c | LSP channel manager: HTLC forwarding, event loop, balance-aware close, watchtower, multi-factory monitoring |
-| `regtest` | regtest.c | bitcoin-cli subprocess harness for integration testing |
-| `util` | util.c | SHA-256, tagged hashing (BIP-340/341), hex encoding, byte utilities |
-| `persist` | persist.c | SQLite3 persistence: 16 tables (factories, channels, HTLCs, revocations, nonce pools, old commitments, wire messages, tree nodes, ladder factories, dw counter, departed clients, invoices, HTLC origins, client invoices, id counters) |
-| `bridge` | bridge.c | CLN bridge daemon for Lightning Network connectivity |
-| `fee` | fee.c | Configurable fee estimation: penalty, HTLC, and factory tx fee computation |
-| `watchtower` | watchtower.c | Breach detection: monitors chain for revoked commitments, builds and broadcasts penalty txs |
-| `keyfile` | keyfile.c | Encrypted keyfile: AES-256-CBC key storage with passphrase-derived encryption |
+## Demos
+
+All demos require a built project (`build/` directory with binaries) and `bitcoind -regtest`.
+
+### One-Command Demo Runner
+
+The easiest way to see SuperScalar in action:
+
+```bash
+bash tools/run_demo.sh --basic       # Factory + payments + cooperative close (~30s)
+bash tools/run_demo.sh --breach      # + watchtower detects breach, broadcasts penalty (~60s)
+bash tools/run_demo.sh --rotation    # + PTLC turnover + factory ladder rotation (~2min)
+bash tools/run_demo.sh --all         # All three scenarios sequentially
+```
+
+`run_demo.sh` handles pre-flight checks, auto-starts `bitcoind` if needed, funds the wallet, launches the LSP + 4 clients, and prints colored output.
+
+#### What each demo shows
+
+| Demo | What happens |
+|------|-------------|
+| `--basic` | Creates a 5-of-5 MuSig2 factory (100k sats), opens 4 channels, runs 4 payments with real preimage validation, cooperative-closes everything in a single on-chain tx |
+| `--breach` | Runs `--basic` first, then broadcasts a **revoked** commitment tx. The watchtower detects the breach and broadcasts a penalty tx that sweeps the cheater's funds |
+| `--rotation` | Runs `--basic`, then performs PTLC key turnover (adaptor sigs extract every client's key over the wire), closes Factory 0, creates Factory 1, runs payments in the new factory, and closes — demonstrating zero-downtime laddering |
+
+### Manual Demo (Minimal)
+
+```bash
+# Terminal: start LSP + auto-fork 4 clients, run demo, close
+cd build
+bash ../tools/demo.sh
+```
+
+### LSP Test Flags
+
+These flags run after the `--demo` payment sequence completes:
+
+```bash
+# Watchtower breach test
+./superscalar_lsp --port 9735 --demo --breach-test
+
+# CLTV timeout recovery (mine past timeout, LSP recovers via script-path)
+./superscalar_lsp --port 9735 --demo --test-expiry
+
+# Distribution tx (pre-signed nLockTime tx defaults funds to clients)
+./superscalar_lsp --port 9735 --demo --test-distrib
+
+# PTLC key turnover (adaptor sigs, LSP can close alone afterward)
+./superscalar_lsp --port 9735 --demo --test-turnover
+
+# Full factory rotation (PTLC wire msgs + new factory + payments)
+./superscalar_lsp --port 9735 --demo --test-rotation
+```
+
+---
+
+## Web Dashboard
+
+A real-time monitoring dashboard for SuperScalar deployments. Stdlib-only Python3 (no pip install needed).
+
+### Launch
+
+```bash
+# Demo mode (no databases required — shows synthetic data)
+python3 tools/dashboard.py --demo
+
+# With real databases from a running deployment
+python3 tools/dashboard.py \
+  --lsp-db /path/to/lsp.db \
+  --client-db /path/to/client.db \
+  --btc-cli bitcoin-cli \
+  --btc-network signet \
+  --btc-rpcuser superscalar \
+  --btc-rpcpassword superscalar123
+
+# Launch alongside the demo runner
+bash tools/run_demo.sh --all --dashboard
+```
+
+Then open **http://localhost:8080** in your browser.
+
+### Dashboard Tabs
+
+| Tab | What it shows |
+|-----|---------------|
+| **Overview** | Process status (bitcoind, CLN, bridge, LSP, client), blockchain height, wallet balance, system health |
+| **Factory** | Factory state (ACTIVE/DYING/EXPIRED), creation block, participant keys, DW epoch, funding txid |
+| **Channels** | Per-channel balances (local/remote), commitment number, HTLC count, state |
+| **Protocol** | Factory tree node visualization (kickoff + state nodes), signatures, wire message log |
+| **Lightning** | CLN node info, peers, channels, forwarding stats (requires `--cln-a-dir` / `--cln-b-dir`) |
+| **Watchtower** | Old commitment tracking, breach detection status, penalty tx history |
+| **Events** | Recent 100 wire messages with timestamp, direction, type, peer label, payload summary |
+
+The dashboard auto-refreshes every 5 seconds. Status indicators: green = healthy, yellow = warning, red = error.
+
+### Dashboard Flags
+
+| Flag | Default | Purpose |
+|------|---------|---------|
+| `--port` | 8080 | HTTP server port |
+| `--demo` | off | Use synthetic data (no databases needed) |
+| `--lsp-db` | — | Path to LSP SQLite database |
+| `--client-db` | — | Path to client SQLite database |
+| `--btc-cli` | bitcoin-cli | Path to bitcoin-cli |
+| `--btc-network` | signet | Bitcoin network |
+| `--btc-rpcuser` | — | Bitcoin RPC username |
+| `--btc-rpcpassword` | — | Bitcoin RPC password |
+| `--cln-cli` | lightning-cli | Path to lightning-cli |
+| `--cln-a-dir` | — | CLN Node A data directory |
+| `--cln-b-dir` | — | CLN Node B data directory |
+
+---
+
+## Signet Deployment
+
+For a full signet deployment with CLN integration, use the step-by-step setup script:
+
+```bash
+bash tools/signet_setup.sh start-bitcoind    # Start bitcoind in signet mode
+bash tools/signet_setup.sh sync-status       # Wait for sync
+bash tools/signet_setup.sh create-wallet     # Create LSP wallet
+bash tools/signet_setup.sh check-balance     # Verify funding
+bash tools/signet_setup.sh start-cln-b       # Start CLN Node B (vanilla)
+bash tools/signet_setup.sh start-cln-a       # Start CLN Node A (with plugin)
+bash tools/signet_setup.sh open-channel      # Open A↔B channel
+bash tools/signet_setup.sh channel-status    # Verify channel
+bash tools/signet_setup.sh start-bridge      # Start SuperScalar↔CLN bridge
+bash tools/signet_setup.sh start-lsp         # Start SuperScalar LSP
+bash tools/signet_setup.sh start-client      # Start SuperScalar client
+bash tools/signet_setup.sh status            # Full system status
+bash tools/signet_setup.sh test-payment      # End-to-end payment test
+bash tools/signet_setup.sh stop-all          # Graceful shutdown
+```
+
+Edit the variables at the top of `signet_setup.sh` to match your environment:
+
+```bash
+BTCBIN="/usr/local/bin"           # Bitcoin binaries directory
+CLNDIR="/usr/local/libexec"       # CLN directory
+DATADIR="/tmp/superscalar-signet" # Data directory
+RPCUSER="superscalar"             # Bitcoin RPC user
+RPCPASS="superscalar123"          # Bitcoin RPC password
+```
+
+Then point the dashboard at your signet databases:
+
+```bash
+python3 tools/dashboard.py \
+  --lsp-db /tmp/superscalar-signet/lsp.db \
+  --client-db /tmp/superscalar-signet/client.db \
+  --btc-network signet \
+  --btc-rpcuser superscalar \
+  --btc-rpcpassword superscalar123 \
+  --cln-a-dir /tmp/superscalar-signet/cln-a \
+  --cln-b-dir /tmp/superscalar-signet/cln-b
+```
+
+---
+
+## Standalone Binaries
+
+### superscalar_lsp
+
+```
+superscalar_lsp [OPTIONS]
+```
+
+| Flag | Argument | Default | Description |
+|------|----------|---------|-------------|
+| `--port` | PORT | 9735 | Listen port |
+| `--clients` | N | 4 | Number of clients |
+| `--amount` | SATS | 100000 | Funding amount |
+| `--network` | MODE | regtest | regtest / signet / testnet / mainnet |
+| `--daemon` | — | off | Long-lived daemon mode |
+| `--demo` | — | off | Run scripted demo sequence |
+| `--db` | PATH | — | SQLite persistence |
+| `--fee-rate` | N | 1000 | Fee rate (sat/kvB) |
+| `--keyfile` | PATH | — | Encrypted keyfile |
+| `--passphrase` | PASS | — | Keyfile passphrase |
+| `--cli-path` | PATH | bitcoin-cli | Bitcoin CLI binary |
+| `--rpcuser` | USER | rpcuser | Bitcoin RPC username |
+| `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
+| `--report` | PATH | — | Write JSON diagnostic report |
+| `--breach-test` | — | off | Broadcast revoked commitment, trigger penalty |
+| `--test-expiry` | — | off | Mine past CLTV, recover via timeout script |
+| `--test-distrib` | — | off | Broadcast pre-signed distribution tx |
+| `--test-turnover` | — | off | PTLC key turnover, close with extracted keys |
+| `--test-rotation` | — | off | Full factory rotation lifecycle |
+
+### superscalar_client
+
+```
+superscalar_client [OPTIONS]
+```
+
+| Flag | Argument | Default | Description |
+|------|----------|---------|-------------|
+| `--seckey` | HEX | **required** | 32-byte secret key |
+| `--port` | PORT | 9735 | LSP port |
+| `--host` | HOST | 127.0.0.1 | LSP host |
+| `--daemon` | — | off | Daemon mode (auto-fulfill HTLCs) |
+| `--db` | PATH | — | SQLite persistence |
+| `--network` | MODE | regtest | Network mode |
+| `--fee-rate` | N | 1000 | Fee rate (sat/kvB) |
+| `--keyfile` | PATH | — | Encrypted keyfile |
+| `--passphrase` | PASS | — | Keyfile passphrase |
+
+### superscalar_bridge
+
+```
+superscalar_bridge [OPTIONS]
+```
+
+| Flag | Argument | Default | Description |
+|------|----------|---------|-------------|
+| `--lsp-host` | HOST | 127.0.0.1 | LSP host |
+| `--lsp-port` | PORT | 9735 | LSP port |
+| `--plugin-port` | PORT | 9736 | CLN plugin listen port |
+
+---
 
 ## Architecture
 
@@ -92,7 +303,7 @@ LD_LIBRARY_PATH=./_deps/secp256k1-zkp-build/src:_deps/cjson-build ./test_supersc
 
 - **6 transactions** in the tree, all pre-signed cooperatively via MuSig2
 - **Alternating kickoff/state layers** prevents the cascade problem
-- **Leaf outputs**: 2 Poon-Dryja payment channels + 1 LSP liquidity stock per branch
+- **Leaf outputs**: 2 Poon-Dryja channels + 1 LSP liquidity stock per branch
 - **L-stock outputs**: Shachain-based invalidation with burn path for old states
 
 ### Decker-Wattenhofer Invalidation
@@ -110,242 +321,82 @@ Multi-layer counter works like an odometer: 2 layers x 4 states = 16 epochs.
 
 ### Timeout-Sig-Trees
 
-State transaction outputs include a taproot script tree with a CLTV timeout fallback:
-
 ```
 Output key = TapTweak(internal_key, merkle_root)
   Key path:    MuSig2(subset N-of-N)  — cooperative spend
   Script path: <cltv_timeout> OP_CHECKLOCKTIMEVERIFY OP_DROP <LSP_pubkey> OP_CHECKSIG
 ```
 
-If clients disappear, the LSP can unilaterally recover funds after the timeout expires.
+If clients disappear, the LSP can unilaterally recover funds after the timeout.
 
 ### Payment Channels
 
 Each leaf channel is a standard Poon-Dryja Lightning channel:
 
 ```
-Commitment TX (held by each party):
+Commitment TX:
   Input:  leaf output (2-of-2 MuSig key-path)
   Output 0: to_local  (revocable with per-commitment point)
   Output 1: to_remote (immediate)
   Output 2+: HTLC outputs (offered/received)
 ```
 
-- **Revocation**: Shachain-derived per-commitment secrets
-- **Penalty**: Full channel balance to counterparty on breach
-- **HTLCs**: 2-leaf taproot trees (success + timeout paths, or revocation + claim)
-- **Cooperative close**: Single key-path spend bypassing commitment structure
+Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf taproot HTLC trees, cooperative close via single key-path spend.
 
-### Watchtower
+### Wire Protocol
 
-Monitors the blockchain for revoked commitment transactions:
+39 message types over TCP with length-prefixed JSON framing:
 
-- Tracks old commitment txids after each `REVOKE_AND_ACK`
-- Polls chain every 5 seconds during daemon mode
-- On breach detection: builds penalty tx, broadcasts it, claims full channel balance
-- Persists watched commitments in SQLite for crash recovery
+| Category | Messages |
+|----------|----------|
+| Handshake | HELLO, HELLO_ACK |
+| Factory | PROPOSE, NONCES, PSIGS, READY, FACTORY_PROPOSE |
+| Channel | BASEPOINTS, CHANNEL_NONCES, CHANNEL_READY, CLOSE_REQUEST, CLOSE_COMPLETE |
+| HTLC | ADD_HTLC, COMMITMENT_SIGNED, REVOKE_AND_ACK, FULFILL_HTLC, FAIL_HTLC |
+| Bridge | BRIDGE_HELLO through BRIDGE_PAY_RESULT (8 types) |
+| Reconnect | RECONNECT, RECONNECT_ACK |
+| Invoice | CREATE_INVOICE, INVOICE_CREATED, REGISTER_INVOICE |
+| PTLC | PTLC_PRESIG, PTLC_ADAPTED_SIG, PTLC_COMPLETE |
 
-## Implementation Status
+### Connection Topology (with CLN Bridge)
 
-### Phase 0: DW Invalidation
-- Multi-layer odometer counter (BIP-68 nSequence)
-- Layer exhaustion detection and state advancement
+```
+CLN (lightningd)
+  └── cln_plugin.py (htlc_accepted hook + superscalar-pay RPC)
+        └── superscalar_bridge (port 9736 ← plugin, port 9735 → LSP)
+              └── superscalar_lsp (port 9735)
+                    ├── client 1
+                    ├── client 2
+                    ├── client 3
+                    └── client 4
+```
 
-### Phase 1: Factory Transaction Tree
-- 6-node alternating kickoff/state tree topology
-- MuSig2 N-of-N signing with taproot key-path tweak
-- Full on-chain broadcast and confirmation on regtest
+---
 
-### Phase 2: Timeout-Sig-Trees
-- CLTV timeout script construction (BIP-341 tapscript)
-- TapLeaf hashing, merkle root, taproot output tweaking
-- Script-path sighash and control block construction
-- LSP timeout spend via script-path witness on regtest
+## Modules
 
-### Phase 3a: Split-Round MuSig2
-- Nonce pool pre-generation (up to 256 nonces per client)
-- Nonce/partial-sig serialization for offline clients
-- 3-phase split-round signing orchestration
-- N-of-N split-round signing (tested with 5 participants)
-
-### Phase 4: Shachain + L-Output Invalidation
-- BOLT #3 shachain generation and compact storage (49 elements)
-- Epoch-to-index mapping for factory states
-- Burn transaction construction for L-stock outputs
-- Shachain secret verification on insert
-
-### Phase 5: Poon-Dryja Payment Channels
-- Channel initialization from factory leaf outputs
-- Per-commitment point/secret generation (shachain-based)
-- Commitment transaction construction and signing
-- Key derivation (simple + revocation keys)
-- Penalty transaction for breach enforcement
-- Regtest: unilateral close with on-chain confirmation
-
-### Phase 6: HTLC Outputs
-- Offered/Received HTLC scripts (2-leaf taproot trees)
-- HTLC-success and HTLC-timeout transaction paths
-- HTLC penalty transactions (revocation spending)
-- HTLC commitment transaction integration
-- Regtest: HTLC success (preimage reveal) and timeout (CLTV expiry)
-
-### Phase 7: Cooperative Close
-- Factory-level cooperative close (single tx, bypasses entire tree)
-- Channel-level cooperative close (key-path spend, no timelocks)
-- Arbitrary output distribution with negotiated balances
-- Regtest: factory coop close + channel coop close after balance shift
-
-### Phase 8a: Adaptor Signatures
-- MuSig2 adaptor signature wrappers (adapt, extract, nonce parity)
-- Pre-signatures that require a secret scalar to become valid Schnorr signatures
-- Taproot-compatible adaptor signatures (key-path with tweak)
-
-### Phase 8b: PTLC Key Turnover
-- Atomic key reveal: client adapts pre-signature with private key, LSP extracts it
-- LSP "sockpuppet" signing: uses extracted key to sign as departed client
-- Factory cooperative close using extracted keys (all clients departed)
-- Regtest: fund factory, PTLC key turnover, LSP coop-closes with extracted keys
-
-### Phase 8c: Factory Lifecycle
-- State machine: ACTIVE (30 days) -> DYING (3 days) -> EXPIRED
-- Block-height queries: blocks until dying, blocks until expired
-- Distribution transaction (inverted timelock default): pre-signed nLockTime tx defaults funds to clients after CLTV timeout
-- Regtest: distribution tx rejected before timeout, accepted after mining past nLockTime
-
-### Phase 8d: Ladder Manager
-- Multi-factory orchestration with overlapping lifecycles
-- Per-client key turnover tracking and departure recording
-- Cooperative close construction using extracted keys for all departed clients
-- Regtest: full migration demo (fund F1 -> PTLC exit -> close F1 -> fund F2)
-- Regtest: distribution tx fallback when clients don't exit
-
-### Phase 9: Wire Protocol
-- TCP transport with length-prefixed JSON message framing
-- 22 base message types: HELLO handshake, factory creation, channel operations, cooperative close
-- LSP + N client architecture with HELLO/HELLO_ACK handshake
-- Factory creation over wire: 3 round-trips (PROPOSE → NONCES → PSIGS → READY)
-- Cooperative close over wire: 2 round-trips on funding output's N+1 key
-- Standalone binaries: `superscalar_lsp` and `superscalar_client`
-- Regtest: full TCP factory creation + cooperative close with forked client processes
-
-### Phase 10: Channel Operations + PoC Hardening
-- 7 channel wire message types: CHANNEL_READY, ADD_HTLC, COMMITMENT_SIGNED, REVOKE_AND_ACK, FULFILL_HTLC, FAIL_HTLC, CLOSE_REQUEST
-- LSP channel manager with HTLC forwarding (sender → LSP → recipient)
-- Client channel handlers with callback-based session loop
-- Full HTLC payment round-trip: ADD_HTLC → COMMIT_SIGNED → REVOKE_AND_ACK → FULFILL
-- Multi-payment support: scripted action sequences (SEND/RECV) per client
-- Select()-based LSP event loop handling messages from any client
-- Balance-aware cooperative close: outputs reflect actual channel balances after payments
-- Input validation, network hardening, memory safety, graceful shutdown
-- Standalone LSP/client binaries with CLI argument parsing
-
-### Phase 12: Real Commitment Signatures
-- MuSig2 partial signatures replace dummy signatures for commitment txs
-- Nonce pool management for distributed 2-of-2 signing
-
-### Phase 13: Persistence (SQLite)
-- 16 database tables: factories, factory_participants, channels, revocation_secrets, htlcs, nonce_pools, old_commitments, wire_messages, tree_nodes, ladder_factories, dw_counter_state, departed_clients, invoice_registry, htlc_origins, client_invoices, id_counters
-- `--db PATH` flag on both LSP and client binaries
-- Full state round-trip: save and reload factory, channel, HTLC, and nonce pool state
-
-### Phase 14: CLN Bridge
-- Bridge daemon (`superscalar_bridge`) connecting SuperScalar to CLN
-- 8 MSG_BRIDGE_* wire messages (0x40-0x47) for HTLC forwarding
-- Invoice registry for routing inbound payments to correct client
-- CLN plugin (`tools/cln_plugin.py`) with htlc_accepted hook + superscalar-pay RPC
-
-### Phase 15: Daemon Mode
-- `--daemon` flag for long-lived LSP and client processes
-- Select()-based daemon loop with 5-second timeout and graceful shutdown
-- MSG_REGISTER_INVOICE (0x38): clients register payment hashes with LSP
-- Client auto-fulfillment of received HTLCs with preimage lookup
-
-### Phase 16: Client Reconnection
-- MSG_RECONNECT (0x48) + MSG_RECONNECT_ACK (0x49) wire messages
-- LSP daemon loop: listen socket in select(), pubkey-matched reconnection
-- Client reconnect from persisted state with nonce re-exchange
-- Retry loop with 5-second backoff on disconnect
-
-### Phase 17: Demo Polish
-- MSG_CREATE_INVOICE (0x4A) + MSG_INVOICE_CREATED (0x4B) wire messages
-- Client-side invoice store: random preimage → SHA256 → payment_hash
-- LSP-orchestrated client-to-client payments with real preimage validation
-- `--demo` flag: scripted 4-payment demo sequence with balance reporting
-
-### Phase 18: Watchtower + Fee Estimation
-- **Fee estimation module** (`fee.c`): configurable `--fee-rate` (sat/kvB), replaces all hardcoded 500-sat fees
-  - Penalty tx: ~152 vB, HTLC tx: ~180 vB, factory tx: ~50+43*n vB
-  - Integrated into channel.c (4 fee sites) and factory.c (tree build)
-- **Watchtower** (`watchtower.c`): breach detection and penalty enforcement
-  - Monitors chain for revoked commitment txids every 5s in daemon loop
-  - Builds and broadcasts penalty txs via `channel_build_penalty_tx()`
-  - Old commitment tracking persisted in `old_commitments` SQLite table
-  - Integrated into LSP daemon loop via `lsp_channel_mgr_t.watchtower`
-- **Persistence**: new `old_commitments` table (7th table) for watchtower state
-- **Regtest helper**: `regtest_get_raw_tx()` for tx hex retrieval
-- 134/134 tests pass (115 unit + 19 regtest)
-
-### Phase 19: Encrypted Transport
-- ChaCha20-Poly1305 AEAD encryption (RFC 7539)
-- HMAC-SHA256 key derivation (RFC 4231)
-- Noise-style XX handshake: ephemeral ECDH + static key exchange
-- All wire messages encrypted after handshake with rotating nonces
-
-### Phase 20: Signet Interop
-- `--network` flag (regtest/signet/testnet/mainnet), `--cli-path`, `--rpcuser`, `--rpcpassword`
-- Signet-aware funding: balance check + confirmation wait instead of mining
-- Bridge integration in daemon loop: message-type dispatch (BRIDGE_HELLO vs RECONNECT)
-- CLN plugin: real `lightning-cli pay` via subprocess + `superscalar-pay` RPC
-- `tools/signet_setup.sh`: subcommand-based signet infrastructure setup (14 commands)
-
-### Phase 21: Web Dashboard + Signet Setup Rewrite
-- `tools/dashboard.py`: stdlib-only Python3 web dashboard (http.server + sqlite3 + subprocess)
-  - Dark theme, 7 tabs (Overview, Factory, Channels, Protocol Log, Lightning, Watchtower, Events)
-  - 4 data collectors (processes, bitcoin, databases, CLN), auto-refresh
-  - `--demo` mode with simulated data for UI preview
-- `tools/signet_setup.sh`: rewritten with 14 subcommands, colored output, python3 JSON parsing
-
-### Phase 22: Persist In-Memory State + Dashboard Exposure
-- **Wire message logging**: callback mechanism in `wire_send()`/`wire_recv()`, fd-to-peer-label map, all 36 message types named
-- **3 new SQLite tables**: `wire_messages` (protocol log), `tree_nodes` (factory tree topology), `ladder_factories` (lifecycle state)
-- **Dashboard Protocol Log tab**: color-coded message categories (channel/factory/bridge/close/invoice/error)
-- **Dashboard tree visualization**: interactive factory tree node layout + detail table
-- **Dashboard ladder section**: factory lifecycle progress bars (ACTIVE → DYING → EXPIRED)
-- 137/137 tests pass (118 unit + 19 regtest)
-
-### Phase 23: Persistence Hardening
-- **6 new SQLite tables**: dw_counter_state, departed_clients, invoice_registry, htlc_origins, client_invoices, id_counters
-- **14 new persist functions**: save/load/deactivate for DW counter epochs, departed client keys, invoice registry, HTLC origin tracking, client invoices, ID counters
-- **LSP wiring**: persist invoice registration, HTLC origin tracking, fulfillment deactivation, DW counter save on factory creation, startup reload from DB
-- **Client wiring**: persist client invoices on creation, deactivate on preimage consumption, reload on daemon startup
-- **Dashboard**: 6 new queries, demo data, and display sections for all new tables
-- 143/143 tests pass (124 unit + 19 regtest)
-
-### Tier 1: Demo Protections
-- `--breach-test`: broadcast revoked commitment after demo, trigger penalty tx
-- `--test-expiry`: mine past CLTV timeout, recover via timeout script path
-- `--test-distrib`: mine past CLTV, broadcast pre-signed distribution tx
-- `--test-turnover`: PTLC key turnover for all clients (local keypairs), cooperative close
-- Factory lifecycle integration: `factory_set_lifecycle()` on factory creation, state monitoring in daemon loop
-- 146/146 tests pass (127 unit + 19 regtest)
-
-### Tier 2: Daemon Feature Wiring
-- Ladder manager wired into LSP daemon loop: block-height polling, state transition logging
-- Distribution tx construction and auto-broadcast on FACTORY_EXPIRED
-- Departed client persistence: `persist_save_departed_client()` for crash recovery
-- DW counter advancement logged and persisted during daemon block monitoring
-- 149/149 tests pass (130 unit + 19 regtest)
-
-### Tier 3: Factory Rotation + PTLC Wire Protocol
-- **3 new PTLC wire messages**: MSG_PTLC_PRESIG (0x4C), MSG_PTLC_ADAPTED_SIG (0x4D), MSG_PTLC_COMPLETE (0x4E)
-- **PTLC key turnover over wire**: LSP sends adaptor pre-signature, client adapts with secret key, LSP extracts key
-- **Factory rotation**: `client_do_factory_rotation()` — condensed factory creation without HELLO handshake
-- **Client daemon handling**: MSG_PTLC_PRESIG (adapt + send sig) and MSG_FACTORY_PROPOSE (rotation) in daemon callback
-- **Multi-factory monitoring**: daemon loop tracks all ladder factory slots, not just factories[0]
-- **`--test-rotation` flag**: full SuperScalar lifecycle demo:
-  Factory 0 → payments → PTLC turnover over wire → ladder close → Factory 1 creation → payment → cooperative close
-- 152/152 tests pass (133 unit + 19 regtest)
+| Module | File | Purpose |
+|--------|------|---------|
+| `dw_state` | dw_state.c | nSequence state machine, odometer-style multi-layer counter |
+| `musig` | musig.c | MuSig2 key aggregation, 2-round signing, split-round protocol, nonce pools |
+| `tx_builder` | tx_builder.c | Raw tx serialization, BIP-341 key-path sighash, witness finalization |
+| `tapscript` | tapscript.c | TapLeaf/TapBranch hashing, CLTV timeout scripts, control blocks |
+| `factory` | factory.c | Factory tree: build, sign, advance, timeout-sig-tree outputs, cooperative close |
+| `shachain` | shachain.c | BOLT #3 shachain, compact storage, epoch-to-index mapping |
+| `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
+| `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
+| `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, migration |
+| `wire` | wire.c | TCP transport, JSON framing, 39 message types |
+| `lsp` | lsp.c | LSP server: factory creation, cooperative close |
+| `client` | client.c | Client: factory ceremony, channel ops, rotation |
+| `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, watchtower, multi-factory |
+| `persist` | persist.c | SQLite3: 17 tables for full state persistence |
+| `bridge` | bridge.c | CLN bridge daemon |
+| `fee` | fee.c | Configurable fee estimation |
+| `watchtower` | watchtower.c | Breach detection + penalty broadcast |
+| `keyfile` | keyfile.c | Encrypted keyfile storage |
+| `regtest` | regtest.c | bitcoin-cli subprocess harness |
+| `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
 
 ## License
 
