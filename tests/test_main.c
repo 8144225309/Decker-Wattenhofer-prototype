@@ -269,6 +269,10 @@ extern int test_multi_factory_ladder_monitor(void);
 extern int test_wire_channel_basepoints_round_trip(void);
 extern int test_basepoint_independence(void);
 
+/* Random Basepoints */
+extern int test_random_basepoints(void);
+extern int test_persist_basepoints(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -492,6 +496,10 @@ static void run_unit_tests(void) {
     printf("\n=== Basepoint Exchange (Gap #1) ===\n");
     RUN_TEST(test_wire_channel_basepoints_round_trip);
     RUN_TEST(test_basepoint_independence);
+
+    printf("\n=== Random Basepoints ===\n");
+    RUN_TEST(test_random_basepoints);
+    RUN_TEST(test_persist_basepoints);
 }
 
 static void run_regtest_tests(void) {

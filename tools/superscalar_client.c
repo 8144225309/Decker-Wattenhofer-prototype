@@ -218,13 +218,14 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                                void *user_data) {
     daemon_cb_data_t *cbd = (daemon_cb_data_t *)user_data;
 
-    /* Save factory + channel state on first entry (Phase 16 persistence) */
+    /* Save factory + channel + basepoints on first entry (Phase 16 persistence) */
     if (cbd && cbd->db && !cbd->saved_initial) {
         persist_save_factory(cbd->db, factory, ctx, 0);
         uint32_t client_idx = my_index - 1;
         persist_save_channel(cbd->db, ch, 0, client_idx);
+        persist_save_basepoints(cbd->db, client_idx, ch);
         cbd->saved_initial = 1;
-        printf("Client %u: persisted factory + channel to DB\n", my_index);
+        printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
     }
 
     secp256k1_pubkey my_pubkey;

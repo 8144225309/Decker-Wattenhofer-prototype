@@ -271,6 +271,14 @@ void channel_update_funding(channel_t *ch,
                               const unsigned char *new_funding_spk,
                               size_t new_funding_spk_len);
 
+/* --- Random bytes utility --- */
+
+int channel_read_random_bytes(unsigned char *buf, size_t len);
+
+/* Generate random basepoint secrets and set local basepoints.
+   Returns 1 on success, 0 on urandom failure. */
+int channel_generate_random_basepoints(channel_t *ch);
+
 /* --- HTLC basepoints --- */
 
 void channel_set_local_htlc_basepoint(channel_t *ch,

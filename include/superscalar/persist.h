@@ -224,6 +224,18 @@ size_t persist_load_client_invoices(persist_t *p,
                                      uint64_t *amounts_out,
                                      size_t max_invoices);
 
+/* --- Channel basepoints --- */
+
+/* Save local basepoint secrets + remote basepoint pubkeys for a channel. */
+int persist_save_basepoints(persist_t *p, uint32_t channel_id,
+                             const channel_t *ch);
+
+/* Load basepoints from DB. local_secrets[4][32] = pay/delay/revoc/htlc secrets.
+   remote_bps[4][33] = compressed pubkeys in same order. Returns 1 on success. */
+int persist_load_basepoints(persist_t *p, uint32_t channel_id,
+                             unsigned char local_secrets[4][32],
+                             unsigned char remote_bps[4][33]);
+
 /* --- ID counters (Phase 23) --- */
 
 int persist_save_counter(persist_t *p, const char *name, uint64_t value);

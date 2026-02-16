@@ -2840,3 +2840,72 @@ int test_regtest_channel_penalty(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Test: Random basepoint generation ---- */
+
+int test_random_basepoints(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    /* Set up a minimal channel */
+    secp256k1_pubkey local_pk, remote_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_pk, local_funding_secret);
+    secp256k1_ec_pubkey_create(ctx, &remote_pk, remote_funding_secret);
+
+    unsigned char spk[34];
+    TEST_ASSERT(compute_channel_funding_spk(ctx, &local_pk, &remote_pk, spk),
+                "compute funding spk");
+
+    unsigned char txid[32] = {0};
+
+    channel_t ch1, ch2;
+    TEST_ASSERT(channel_init(&ch1, ctx, local_funding_secret, &local_pk, &remote_pk,
+                              txid, 0, 100000, spk, 34, 40000, 40000,
+                              CHANNEL_DEFAULT_CSV_DELAY), "init ch1");
+    TEST_ASSERT(channel_init(&ch2, ctx, local_funding_secret, &local_pk, &remote_pk,
+                              txid, 0, 100000, spk, 34, 40000, 40000,
+                              CHANNEL_DEFAULT_CSV_DELAY), "init ch2");
+
+    /* Generate random basepoints */
+    TEST_ASSERT(channel_generate_random_basepoints(&ch1), "gen basepoints ch1");
+    TEST_ASSERT(channel_generate_random_basepoints(&ch2), "gen basepoints ch2");
+
+    /* Verify all 4 pubkeys are valid (non-zero) */
+    unsigned char ser1[33], ser2[33];
+    size_t len;
+
+    len = 33;
+    TEST_ASSERT(secp256k1_ec_pubkey_serialize(ctx, ser1, &len,
+        &ch1.local_payment_basepoint, SECP256K1_EC_COMPRESSED), "serialize pay bp1");
+    len = 33;
+    TEST_ASSERT(secp256k1_ec_pubkey_serialize(ctx, ser2, &len,
+        &ch2.local_payment_basepoint, SECP256K1_EC_COMPRESSED), "serialize pay bp2");
+
+    /* Two random generations should produce different secrets */
+    TEST_ASSERT(memcmp(ch1.local_payment_basepoint_secret,
+                       ch2.local_payment_basepoint_secret, 32) != 0,
+                "different payment secrets");
+    TEST_ASSERT(memcmp(ch1.local_delayed_payment_basepoint_secret,
+                       ch2.local_delayed_payment_basepoint_secret, 32) != 0,
+                "different delayed secrets");
+    TEST_ASSERT(memcmp(ch1.local_revocation_basepoint_secret,
+                       ch2.local_revocation_basepoint_secret, 32) != 0,
+                "different revocation secrets");
+    TEST_ASSERT(memcmp(ch1.local_htlc_basepoint_secret,
+                       ch2.local_htlc_basepoint_secret, 32) != 0,
+                "different htlc secrets");
+
+    /* Verify secrets produce matching pubkeys */
+    secp256k1_pubkey verify_pk;
+    TEST_ASSERT(secp256k1_ec_pubkey_create(ctx, &verify_pk,
+        ch1.local_payment_basepoint_secret), "create from pay secret");
+    unsigned char vser[33], cser[33];
+    len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, vser, &len, &verify_pk, SECP256K1_EC_COMPRESSED);
+    len = 33;
+    secp256k1_ec_pubkey_serialize(ctx, cser, &len,
+        &ch1.local_payment_basepoint, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT_MEM_EQ(vser, cser, 33, "pay secret matches pubkey");
+
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

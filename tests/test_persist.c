@@ -529,3 +529,102 @@ int test_persist_counter_round_trip(void) {
     persist_close(&db);
     return 1;
 }
+
+/* ---- Test: Basepoint persistence round-trip ---- */
+
+int test_persist_basepoints(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    secp256k1_context *ctx = test_ctx();
+
+    /* Create a channel with known basepoint secrets */
+    secp256k1_pubkey local_pk, remote_pk;
+    secp256k1_ec_pubkey_create(ctx, &local_pk, seckeys[0]);
+    secp256k1_ec_pubkey_create(ctx, &remote_pk, seckeys[1]);
+
+    /* Build funding SPK */
+    extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned char *);
+    secp256k1_pubkey pks[2] = { local_pk, remote_pk };
+    musig_keyagg_t ka;
+    TEST_ASSERT(musig_aggregate_keys(ctx, &ka, pks, 2), "keyagg");
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char twk[32];
+    sha256_tagged("TapTweak", internal_ser, 32, twk);
+    musig_keyagg_t ka2 = ka;
+    secp256k1_pubkey tweaked;
+    TEST_ASSERT(secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked, &ka2.cache, twk), "tweak");
+    secp256k1_xonly_pubkey twx;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &twx, NULL, &tweaked);
+    unsigned char spk[34];
+    build_p2tr_script_pubkey(spk, &twx);
+
+    unsigned char txid[32] = {0};
+    channel_t ch;
+    TEST_ASSERT(channel_init(&ch, ctx, seckeys[0], &local_pk, &remote_pk,
+                              txid, 0, 100000, spk, 34, 40000, 40000,
+                              CHANNEL_DEFAULT_CSV_DELAY), "init ch");
+
+    /* Set local basepoints with known secrets */
+    unsigned char pay_sec[32] = { [0 ... 31] = 0xAA };
+    unsigned char delay_sec[32] = { [0 ... 31] = 0xBB };
+    unsigned char revoc_sec[32] = { [0 ... 31] = 0xCC };
+    unsigned char htlc_sec[32] = { [0 ... 31] = 0xDD };
+    channel_set_local_basepoints(&ch, pay_sec, delay_sec, revoc_sec);
+    channel_set_local_htlc_basepoint(&ch, htlc_sec);
+
+    /* Set remote basepoints */
+    secp256k1_pubkey rpay, rdelay, rrevoc, rhtlc;
+    unsigned char rsec1[32] = { [0 ... 31] = 0x61 };
+    unsigned char rsec2[32] = { [0 ... 31] = 0x71 };
+    unsigned char rsec3[32] = { [0 ... 31] = 0x81 };
+    unsigned char rsec4[32] = { [0 ... 31] = 0x91 };
+    secp256k1_ec_pubkey_create(ctx, &rpay, rsec1);
+    secp256k1_ec_pubkey_create(ctx, &rdelay, rsec2);
+    secp256k1_ec_pubkey_create(ctx, &rrevoc, rsec3);
+    secp256k1_ec_pubkey_create(ctx, &rhtlc, rsec4);
+    channel_set_remote_basepoints(&ch, &rpay, &rdelay, &rrevoc);
+    channel_set_remote_htlc_basepoint(&ch, &rhtlc);
+
+    /* Save */
+    TEST_ASSERT(persist_save_basepoints(&db, 0, &ch), "save basepoints");
+
+    /* Load */
+    unsigned char loaded_local[4][32];
+    unsigned char loaded_remote[4][33];
+    TEST_ASSERT(persist_load_basepoints(&db, 0, loaded_local, loaded_remote),
+                "load basepoints");
+
+    /* Verify local secrets */
+    TEST_ASSERT(memcmp(loaded_local[0], pay_sec, 32) == 0, "pay secret match");
+    TEST_ASSERT(memcmp(loaded_local[1], delay_sec, 32) == 0, "delay secret match");
+    TEST_ASSERT(memcmp(loaded_local[2], revoc_sec, 32) == 0, "revoc secret match");
+    TEST_ASSERT(memcmp(loaded_local[3], htlc_sec, 32) == 0, "htlc secret match");
+
+    /* Verify remote pubkeys */
+    unsigned char expected_remote[33];
+    size_t slen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, expected_remote, &slen, &rpay, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(loaded_remote[0], expected_remote, 33) == 0, "remote pay bp match");
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, expected_remote, &slen, &rdelay, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(loaded_remote[1], expected_remote, 33) == 0, "remote delay bp match");
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, expected_remote, &slen, &rrevoc, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(loaded_remote[2], expected_remote, 33) == 0, "remote revoc bp match");
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ctx, expected_remote, &slen, &rhtlc, SECP256K1_EC_COMPRESSED);
+    TEST_ASSERT(memcmp(loaded_remote[3], expected_remote, 33) == 0, "remote htlc bp match");
+
+    /* Verify loading non-existent channel fails */
+    TEST_ASSERT(!persist_load_basepoints(&db, 99, loaded_local, loaded_remote),
+                "non-existent channel fails");
+
+    secp256k1_context_destroy(ctx);
+    persist_close(&db);
+    return 1;
+}

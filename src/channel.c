@@ -284,6 +284,20 @@ void channel_set_local_basepoints(channel_t *ch,
     memcpy(ch->local_revocation_basepoint_secret, revocation_secret32, 32);
     secp256k1_ec_pubkey_create(ch->ctx, &ch->local_revocation_basepoint,
                                 revocation_secret32);
+
+#if BASEPOINT_DIAG
+    {
+        unsigned char s1[33], s2[33], s3[33];
+        size_t l = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, s1, &l, &ch->local_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        l = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, s2, &l, &ch->local_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
+        l = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, s3, &l, &ch->local_revocation_basepoint, SECP256K1_EC_COMPRESSED);
+        fprintf(stderr, "DIAG basepoint: set local pay=%02x%02x%02x%02x delay=%02x%02x%02x%02x revoc=%02x%02x%02x%02x\n",
+                s1[0],s1[1],s1[2],s1[3], s2[0],s2[1],s2[2],s2[3], s3[0],s3[1],s3[2],s3[3]);
+    }
+#endif
 }
 
 void channel_set_remote_basepoints(channel_t *ch,
@@ -293,11 +307,54 @@ void channel_set_remote_basepoints(channel_t *ch,
     ch->remote_payment_basepoint = *payment;
     ch->remote_delayed_payment_basepoint = *delayed_payment;
     ch->remote_revocation_basepoint = *revocation;
+
+#if BASEPOINT_DIAG
+    {
+        unsigned char s1[33], s2[33], s3[33];
+        size_t l = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, s1, &l, payment, SECP256K1_EC_COMPRESSED);
+        l = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, s2, &l, delayed_payment, SECP256K1_EC_COMPRESSED);
+        l = 33;
+        secp256k1_ec_pubkey_serialize(ch->ctx, s3, &l, revocation, SECP256K1_EC_COMPRESSED);
+        fprintf(stderr, "DIAG basepoint: set remote pay=%02x%02x%02x%02x delay=%02x%02x%02x%02x revoc=%02x%02x%02x%02x\n",
+                s1[0],s1[1],s1[2],s1[3], s2[0],s2[1],s2[2],s2[3], s3[0],s3[1],s3[2],s3[3]);
+    }
+#endif
+}
+
+/* ---- Random basepoint generation ---- */
+
+#ifndef BASEPOINT_DIAG
+#define BASEPOINT_DIAG 1
+#endif
+
+int channel_generate_random_basepoints(channel_t *ch) {
+    unsigned char ps[32], ds[32], rs[32], hs[32];
+    if (!channel_read_random_bytes(ps, 32) || !channel_read_random_bytes(ds, 32) ||
+        !channel_read_random_bytes(rs, 32) || !channel_read_random_bytes(hs, 32)) {
+        return 0;
+    }
+
+#if BASEPOINT_DIAG
+    fprintf(stderr, "DIAG basepoint: generated random (pay=%02x%02x..., delay=%02x%02x..., "
+            "revoc=%02x%02x..., htlc=%02x%02x...)\n",
+            ps[0], ps[1], ds[0], ds[1], rs[0], rs[1], hs[0], hs[1]);
+#endif
+
+    channel_set_local_basepoints(ch, ps, ds, rs);
+    channel_set_local_htlc_basepoint(ch, hs);
+
+    memset(ps, 0, 32);
+    memset(ds, 0, 32);
+    memset(rs, 0, 32);
+    memset(hs, 0, 32);
+    return 1;
 }
 
 /* ---- Per-commitment secret flat storage ---- */
 
-static int read_random_bytes(unsigned char *buf, size_t len) {
+int channel_read_random_bytes(unsigned char *buf, size_t len) {
     int fd = open("/dev/urandom", O_RDONLY);
     if (fd < 0) return 0;
     ssize_t n = read(fd, buf, len);
@@ -307,7 +364,7 @@ static int read_random_bytes(unsigned char *buf, size_t len) {
 
 int channel_generate_local_pcs(channel_t *ch, uint64_t commitment_num) {
     if (commitment_num >= CHANNEL_MAX_SECRETS) return 0;
-    if (!read_random_bytes(ch->local_pcs[commitment_num], 32))
+    if (!channel_read_random_bytes(ch->local_pcs[commitment_num], 32))
         return 0;
     if (commitment_num + 1 > ch->n_local_pcs)
         ch->n_local_pcs = (size_t)(commitment_num + 1);

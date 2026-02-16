@@ -5,6 +5,10 @@
 #include <stdlib.h>
 #include <time.h>
 
+#ifndef BASEPOINT_DIAG
+#define BASEPOINT_DIAG 1
+#endif
+
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
@@ -169,6 +173,17 @@ static const char *SCHEMA_SQL =
     "  commit_num INTEGER NOT NULL,"
     "  point TEXT NOT NULL,"
     "  PRIMARY KEY (channel_id, commit_num)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS channel_basepoints ("
+    "  channel_id INTEGER PRIMARY KEY,"
+    "  local_payment_secret TEXT NOT NULL,"
+    "  local_delayed_secret TEXT NOT NULL,"
+    "  local_revocation_secret TEXT NOT NULL,"
+    "  local_htlc_secret TEXT NOT NULL,"
+    "  remote_payment_bp TEXT NOT NULL,"
+    "  remote_delayed_bp TEXT NOT NULL,"
+    "  remote_revocation_bp TEXT NOT NULL,"
+    "  remote_htlc_bp TEXT NOT NULL"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -1473,6 +1488,127 @@ size_t persist_load_client_invoices(persist_t *p,
 
     sqlite3_finalize(stmt);
     return count;
+}
+
+/* --- Channel basepoints --- */
+
+int persist_save_basepoints(persist_t *p, uint32_t channel_id,
+                             const channel_t *ch) {
+    if (!p || !p->db || !ch) return 0;
+
+    /* Encode 4 local secrets as hex */
+    char pay_hex[65], delay_hex[65], revoc_hex[65], htlc_hex[65];
+    hex_encode(ch->local_payment_basepoint_secret, 32, pay_hex);
+    hex_encode(ch->local_delayed_payment_basepoint_secret, 32, delay_hex);
+    hex_encode(ch->local_revocation_basepoint_secret, 32, revoc_hex);
+    hex_encode(ch->local_htlc_basepoint_secret, 32, htlc_hex);
+
+    /* Encode 4 remote pubkeys as compressed hex */
+    unsigned char ser[33];
+    size_t slen;
+    char rpay_hex[67], rdelay_hex[67], rrevoc_hex[67], rhtlc_hex[67];
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+        &ch->remote_payment_basepoint, SECP256K1_EC_COMPRESSED);
+    hex_encode(ser, 33, rpay_hex);
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+        &ch->remote_delayed_payment_basepoint, SECP256K1_EC_COMPRESSED);
+    hex_encode(ser, 33, rdelay_hex);
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+        &ch->remote_revocation_basepoint, SECP256K1_EC_COMPRESSED);
+    hex_encode(ser, 33, rrevoc_hex);
+
+    slen = 33;
+    secp256k1_ec_pubkey_serialize(ch->ctx, ser, &slen,
+        &ch->remote_htlc_basepoint, SECP256K1_EC_COMPRESSED);
+    hex_encode(ser, 33, rhtlc_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO channel_basepoints "
+        "(channel_id, local_payment_secret, local_delayed_secret, "
+        " local_revocation_secret, local_htlc_secret, "
+        " remote_payment_bp, remote_delayed_bp, "
+        " remote_revocation_bp, remote_htlc_bp) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_text(stmt, 2, pay_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 3, delay_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, revoc_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 5, htlc_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 6, rpay_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 7, rdelay_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 8, rrevoc_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 9, rhtlc_hex, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+
+#if BASEPOINT_DIAG
+    if (ok)
+        fprintf(stderr, "DIAG basepoint: saved to DB channel_id=%u\n", channel_id);
+#endif
+
+    return ok;
+}
+
+int persist_load_basepoints(persist_t *p, uint32_t channel_id,
+                             unsigned char local_secrets[4][32],
+                             unsigned char remote_bps[4][33]) {
+    if (!p || !p->db || !local_secrets || !remote_bps) return 0;
+
+    const char *sql =
+        "SELECT local_payment_secret, local_delayed_secret, "
+        "local_revocation_secret, local_htlc_secret, "
+        "remote_payment_bp, remote_delayed_bp, "
+        "remote_revocation_bp, remote_htlc_bp "
+        "FROM channel_basepoints WHERE channel_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+
+    if (sqlite3_step(stmt) != SQLITE_ROW) {
+        sqlite3_finalize(stmt);
+        return 0;
+    }
+
+    /* Decode 4 local secrets */
+    for (int i = 0; i < 4; i++) {
+        const char *hex = (const char *)sqlite3_column_text(stmt, i);
+        if (!hex || hex_decode(hex, local_secrets[i], 32) != 32) {
+            sqlite3_finalize(stmt);
+            return 0;
+        }
+    }
+
+    /* Decode 4 remote pubkeys */
+    for (int i = 0; i < 4; i++) {
+        const char *hex = (const char *)sqlite3_column_text(stmt, 4 + i);
+        if (!hex || hex_decode(hex, remote_bps[i], 33) != 33) {
+            sqlite3_finalize(stmt);
+            return 0;
+        }
+    }
+
+    sqlite3_finalize(stmt);
+
+#if BASEPOINT_DIAG
+    fprintf(stderr, "DIAG basepoint: loaded from DB channel_id=%u\n", channel_id);
+#endif
+
+    return 1;
 }
 
 /* --- ID counters --- */
