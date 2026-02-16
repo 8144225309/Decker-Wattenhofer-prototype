@@ -4,6 +4,8 @@
 #include <stdint.h>
 #include <stddef.h>
 
+struct regtest_t;  /* forward declaration */
+
 typedef struct {
     uint64_t fee_rate_sat_per_kvb;  /* sat/kilo-vbyte (matches Core's units) */
     int use_estimatesmartfee;        /* if 1, try bitcoin-cli estimatesmartfee */
@@ -11,6 +13,11 @@ typedef struct {
 
 /* Initialize with a default fee rate (1000 sat/kvB = 1 sat/vB). */
 void fee_init(fee_estimator_t *fe, uint64_t default_rate_sat_per_kvb);
+
+/* Query bitcoind estimatesmartfee for target_blocks confirmation.
+   Updates fee_rate_sat_per_kvb if RPC succeeds; keeps current rate on failure.
+   Returns 1 if updated, 0 if RPC failed (rate unchanged). */
+int fee_update_from_node(fee_estimator_t *fe, void *rt, int target_blocks);
 
 /* Estimate fee for a tx of given virtual size. Returns fee in sats. */
 uint64_t fee_estimate(const fee_estimator_t *fe, size_t vsize_bytes);

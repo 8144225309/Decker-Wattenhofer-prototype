@@ -1,11 +1,47 @@
 #include "superscalar/fee.h"
+#include "superscalar/regtest.h"
+#include "cJSON.h"
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
 void fee_init(fee_estimator_t *fe, uint64_t default_rate_sat_per_kvb) {
     if (!fe) return;
     memset(fe, 0, sizeof(*fe));
     fe->fee_rate_sat_per_kvb = default_rate_sat_per_kvb;
     fe->use_estimatesmartfee = 0;
+}
+
+int fee_update_from_node(fee_estimator_t *fe, void *rt_ptr, int target_blocks) {
+    if (!fe || !rt_ptr || target_blocks < 1) return 0;
+    regtest_t *rt = (regtest_t *)rt_ptr;
+
+    char params[32];
+    snprintf(params, sizeof(params), "%d", target_blocks);
+    char *result = regtest_exec(rt, "estimatesmartfee", params);
+    if (!result) return 0;
+
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json) return 0;
+
+    /* estimatesmartfee returns {"feerate": BTC_per_kvB, "blocks": N}
+       or {"errors": [...]} if insufficient data */
+    cJSON *feerate = cJSON_GetObjectItem(json, "feerate");
+    if (!feerate || !cJSON_IsNumber(feerate) || feerate->valuedouble <= 0) {
+        cJSON_Delete(json);
+        return 0;
+    }
+
+    /* Convert BTC/kvB to sat/kvB: multiply by 100,000,000 */
+    uint64_t sat_per_kvb = (uint64_t)(feerate->valuedouble * 100000000.0 + 0.5);
+
+    /* Clamp to minimum 1000 sat/kvB (1 sat/vB) */
+    if (sat_per_kvb < 1000) sat_per_kvb = 1000;
+
+    fe->fee_rate_sat_per_kvb = sat_per_kvb;
+    cJSON_Delete(json);
+    return 1;
 }
 
 uint64_t fee_estimate(const fee_estimator_t *fe, size_t vsize_bytes) {

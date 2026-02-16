@@ -471,7 +471,12 @@ int main(int argc, char *argv[]) {
     /* Initialize fee estimator */
     fee_estimator_t fee_est;
     fee_init(&fee_est, fee_rate);
-    printf("LSP: fee rate: %llu sat/kvB\n", (unsigned long long)fee_rate);
+    if (!is_regtest && fee_update_from_node(&fee_est, &rt, 6)) {
+        printf("LSP: fee rate from estimatesmartfee(6): %llu sat/kvB\n",
+               (unsigned long long)fee_est.fee_rate_sat_per_kvb);
+    } else {
+        printf("LSP: fee rate (static): %llu sat/kvB\n", (unsigned long long)fee_rate);
+    }
 
     /* === Phase 1: Accept clients === */
     printf("LSP: listening on port %d, waiting for %d clients...\n", port, n_clients);

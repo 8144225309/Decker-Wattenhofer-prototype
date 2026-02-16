@@ -607,6 +607,25 @@ int test_fee_factory_tx(void) {
     return 1;
 }
 
+/* Test: fee_update_from_node with NULL/invalid args */
+int test_fee_update_from_node_null(void) {
+    fee_estimator_t fe;
+    fee_init(&fe, 1000);
+
+    /* NULL rt should fail gracefully, rate unchanged */
+    TEST_ASSERT(!fee_update_from_node(&fe, NULL, 6), "NULL rt returns 0");
+    TEST_ASSERT_EQ(fe.fee_rate_sat_per_kvb, 1000, "rate unchanged after NULL");
+
+    /* Invalid target should fail */
+    TEST_ASSERT(!fee_update_from_node(&fe, NULL, 0), "target=0 returns 0");
+    TEST_ASSERT(!fee_update_from_node(&fe, NULL, -1), "target=-1 returns 0");
+
+    /* NULL fe should not crash */
+    TEST_ASSERT(!fee_update_from_node(NULL, NULL, 6), "NULL fe returns 0");
+
+    return 1;
+}
+
 /* Test 11: watchtower watch and check (no breach) */
 int test_watchtower_watch_and_check(void) {
     secp256k1_context *ctx = test_ctx();

@@ -203,6 +203,7 @@ extern int test_balance_reporting(void);
 extern int test_fee_init_default(void);
 extern int test_fee_penalty_tx(void);
 extern int test_fee_factory_tx(void);
+extern int test_fee_update_from_node_null(void);
 extern int test_watchtower_watch_and_check(void);
 extern int test_persist_old_commitments(void);
 extern int test_regtest_get_raw_tx_api(void);
@@ -453,6 +454,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_fee_init_default);
     RUN_TEST(test_fee_penalty_tx);
     RUN_TEST(test_fee_factory_tx);
+    RUN_TEST(test_fee_update_from_node_null);
     RUN_TEST(test_watchtower_watch_and_check);
     RUN_TEST(test_persist_old_commitments);
     RUN_TEST(test_regtest_get_raw_tx_api);
