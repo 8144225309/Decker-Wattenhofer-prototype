@@ -88,6 +88,7 @@ typedef struct {
     /* Config */
     uint32_t to_self_delay;
     uint64_t fee_rate_sat_per_kvb;  /* sat/kvB for penalty/HTLC txs (default 1000) */
+    int funder_is_local;  /* 1 if local side is the channel funder (pays commit fee) */
 
     /* MuSig2 signer index: 0 or 1 in the canonical 2-of-2 keyagg order.
        Needed for distributed signing (Phase 12). */

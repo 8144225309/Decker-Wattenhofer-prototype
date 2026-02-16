@@ -1,4 +1,5 @@
 #include "superscalar/lsp_channels.h"
+#include "superscalar/fee.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
 #include "superscalar/ladder.h"
@@ -116,9 +117,10 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Client pubkey (participant c+1) */
         const secp256k1_pubkey *client_pubkey = &factory->pubkeys[c + 1];
 
-        /* Commitment tx fee: 2 P2TR outputs + 1 taproot key-spend input
-         * = 154 vbytes.  Deduct from usable balance (LSP = funder = local). */
-        uint64_t commit_fee = (1000 * 154 + 999) / 1000;  /* 154 sats at 1 sat/vB */
+        /* Commitment tx fee: base 154 vB (dynamic with HTLCs via fee module). */
+        fee_estimator_t _fe;
+        fee_init(&_fe, 1000);
+        uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
         uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
         uint64_t local_amount = usable / 2;
         uint64_t remote_amount = usable - local_amount;
@@ -134,6 +136,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                            local_amount, remote_amount,
                            CHANNEL_DEFAULT_CSV_DELAY))
             return 0;
+        entry->channel.funder_is_local = 1;  /* LSP is funder and local */
 
         /* Generate random basepoint secrets */
         if (!channel_generate_random_basepoints(&entry->channel)) {

@@ -1,6 +1,7 @@
 #include "superscalar/client.h"
 #include "superscalar/wire.h"
 #include "superscalar/factory.h"
+#include "superscalar/fee.h"
 #include "superscalar/musig.h"
 #include "superscalar/persist.h"
 #include "superscalar/shachain.h"
@@ -72,9 +73,10 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
     /* LSP pubkey (participant 0) */
     const secp256k1_pubkey *lsp_pubkey = &factory->pubkeys[0];
 
-    /* Commitment tx fee: 154 vbytes at 1 sat/vB = 154 sats.
-       Must match lsp_channels_init so both sides agree on amounts. */
-    uint64_t commit_fee = (1000 * 154 + 999) / 1000;
+    /* Commitment tx fee: must match lsp_channels_init so both sides agree. */
+    fee_estimator_t _fe;
+    fee_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
     uint64_t usable = funding_amount > commit_fee ? funding_amount - commit_fee : 0;
     uint64_t local_amount = usable / 2;
     uint64_t remote_amount = usable - local_amount;
@@ -95,6 +97,7 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
         memset(my_seckey, 0, 32);
         return 0;
     }
+    ch->funder_is_local = 0;  /* LSP (remote) is the funder */
 
     /* Set local basepoints from caller-provided random secrets */
     channel_set_local_basepoints(ch, local_pay_sec32, local_delay_sec32, local_revoc_sec32);

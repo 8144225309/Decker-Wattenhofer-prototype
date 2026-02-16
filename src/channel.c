@@ -258,6 +258,7 @@ int channel_init(channel_t *ch, secp256k1_context *ctx,
     ch->remote_amount = remote_amount;
     ch->to_self_delay = to_self_delay;
     ch->fee_rate_sat_per_kvb = 1000;  /* default: 1 sat/vB */
+    ch->funder_is_local = 0;
     ch->commitment_number = 0;
 
     /* Generate random per-commitment secrets for cn=0 and cn=1.
@@ -1084,6 +1085,17 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
         ch->remote_amount -= amount_sats;
     }
 
+    /* Dynamic fee: each HTLC adds 43 vB to commitment tx */
+    uint64_t per_htlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    uint64_t *funder_bal = ch->funder_is_local ? &ch->local_amount : &ch->remote_amount;
+    if (*funder_bal < per_htlc_fee) {
+        /* Rollback HTLC amount deduction */
+        if (direction == HTLC_OFFERED) ch->local_amount += amount_sats;
+        else ch->remote_amount += amount_sats;
+        return 0;
+    }
+    *funder_bal -= per_htlc_fee;
+
     htlc_t *h = &ch->htlcs[ch->n_htlcs++];
     h->direction = direction;
     h->state = HTLC_STATE_ACTIVE;
@@ -1128,6 +1140,11 @@ int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
         ch->local_amount += h->amount_sats;
     }
 
+    /* Refund per-HTLC fee to funder */
+    uint64_t per_htlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    if (ch->funder_is_local) ch->local_amount += per_htlc_fee;
+    else ch->remote_amount += per_htlc_fee;
+
     memcpy(h->payment_preimage, preimage32, 32);
     h->state = HTLC_STATE_FULFILLED;
     ch->commitment_number++;
@@ -1152,6 +1169,11 @@ int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
     } else {
         ch->remote_amount += h->amount_sats;
     }
+
+    /* Refund per-HTLC fee to funder */
+    uint64_t per_htlc_fee = (ch->fee_rate_sat_per_kvb * 43 + 999) / 1000;
+    if (ch->funder_is_local) ch->local_amount += per_htlc_fee;
+    else ch->remote_amount += per_htlc_fee;
 
     h->state = HTLC_STATE_FAILED;
     ch->commitment_number++;

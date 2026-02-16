@@ -21,6 +21,9 @@ uint64_t fee_for_penalty_tx(const fee_estimator_t *fe);
 /* Convenience: HTLC resolution tx is ~180 vB. */
 uint64_t fee_for_htlc_tx(const fee_estimator_t *fe);
 
+/* Convenience: commitment tx is 154 vB base + 43 vB per active HTLC output. */
+uint64_t fee_for_commitment_tx(const fee_estimator_t *fe, size_t n_htlcs);
+
 /* Convenience: factory tree tx (variable). */
 uint64_t fee_for_factory_tx(const fee_estimator_t *fe, size_t n_outputs);
 

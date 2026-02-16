@@ -1,5 +1,6 @@
 #include "superscalar/channel.h"
 #include "superscalar/factory.h"
+#include "superscalar/fee.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
 #include <stdio.h>
@@ -81,6 +82,7 @@ static int setup_channel(channel_t *ch, secp256k1_context *ctx,
                        fund_spk, fund_spk_len,
                        local_amt, remote_amt, CHANNEL_DEFAULT_CSV_DELAY))
         return 0;
+    ch->funder_is_local = 1;
 
     channel_set_local_basepoints(ch, local_payment_secret,
                                    local_delayed_secret,
@@ -520,6 +522,7 @@ int test_channel_penalty_tx(void) {
                                fake_txid, 0, 100000, fund_spk, 34,
                                30000, 70000, CHANNEL_DEFAULT_CSV_DELAY),
                 "init remote channel");
+    remote_ch.funder_is_local = 0;  /* funder is the other side */
 
     secp256k1_pubkey lp, ld, lr;
     secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
@@ -888,7 +891,8 @@ int test_regtest_channel_unilateral(void) {
     /* Channel funding keys must match factory leaf output order:
        setup_leaf_outputs uses [client_a, LSP] for channel A */
     channel_t ch;
-    uint64_t commit_fee = 500;  /* fee for commitment tx */
+    fee_estimator_t _fe; fee_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
     uint64_t usable = chan_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -902,6 +906,7 @@ int test_regtest_channel_unilateral(void) {
                                chan_spk, 34,
                                local_amt, remote_amt, csv_delay),
                 "init channel");
+    ch.funder_is_local = 1;
 
     /* Set basepoints from deterministic keys */
     unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
@@ -1326,7 +1331,8 @@ int test_htlc_add_fulfill(void) {
                                    500000, &htlc_id),
                 "add htlc");
 
-    TEST_ASSERT_EQ(ch.local_amount, 65000, "local balance deducted");
+    /* 70000 - 5000 (HTLC) - 43 (per-HTLC fee, funder=local) = 64957 */
+    TEST_ASSERT_EQ(ch.local_amount, 64957, "local balance deducted + fee");
     TEST_ASSERT_EQ(ch.remote_amount, 30000, "remote balance unchanged");
     TEST_ASSERT_EQ(ch.n_htlcs, 1, "htlc count = 1");
     TEST_ASSERT_EQ(htlc_id, 0, "first htlc id = 0");
@@ -1389,7 +1395,8 @@ int test_htlc_add_fail(void) {
                                    500000, &htlc_id),
                 "add htlc");
 
-    TEST_ASSERT_EQ(ch.local_amount, 62000, "local deducted");
+    /* 70000 - 8000 (HTLC) - 43 (per-HTLC fee, funder=local) = 61957 */
+    TEST_ASSERT_EQ(ch.local_amount, 61957, "local deducted + fee");
 
     /* Fail the HTLC */
     TEST_ASSERT(channel_fail_htlc(&ch, htlc_id), "fail htlc");
@@ -1687,6 +1694,7 @@ int test_htlc_penalty(void) {
                                fake_txid, 0, 100000, fund_spk, 34,
                                30000, 70000, CHANNEL_DEFAULT_CSV_DELAY),
                 "init remote channel");
+    remote_ch.funder_is_local = 0;  /* funder is the other side */
 
     secp256k1_pubkey lp, ld, lr;
     secp256k1_ec_pubkey_create(ctx, &lp, local_payment_secret);
@@ -1912,7 +1920,8 @@ int test_regtest_htlc_success(void) {
     /* Set up channel with HTLC */
     channel_t ch;
     uint32_t csv_delay = 6;
-    uint64_t commit_fee = 500;
+    fee_estimator_t _fe; fee_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
     uint64_t usable = fund_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -1923,6 +1932,7 @@ int test_regtest_htlc_success(void) {
                                fund_spk, 34,
                                local_amt, remote_amt, csv_delay),
                 "init channel");
+    ch.funder_is_local = 1;
 
     unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
     unsigned char chan_delayed_sec[32] = { [0 ... 31] = 0xC2 };
@@ -2138,7 +2148,8 @@ int test_regtest_htlc_timeout(void) {
     /* Set up channel */
     channel_t ch;
     uint32_t csv_delay = 6;
-    uint64_t commit_fee = 500;
+    fee_estimator_t _fe; fee_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
     uint64_t usable = fund_amount - commit_fee;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -2149,6 +2160,7 @@ int test_regtest_htlc_timeout(void) {
                                fund_spk, 34,
                                local_amt, remote_amt, csv_delay),
                 "init channel");
+    ch.funder_is_local = 1;
 
     unsigned char chan_payment_sec[32] = { [0 ... 31] = 0xC1 };
     unsigned char chan_delayed_sec[32] = { [0 ... 31] = 0xC2 };
@@ -2690,7 +2702,8 @@ int test_regtest_channel_penalty(void) {
 
     /* CHEATER channel (Client A perspective) */
     channel_t cheater_ch;
-    uint64_t commit_fee = 500;
+    fee_estimator_t _fe; fee_init(&_fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&_fe, 0);
     uint64_t usable = chan_amount > commit_fee ? chan_amount - commit_fee : chan_amount;
     uint64_t local_amt = usable / 2;
     uint64_t remote_amt = usable - local_amt;
@@ -2705,6 +2718,7 @@ int test_regtest_channel_penalty(void) {
                                chan_spk, 34,
                                local_amt, remote_amt, csv_delay),
                 "init cheater channel");
+    cheater_ch.funder_is_local = 0;  /* LSP (remote) is funder */
 
     unsigned char ch_pay_sec[32] = { [0 ... 31] = 0xC1 };
     unsigned char ch_del_sec[32] = { [0 ... 31] = 0xC2 };
@@ -2728,6 +2742,7 @@ int test_regtest_channel_penalty(void) {
                                chan_spk, 34,
                                remote_amt, local_amt, csv_delay),
                 "init honest channel");
+    honest_ch.funder_is_local = 1;  /* LSP (local here) is funder */
 
     secp256k1_pubkey ch_pay_bp, ch_del_bp, ch_rev_bp;
     secp256k1_ec_pubkey_create(ctx, &ch_pay_bp, ch_pay_sec);
