@@ -45,7 +45,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_txid, uint32_t funding_vout,
                               uint64_t funding_amount,
                               const unsigned char *funding_spk, size_t funding_spk_len,
-                              uint16_t step_blocks, uint32_t states_per_layer);
+                              uint16_t step_blocks, uint32_t states_per_layer,
+                              uint32_t cltv_timeout);
 
 /* Run cooperative close ceremony over the wire.
    Returns 1 on success, fills close_tx_out with signed tx. */

@@ -85,6 +85,7 @@ extern int test_tapscript_tweak_with_tree(void);
 extern int test_tapscript_control_block(void);
 extern int test_tapscript_sighash(void);
 extern int test_factory_tree_with_timeout(void);
+extern int test_multi_level_timeout_unit(void);
 extern int test_regtest_timeout_spend(void);
 
 extern int test_shachain_generation(void);
@@ -330,6 +331,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_tapscript_control_block);
     RUN_TEST(test_tapscript_sighash);
     RUN_TEST(test_factory_tree_with_timeout);
+    RUN_TEST(test_multi_level_timeout_unit);
 
     printf("\n=== Shachain (Factory) ===\n");
     RUN_TEST(test_shachain_generation);

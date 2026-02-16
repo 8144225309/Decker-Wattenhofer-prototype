@@ -63,8 +63,9 @@ typedef struct {
     /* Input amount from parent output */
     uint64_t input_amount;
 
-    /* Timeout script path (state outputs feeding kickoff nodes) */
+    /* Timeout script path (staggered per-node CLTV) */
     int has_taptree;
+    uint32_t cltv_timeout;    /* per-node absolute CLTV for timeout script-path */
     tapscript_leaf_t timeout_leaf;
     unsigned char merkle_root[32];
     int output_parity;        /* parity of tweaked output key */

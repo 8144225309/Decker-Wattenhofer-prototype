@@ -647,12 +647,20 @@ int main(int argc, char *argv[]) {
         secp256k1_context_destroy(ctx);
         return 1;
     }
+    /* Compute cltv_timeout BEFORE factory creation (needed for staggered taptrees) */
+    uint32_t cltv_timeout = 0;
+    {
+        int cur_height = regtest_get_block_height(&rt);
+        if (cur_height > 0)
+            cltv_timeout = (uint32_t)cur_height + 35;
+    }
+
     printf("LSP: starting factory creation ceremony...\n");
     if (!lsp_run_factory_creation(&lsp,
                                    funding_txid, funding_vout,
                                    funding_amount,
                                    fund_spk, 34,
-                                   step_blocks, 4)) {
+                                   step_blocks, 4, cltv_timeout)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_cleanup(&lsp);
         secp256k1_context_destroy(ctx);
@@ -660,12 +668,11 @@ int main(int argc, char *argv[]) {
     }
     printf("LSP: factory creation complete! (%zu nodes signed)\n", lsp.factory.n_nodes);
 
-    /* Set factory lifecycle so it has a visible lifecycle for demo */
+    /* Set factory lifecycle */
     {
         int cur_height = regtest_get_block_height(&rt);
         if (cur_height > 0) {
             factory_set_lifecycle(&lsp.factory, (uint32_t)cur_height, 20, 10);
-            lsp.factory.cltv_timeout = (uint32_t)cur_height + 35;
             printf("LSP: factory lifecycle set at height %d "
                    "(active=20, dying=10, CLTV=%u)\n",
                    cur_height, lsp.factory.cltv_timeout);
@@ -1050,212 +1057,240 @@ int main(int argc, char *argv[]) {
         return 0;
     }
 
-    /* === Expiry Test: mine past CLTV, recover via timeout script === */
+    /* === Expiry Test: multi-level timeout recovery === */
     if (test_expiry && channels_active) {
-        printf("\n=== EXPIRY TEST ===\n");
+        printf("\n=== EXPIRY TEST (Multi-Level Timeout Recovery) ===\n");
 
-        /* Broadcast kickoff_root (node 0) */
+        /* Step 1: Broadcast kickoff_root (node 0, key-path pre-signed) */
         factory_node_t *kickoff_root = &lsp.factory.nodes[0];
-        char *kr_hex = malloc(kickoff_root->signed_tx.len * 2 + 1);
-        hex_encode(kickoff_root->signed_tx.data, kickoff_root->signed_tx.len, kr_hex);
-        char kr_txid_str[65];
-        if (!regtest_send_raw_tx(&rt, kr_hex, kr_txid_str)) {
-            fprintf(stderr, "EXPIRY TEST: kickoff_root broadcast failed\n");
+        {
+            char *kr_hex = malloc(kickoff_root->signed_tx.len * 2 + 1);
+            hex_encode(kickoff_root->signed_tx.data, kickoff_root->signed_tx.len, kr_hex);
+            char kr_txid_str[65];
+            if (!regtest_send_raw_tx(&rt, kr_hex, kr_txid_str)) {
+                fprintf(stderr, "EXPIRY TEST: kickoff_root broadcast failed\n");
+                free(kr_hex);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
             free(kr_hex);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+            regtest_mine_blocks(&rt, 1, mine_addr);
+            printf("1. kickoff_root broadcast: %s\n", kr_txid_str);
         }
-        free(kr_hex);
-        regtest_mine_blocks(&rt, 1, mine_addr);
-        printf("kickoff_root broadcast: %s\n", kr_txid_str);
 
-        /* Broadcast state_root (node 1) — has DW nSequence relative timelock */
+        /* Step 2: Broadcast state_root (node 1, key-path pre-signed) */
         factory_node_t *state_root = &lsp.factory.nodes[1];
-        uint32_t state_nseq = state_root->nsequence;
-        int nseq_blocks = (state_nseq == NSEQUENCE_DISABLE_BIP68)
-            ? 0 : (int)(state_nseq & 0xFFFF);
+        {
+            uint32_t state_nseq = state_root->nsequence;
+            int nseq_blocks = (state_nseq == NSEQUENCE_DISABLE_BIP68)
+                ? 0 : (int)(state_nseq & 0xFFFF);
+            if (nseq_blocks > 0)
+                regtest_mine_blocks(&rt, nseq_blocks, mine_addr);
 
-        /* Mine enough blocks for relative timelock */
-        if (nseq_blocks > 0)
-            regtest_mine_blocks(&rt, nseq_blocks, mine_addr);
-
-        char *sr_hex = malloc(state_root->signed_tx.len * 2 + 1);
-        hex_encode(state_root->signed_tx.data, state_root->signed_tx.len, sr_hex);
-        char sr_txid_str[65];
-        if (!regtest_send_raw_tx(&rt, sr_hex, sr_txid_str)) {
-            fprintf(stderr, "EXPIRY TEST: state_root broadcast failed\n");
+            char *sr_hex = malloc(state_root->signed_tx.len * 2 + 1);
+            hex_encode(state_root->signed_tx.data, state_root->signed_tx.len, sr_hex);
+            char sr_txid_str[65];
+            if (!regtest_send_raw_tx(&rt, sr_hex, sr_txid_str)) {
+                fprintf(stderr, "EXPIRY TEST: state_root broadcast failed\n");
+                free(sr_hex);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
             free(sr_hex);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        free(sr_hex);
-        regtest_mine_blocks(&rt, 1, mine_addr);
-        printf("state_root broadcast: %s (nSeq blocks: %d)\n",
-               sr_txid_str, nseq_blocks);
-
-        /* Mine past CLTV timeout */
-        int height = regtest_get_block_height(&rt);
-        int blocks_needed = (int)lsp.factory.cltv_timeout - height;
-        if (blocks_needed > 0) {
-            printf("Mining %d blocks to reach CLTV timeout %u...\n",
-                   blocks_needed, lsp.factory.cltv_timeout);
-            regtest_mine_blocks(&rt, blocks_needed, mine_addr);
+            regtest_mine_blocks(&rt, 1, mine_addr);
+            printf("2. state_root broadcast: %s (nSeq blocks: %d)\n",
+                   sr_txid_str, nseq_blocks);
         }
 
-        /* Build timeout-spend tx on state_root's first output.
-           Use kickoff_left (node 2) which has the timeout taptree
-           for state_root's outputs. Actually, timeout leaf is on the
-           node whose output feeds the kickoff — that's state_root itself
-           or the kickoff nodes. Let's check which node has the taptree. */
-        /* The timeout taptree is on kickoff nodes (they feed from state nodes).
-           For the timeout spend, we spend from a kickoff node's output.
-           Actually, in the factory tree: kickoff nodes are children of state_root,
-           and each kickoff node has a timeout_leaf.
-           The plan says: spend state_root->outputs[0] using
-           kickoff_left->timeout_leaf and kickoff_left->spending_spk.
-           But actually kickoff_left has the taptree because it has the timeout
-           script path as an alternative spend for its parent's output.
-           Wait — re-reading factory.h: the has_taptree/timeout_leaf/merkle_root
-           are on each node, used for that node's spending_spk.
-           So kickoff_left's spending_spk has a taptree with timeout_leaf.
-           The state_root output[0] SPK = kickoff_left->spending_spk.
-           So we spend state_root txid:vout=0 using kickoff_left's timeout path. */
+        /* Step 3: Broadcast kickoff_left (node 2, key-path pre-signed, no nSeq wait) */
         factory_node_t *kickoff_left = &lsp.factory.nodes[2];
-
-        if (!kickoff_left->has_taptree) {
-            fprintf(stderr, "EXPIRY TEST: kickoff_left has no taptree\n");
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+        {
+            char *kl_hex = malloc(kickoff_left->signed_tx.len * 2 + 1);
+            hex_encode(kickoff_left->signed_tx.data, kickoff_left->signed_tx.len, kl_hex);
+            char kl_txid_str[65];
+            if (!regtest_send_raw_tx(&rt, kl_hex, kl_txid_str)) {
+                fprintf(stderr, "EXPIRY TEST: kickoff_left broadcast failed\n");
+                free(kl_hex);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            free(kl_hex);
+            regtest_mine_blocks(&rt, 1, mine_addr);
+            printf("3. kickoff_left broadcast: %s\n", kl_txid_str);
         }
 
-        /* Build LSP's P2TR destination address */
+        /* LSP pubkey for signing + destination */
         secp256k1_xonly_pubkey lsp_xonly;
         secp256k1_keypair_xonly_pub(ctx, &lsp_xonly, NULL, &lsp_kp);
-        unsigned char lsp_xonly_ser[32];
-        secp256k1_xonly_pubkey_serialize(ctx, lsp_xonly_ser, &lsp_xonly);
-
-        /* Destination: P2TR to LSP's key (no taptree) */
         unsigned char dest_spk[34];
         build_p2tr_script_pubkey(dest_spk, &lsp_xonly);
 
-        uint64_t spend_amount = state_root->outputs[0].amount_sats;
-        uint64_t fee_sats = fee_estimate(&fee_est, 150);  /* ~150 vbytes */
-        if (fee_sats >= spend_amount) fee_sats = 500;     /* fallback */
+        uint64_t fee_sats = fee_estimate(&fee_est, 150);
+        if (fee_sats == 0) fee_sats = 500;
+        uint64_t leaf_recovered = 0, mid_recovered = 0;
 
-        tx_output_t timeout_out;
-        timeout_out.amount_sats = spend_amount - fee_sats;
-        memcpy(timeout_out.script_pubkey, dest_spk, 34);
-        timeout_out.script_pubkey_len = 34;
-
-        /* Build unsigned tx with nLockTime = cltv_timeout */
-        tx_buf_t timeout_unsigned;
-        tx_buf_init(&timeout_unsigned, 256);
-        if (!build_unsigned_tx_locktime(&timeout_unsigned, NULL,
-                                          state_root->txid, 0,
-                                          0xFFFFFFFEu,
-                                          lsp.factory.cltv_timeout,
-                                          &timeout_out, 1)) {
-            fprintf(stderr, "EXPIRY TEST: build unsigned tx failed\n");
-            tx_buf_free(&timeout_unsigned);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+        /* Step 4: Mine to leaf CLTV (cltv_timeout - 10) */
+        factory_node_t *state_left = &lsp.factory.nodes[4];
+        uint32_t leaf_cltv = state_left->cltv_timeout;
+        {
+            int height = regtest_get_block_height(&rt);
+            int needed = (int)leaf_cltv - height;
+            if (needed > 0) {
+                printf("4. Mining %d blocks to reach leaf CLTV %u...\n",
+                       needed, leaf_cltv);
+                regtest_mine_blocks(&rt, needed, mine_addr);
+            }
         }
 
-        /* Compute script-path sighash */
-        unsigned char timeout_sighash[32];
-        if (!compute_tapscript_sighash(timeout_sighash,
-                                         timeout_unsigned.data,
-                                         timeout_unsigned.len,
-                                         0,
-                                         kickoff_left->spending_spk,
-                                         kickoff_left->spending_spk_len,
-                                         spend_amount,
-                                         0xFFFFFFFEu,
-                                         &kickoff_left->timeout_leaf)) {
-            fprintf(stderr, "EXPIRY TEST: sighash computation failed\n");
-            tx_buf_free(&timeout_unsigned);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+        /* Step 5: Spend kickoff_left:0 via state_left timeout script-path */
+        {
+            if (!state_left->has_taptree) {
+                fprintf(stderr, "EXPIRY TEST: state_left has no taptree\n");
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            uint64_t spend_amount = kickoff_left->outputs[0].amount_sats;
+            if (fee_sats >= spend_amount) fee_sats = 500;
+
+            tx_output_t tout;
+            tout.amount_sats = spend_amount - fee_sats;
+            memcpy(tout.script_pubkey, dest_spk, 34);
+            tout.script_pubkey_len = 34;
+
+            tx_buf_t tu;
+            tx_buf_init(&tu, 256);
+            if (!build_unsigned_tx_with_locktime(&tu, NULL,
+                    kickoff_left->txid, 0, 0xFFFFFFFEu, leaf_cltv,
+                    &tout, 1)) {
+                fprintf(stderr, "EXPIRY TEST: leaf build failed\n");
+                tx_buf_free(&tu);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            unsigned char sh[32];
+            compute_tapscript_sighash(sh, tu.data, tu.len, 0,
+                state_left->spending_spk, state_left->spending_spk_len,
+                spend_amount, 0xFFFFFFFEu, &state_left->timeout_leaf);
+
+            unsigned char sig[64], aux[32];
+            memset(aux, 0xEE, 32);
+            secp256k1_schnorrsig_sign32(ctx, sig, sh, &lsp_kp, aux);
+
+            unsigned char cb[65];
+            size_t cb_len;
+            tapscript_build_control_block(cb, &cb_len,
+                state_left->output_parity,
+                &state_left->keyagg.agg_pubkey, ctx);
+
+            tx_buf_t ts;
+            tx_buf_init(&ts, 512);
+            finalize_script_path_tx(&ts, tu.data, tu.len, sig,
+                state_left->timeout_leaf.script,
+                state_left->timeout_leaf.script_len, cb, cb_len);
+            tx_buf_free(&tu);
+
+            char *hex = malloc(ts.len * 2 + 1);
+            hex_encode(ts.data, ts.len, hex);
+            char txid_str[65];
+            int sent = regtest_send_raw_tx(&rt, hex, txid_str);
+            free(hex);
+            tx_buf_free(&ts);
+
+            if (!sent) {
+                fprintf(stderr, "EXPIRY TEST: leaf timeout tx broadcast failed\n");
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            regtest_mine_blocks(&rt, 1, mine_addr);
+            leaf_recovered = tout.amount_sats;
+            printf("5. Leaf recovery: %llu sats (state_left timeout) txid: %s\n",
+                   (unsigned long long)leaf_recovered, txid_str);
         }
 
-        /* Sign with LSP key (single schnorr sig, not MuSig) */
-        unsigned char timeout_sig[64];
-        unsigned char aux_rand[32];
-        memset(aux_rand, 0xEE, 32);
-        if (!secp256k1_schnorrsig_sign32(ctx, timeout_sig, timeout_sighash,
-                                           &lsp_kp, aux_rand)) {
-            fprintf(stderr, "EXPIRY TEST: signing failed\n");
-            tx_buf_free(&timeout_unsigned);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+        /* Step 6: Mine to mid CLTV (cltv_timeout - 5) */
+        factory_node_t *kickoff_right = &lsp.factory.nodes[3];
+        uint32_t mid_cltv = kickoff_right->cltv_timeout;
+        {
+            int height = regtest_get_block_height(&rt);
+            int needed = (int)mid_cltv - height;
+            if (needed > 0) {
+                printf("6. Mining %d blocks to reach mid CLTV %u...\n",
+                       needed, mid_cltv);
+                regtest_mine_blocks(&rt, needed, mine_addr);
+            }
         }
 
-        /* Build control block */
-        unsigned char control_block[65];
-        size_t cb_len;
-        if (!tapscript_build_control_block(control_block, &cb_len,
-                                             kickoff_left->output_parity,
-                                             &kickoff_left->keyagg.agg_pubkey,
-                                             ctx)) {
-            fprintf(stderr, "EXPIRY TEST: control block failed\n");
-            tx_buf_free(&timeout_unsigned);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
+        /* Step 7: Spend state_root:1 via kickoff_right timeout script-path */
+        {
+            if (!kickoff_right->has_taptree) {
+                fprintf(stderr, "EXPIRY TEST: kickoff_right has no taptree\n");
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            uint64_t spend_amount = state_root->outputs[1].amount_sats;
+            if (fee_sats >= spend_amount) fee_sats = 500;
+
+            tx_output_t tout;
+            tout.amount_sats = spend_amount - fee_sats;
+            memcpy(tout.script_pubkey, dest_spk, 34);
+            tout.script_pubkey_len = 34;
+
+            tx_buf_t tu;
+            tx_buf_init(&tu, 256);
+            if (!build_unsigned_tx_with_locktime(&tu, NULL,
+                    state_root->txid, 1, 0xFFFFFFFEu, mid_cltv,
+                    &tout, 1)) {
+                fprintf(stderr, "EXPIRY TEST: mid build failed\n");
+                tx_buf_free(&tu);
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+
+            unsigned char sh[32];
+            compute_tapscript_sighash(sh, tu.data, tu.len, 0,
+                kickoff_right->spending_spk, kickoff_right->spending_spk_len,
+                spend_amount, 0xFFFFFFFEu, &kickoff_right->timeout_leaf);
+
+            unsigned char sig[64], aux[32];
+            memset(aux, 0xFF, 32);
+            secp256k1_schnorrsig_sign32(ctx, sig, sh, &lsp_kp, aux);
+
+            unsigned char cb[65];
+            size_t cb_len;
+            tapscript_build_control_block(cb, &cb_len,
+                kickoff_right->output_parity,
+                &kickoff_right->keyagg.agg_pubkey, ctx);
+
+            tx_buf_t ts;
+            tx_buf_init(&ts, 512);
+            finalize_script_path_tx(&ts, tu.data, tu.len, sig,
+                kickoff_right->timeout_leaf.script,
+                kickoff_right->timeout_leaf.script_len, cb, cb_len);
+            tx_buf_free(&tu);
+
+            char *hex = malloc(ts.len * 2 + 1);
+            hex_encode(ts.data, ts.len, hex);
+            char txid_str[65];
+            int sent = regtest_send_raw_tx(&rt, hex, txid_str);
+            free(hex);
+            tx_buf_free(&ts);
+
+            if (!sent) {
+                fprintf(stderr, "EXPIRY TEST: mid timeout tx broadcast failed\n");
+                lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx); return 1;
+            }
+            regtest_mine_blocks(&rt, 1, mine_addr);
+            mid_recovered = tout.amount_sats;
+            printf("7. Mid recovery: %llu sats (kickoff_right timeout) txid: %s\n",
+                   (unsigned long long)mid_recovered, txid_str);
         }
 
-        /* Finalize script-path tx */
-        tx_buf_t timeout_signed;
-        tx_buf_init(&timeout_signed, 512);
-        if (!finalize_script_path_tx(&timeout_signed,
-                                       timeout_unsigned.data,
-                                       timeout_unsigned.len,
-                                       timeout_sig,
-                                       kickoff_left->timeout_leaf.script,
-                                       kickoff_left->timeout_leaf.script_len,
-                                       control_block, cb_len)) {
-            fprintf(stderr, "EXPIRY TEST: finalize failed\n");
-            tx_buf_free(&timeout_unsigned);
-            tx_buf_free(&timeout_signed);
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        tx_buf_free(&timeout_unsigned);
-
-        /* Broadcast timeout tx */
-        char *to_hex = malloc(timeout_signed.len * 2 + 1);
-        hex_encode(timeout_signed.data, timeout_signed.len, to_hex);
-        char to_txid_str[65];
-        int to_sent = regtest_send_raw_tx(&rt, to_hex, to_txid_str);
-        free(to_hex);
-        tx_buf_free(&timeout_signed);
-
-        if (!to_sent) {
-            fprintf(stderr, "EXPIRY TEST: timeout tx broadcast failed\n");
-            lsp_cleanup(&lsp);
-            memset(lsp_seckey, 0, 32);
-            secp256k1_context_destroy(ctx);
-            return 1;
-        }
-        regtest_mine_blocks(&rt, 1, mine_addr);
-
-        printf("LSP recovered %llu sats via timeout script! txid: %s\n",
-               (unsigned long long)timeout_out.amount_sats, to_txid_str);
+        printf("\nLeaf recovery: %llu sats\n", (unsigned long long)leaf_recovered);
+        printf("Mid recovery:  %llu sats\n", (unsigned long long)mid_recovered);
         printf("=== EXPIRY TEST PASSED ===\n\n");
 
         /* Skip cooperative close — factory already spent */
@@ -1696,13 +1731,20 @@ int main(int argc, char *argv[]) {
         /* Free old factory in lsp before reusing */
         factory_free(&lsp.factory);
 
+        /* Compute cltv_timeout for Factory 1 */
+        uint32_t cltv2 = 0;
+        {
+            int cur_h = regtest_get_block_height(&rt);
+            if (cur_h > 0) cltv2 = (uint32_t)cur_h + 35;
+        }
+
         /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients,
            who handle it in their MSG_FACTORY_PROPOSE daemon callback) */
         if (!lsp_run_factory_creation(&lsp,
                                        fund2_txid, fund2_vout,
                                        fund2_amount,
                                        fund_spk, 34,
-                                       step_blocks, 4)) {
+                                       step_blocks, 4, cltv2)) {
             fprintf(stderr, "ROTATION: Factory 1 creation failed\n");
             lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
             secp256k1_context_destroy(ctx); return 1;
@@ -1711,10 +1753,8 @@ int main(int argc, char *argv[]) {
         /* Set lifecycle for Factory 1 */
         {
             int cur_h = regtest_get_block_height(&rt);
-            if (cur_h > 0) {
+            if (cur_h > 0)
                 factory_set_lifecycle(&lsp.factory, (uint32_t)cur_h, 20, 10);
-                lsp.factory.cltv_timeout = (uint32_t)cur_h + 35;
-            }
         }
 
         /* Store in ladder slot 1 */

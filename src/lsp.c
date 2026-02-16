@@ -117,7 +117,8 @@ int lsp_run_factory_creation(lsp_t *lsp,
                               const unsigned char *funding_txid, uint32_t funding_vout,
                               uint64_t funding_amount,
                               const unsigned char *funding_spk, size_t funding_spk_len,
-                              uint16_t step_blocks, uint32_t states_per_layer) {
+                              uint16_t step_blocks, uint32_t states_per_layer,
+                              uint32_t cltv_timeout) {
     size_t n_total = 1 + lsp->n_clients;
 
     /* Build all_pubkeys: LSP=0, clients=1..N */
@@ -131,6 +132,7 @@ int lsp_run_factory_creation(lsp_t *lsp,
     factory_t *f = &lsp->factory;
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
+    f->cltv_timeout = cltv_timeout;  /* set BEFORE build_tree for staggered taptrees */
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                         funding_spk, funding_spk_len);
 

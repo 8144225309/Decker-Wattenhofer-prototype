@@ -273,15 +273,20 @@ int test_factory_tree_with_timeout(void) {
     TEST_ASSERT(factory_build_tree(&f), "build tree with timeout");
     TEST_ASSERT_EQ(f.n_nodes, 6, "6 nodes");
 
-    /* kickoff_left (node 2) and kickoff_right (node 3) should have taptree */
+    /* All non-root nodes should have taptree (staggered CLTVs) */
+    TEST_ASSERT(f.nodes[0].has_taptree == 0, "kickoff_root no taptree");
+    TEST_ASSERT(f.nodes[1].has_taptree == 1, "state_root has taptree");
     TEST_ASSERT(f.nodes[2].has_taptree == 1, "kickoff_left has taptree");
     TEST_ASSERT(f.nodes[3].has_taptree == 1, "kickoff_right has taptree");
+    TEST_ASSERT(f.nodes[4].has_taptree == 1, "state_left has taptree");
+    TEST_ASSERT(f.nodes[5].has_taptree == 1, "state_right has taptree");
 
-    /* All other nodes should NOT have taptree */
-    TEST_ASSERT(f.nodes[0].has_taptree == 0, "kickoff_root no taptree");
-    TEST_ASSERT(f.nodes[1].has_taptree == 0, "state_root no taptree");
-    TEST_ASSERT(f.nodes[4].has_taptree == 0, "state_left no taptree");
-    TEST_ASSERT(f.nodes[5].has_taptree == 0, "state_right no taptree");
+    /* Verify per-node staggered CLTV values */
+    TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 1000, "state_root cltv = 1000 (root)");
+    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995, "kickoff_left cltv = 995 (mid)");
+    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 995, "kickoff_right cltv = 995 (mid)");
+    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 990, "state_left cltv = 990 (leaf)");
+    TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 990, "state_right cltv = 990 (leaf)");
 
     /* Build factory WITHOUT cltv_timeout for comparison */
     factory_t f2;
@@ -290,9 +295,13 @@ int test_factory_tree_with_timeout(void) {
     factory_set_funding(&f2, fake_txid, 0, 100000, fund_spk, 34);
     TEST_ASSERT(factory_build_tree(&f2), "build tree without timeout");
 
-    /* spending_spk of kickoff_left should differ between f and f2 */
+    /* spending_spk of taptree nodes should differ between f and f2 */
+    TEST_ASSERT(memcmp(f.nodes[1].spending_spk, f2.nodes[1].spending_spk, 34) != 0,
+                "state_root spk differs with taptree");
     TEST_ASSERT(memcmp(f.nodes[2].spending_spk, f2.nodes[2].spending_spk, 34) != 0,
                 "kickoff_left spk differs with taptree");
+    TEST_ASSERT(memcmp(f.nodes[4].spending_spk, f2.nodes[4].spending_spk, 34) != 0,
+                "state_left spk differs with taptree");
 
     /* spending_spk of kickoff_root should be SAME (no taptree on either) */
     TEST_ASSERT(memcmp(f.nodes[0].spending_spk, f2.nodes[0].spending_spk, 34) == 0,
@@ -699,6 +708,86 @@ int test_regtest_timeout_spend(void) {
 
     tx_buf_free(&timeout_unsigned);
     tx_buf_free(&timeout_signed);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Unit test 7: multi-level staggered timeout ---- */
+
+int test_multi_level_timeout_unit(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    /* Compute funding spk */
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak);
+
+    musig_keyagg_t tmp = ka;
+    secp256k1_pubkey tweaked_pk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &tmp.cache, tweak);
+    secp256k1_xonly_pubkey tweaked_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xCC, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    f.cltv_timeout = 1000;
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT_EQ(f.n_nodes, 6, "6 nodes");
+
+    /* Verify each taptree node has correct CLTV in its timeout_leaf script */
+    for (size_t i = 1; i < f.n_nodes; i++) {
+        factory_node_t *node = &f.nodes[i];
+        TEST_ASSERT(node->has_taptree == 1, "node has taptree");
+        TEST_ASSERT(node->timeout_leaf.script_len > 0, "script non-empty");
+
+        /* Verify OP_CLTV (0xb1) present */
+        int found = 0;
+        for (size_t j = 0; j < node->timeout_leaf.script_len; j++) {
+            if (node->timeout_leaf.script[j] == 0xb1) { found = 1; break; }
+        }
+        TEST_ASSERT(found, "OP_CLTV in script");
+    }
+
+    /* Verify CLTV ordering: leaf < mid < root */
+    TEST_ASSERT(f.nodes[4].cltv_timeout < f.nodes[2].cltv_timeout,
+                "leaf cltv < mid cltv");
+    TEST_ASSERT(f.nodes[5].cltv_timeout < f.nodes[3].cltv_timeout,
+                "leaf cltv < mid cltv (right)");
+    TEST_ASSERT(f.nodes[2].cltv_timeout < f.nodes[1].cltv_timeout,
+                "mid cltv < root cltv");
+
+    /* Verify exact values: step=5 */
+    TEST_ASSERT_EQ(f.nodes[1].cltv_timeout, 1000, "state_root = base");
+    TEST_ASSERT_EQ(f.nodes[2].cltv_timeout, 995,  "kickoff_left = base-5");
+    TEST_ASSERT_EQ(f.nodes[3].cltv_timeout, 995,  "kickoff_right = base-5");
+    TEST_ASSERT_EQ(f.nodes[4].cltv_timeout, 990,  "state_left = base-10");
+    TEST_ASSERT_EQ(f.nodes[5].cltv_timeout, 990,  "state_right = base-10");
+
+    /* All 6 txs should sign and verify via key-path */
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    for (size_t i = 0; i < f.n_nodes; i++) {
+        TEST_ASSERT(f.nodes[i].is_signed, "node signed");
+    }
+
     factory_free(&f);
     secp256k1_context_destroy(ctx);
     return 1;

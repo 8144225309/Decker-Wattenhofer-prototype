@@ -770,7 +770,7 @@ int test_regtest_intra_factory_payment(void) {
     if (lsp_ok && !lsp_run_factory_creation(&lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4)) {
+                                             fund_spk, 34, 10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }
@@ -1184,7 +1184,7 @@ int test_regtest_multi_payment(void) {
     if (lsp_ok && !lsp_run_factory_creation(&lsp,
                                              funding_txid, funding_vout,
                                              funding_amount,
-                                             fund_spk, 34, 10, 4)) {
+                                             fund_spk, 34, 10, 4, 0)) {
         fprintf(stderr, "LSP: factory creation failed\n");
         lsp_ok = 0;
     }

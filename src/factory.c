@@ -99,7 +99,7 @@ static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
 }
 
 /* Add a node to the factory. Returns node index or -1 on error.
-   has_timeout_path: if true, build CLTV timeout taptree for this node's spending_spk. */
+   node_cltv: if > 0, build CLTV timeout taptree for this node's spending_spk. */
 static int add_node(
     factory_t *f,
     factory_node_type_t type,
@@ -108,7 +108,7 @@ static int add_node(
     int parent_index,
     uint32_t parent_vout,
     int dw_layer_index,
-    int has_timeout_path
+    uint32_t node_cltv
 ) {
     if (f->n_nodes >= FACTORY_MAX_NODES) return -1;
 
@@ -122,7 +122,8 @@ static int add_node(
     node->parent_index = parent_index;
     node->parent_vout = parent_vout;
     node->dw_layer_index = dw_layer_index;
-    node->has_taptree = (has_timeout_path && f->cltv_timeout > 0) ? 1 : 0;
+    node->has_taptree = (node_cltv > 0) ? 1 : 0;
+    node->cltv_timeout = node_cltv;
 
     tx_buf_init(&node->unsigned_tx, 256);
     tx_buf_init(&node->signed_tx, 512);
@@ -138,7 +139,7 @@ static int add_node(
         if (!secp256k1_xonly_pubkey_from_pubkey(f->ctx, &lsp_xonly, NULL, &f->pubkeys[0]))
             return -1;
 
-        tapscript_build_cltv_timeout(&node->timeout_leaf, f->cltv_timeout,
+        tapscript_build_cltv_timeout(&node->timeout_leaf, node_cltv,
                                       &lsp_xonly, f->ctx);
         tapscript_merkle_root(node->merkle_root, &node->timeout_leaf, 1);
 
@@ -409,14 +410,21 @@ int factory_build_tree(factory_t *f) {
     uint32_t right_set[] = {0, 3, 4};      /* L, C, D */
 
     /* ---- Phase 1: Setup nodes (top-down order) ---- */
-    /* has_timeout_path: kickoff_left/kickoff_right get taptree
-       (their spending_spk appears in state_root outputs with CLTV timeout) */
-    int kr  = add_node(f, NODE_KICKOFF, all, 5,        -1, 0, -1, 0);
-    int sr  = add_node(f, NODE_STATE,   all, 5,        kr, 0,  0, 0);
-    int kl  = add_node(f, NODE_KICKOFF, left_set, 3,   sr, 0, -1, 1);
-    int kri = add_node(f, NODE_KICKOFF, right_set, 3,  sr, 1, -1, 1);
-    int sl  = add_node(f, NODE_STATE,   left_set, 3,   kl, 0,  1, 0);
-    int sri = add_node(f, NODE_STATE,   right_set, 3, kri, 0,  1, 0);
+    /* Staggered CLTVs: leaves expire first, root last.
+       TIMEOUT_STEP_BLOCKS between levels. */
+#define TIMEOUT_STEP_BLOCKS 5
+    uint32_t cltv = f->cltv_timeout;
+    uint32_t step = TIMEOUT_STEP_BLOCKS;
+    uint32_t root_cltv = cltv;                           /* longest */
+    uint32_t mid_cltv  = (cltv > step) ? cltv - step : 0;
+    uint32_t leaf_cltv = (cltv > 2*step) ? cltv - 2*step : 0;
+
+    int kr  = add_node(f, NODE_KICKOFF, all, 5,        -1, 0, -1, 0);          /* no timeout */
+    int sr  = add_node(f, NODE_STATE,   all, 5,        kr, 0,  0, root_cltv);  /* longest */
+    int kl  = add_node(f, NODE_KICKOFF, left_set, 3,   sr, 0, -1, mid_cltv);   /* mid */
+    int kri = add_node(f, NODE_KICKOFF, right_set, 3,  sr, 1, -1, mid_cltv);   /* mid */
+    int sl  = add_node(f, NODE_STATE,   left_set, 3,   kl, 0,  1, leaf_cltv);  /* shortest */
+    int sri = add_node(f, NODE_STATE,   right_set, 3, kri, 0,  1, leaf_cltv);  /* shortest */
 
     if (kr < 0 || sr < 0 || kl < 0 || kri < 0 || sl < 0 || sri < 0)
         return 0;
