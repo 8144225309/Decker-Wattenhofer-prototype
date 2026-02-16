@@ -238,7 +238,8 @@ static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *
         if (cbd && cbd->wt) {
             watchtower_watch_revoked_commitment(cbd->wt, ch,
                 rev_chan_id, old_cn,
-                ch->local_amount, ch->remote_amount);
+                ch->local_amount, ch->remote_amount,
+                NULL, 0);
         }
 
         /* Store LSP's next per-commitment point */

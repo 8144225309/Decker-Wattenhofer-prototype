@@ -39,8 +39,16 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
                 e->to_local_amount = amounts[i];
                 memcpy(e->to_local_spk, spks[i], spk_lens[i]);
                 e->to_local_spk_len = spk_lens[i];
+                e->n_htlc_outputs = 0;
                 e->response_tx = NULL;
                 e->response_tx_len = 0;
+
+                /* Load persisted HTLC output data for this commitment */
+                if (db && db->db) {
+                    e->n_htlc_outputs = persist_load_old_commitment_htlcs(
+                        db, (uint32_t)c, commit_nums[i],
+                        e->htlc_outputs, MAX_HTLCS);
+                }
             }
         }
     }
@@ -72,6 +80,7 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
     e->to_local_amount = to_local_amount;
     memcpy(e->to_local_spk, to_local_spk, spk_len);
     e->to_local_spk_len = spk_len;
+    e->n_htlc_outputs = 0;
     e->response_tx = NULL;
     e->response_tx_len = 0;
 
@@ -88,7 +97,8 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
 void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                            uint32_t channel_id,
                                            uint64_t old_commit_num,
-                                           uint64_t old_local, uint64_t old_remote) {
+                                           uint64_t old_local, uint64_t old_remote,
+                                           const htlc_t *old_htlcs, size_t old_n_htlcs) {
     if (!wt)
         return;
 
@@ -102,16 +112,25 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
     if (saved_n_htlcs > 0)
         memcpy(saved_htlcs, ch->htlcs, saved_n_htlcs * sizeof(htlc_t));
 
-    /* Temporarily set to old state.
-     * We clear HTLCs because we don't track per-commitment HTLC state.
-     * Build the REMOTE commitment (what the peer holds) since that's
-     * what would appear on-chain in a breach scenario.
-     * The old remote PCP can be derived from the just-received revocation secret
-     * (which is stored in received_revocations[old_commit_num]). */
+    /* Temporarily set to old state, restoring the HTLC state that was active
+     * at the time of the old commitment. This ensures the rebuilt commitment tx
+     * includes HTLC outputs and produces the correct txid. */
     ch->commitment_number = old_commit_num;
     ch->local_amount = old_local;
     ch->remote_amount = old_remote;
-    ch->n_htlcs = 0;
+    if (old_htlcs && old_n_htlcs > 0) {
+        ch->n_htlcs = old_n_htlcs;
+        memcpy(ch->htlcs, old_htlcs, old_n_htlcs * sizeof(htlc_t));
+    } else {
+        ch->n_htlcs = 0;
+    }
+
+    /* Count active HTLCs for output parsing */
+    size_t n_active_htlcs = 0;
+    for (size_t i = 0; i < ch->n_htlcs; i++) {
+        if (ch->htlcs[i].state == HTLC_STATE_ACTIVE)
+            n_active_htlcs++;
+    }
 
     /* Ensure old remote PCP is available: derive from stored revocation secret */
     {
@@ -143,26 +162,78 @@ void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
         return;
     }
 
-    /* to_local is vout 0, its SPK is the first output scriptPubKey */
-    /* Extract to_local_spk from the old commitment tx output 0 */
-    unsigned char to_local_spk[34];
-    /* In our commitment tx, output[0] = to_local with a P2TR SPK (34 bytes) */
-    /* Parse the first output's SPK from the unsigned raw tx (no segwit marker/flag) */
+    /* Parse outputs from the unsigned raw tx.
+     * Layout (no segwit marker/flag):
+     *   4 version + 1 vincount +
+     *   (32 prevhash + 4 vout + 1 scriptlen + 0 script + 4 sequence) = 41 vin bytes
+     *   + 1 voutcount = 47 bytes offset to first output
+     *   Each output: 8 amount (LE) + 1 spk_len + spk_len bytes */
     if (old_tx.len > 60) {
-        /* Unsigned tx layout (no segwit marker/flag):
-           4 version + 1 vincount +
-           (32 prevhash + 4 vout + 1 scriptlen + 0 script + 4 sequence) = 41 vin bytes
-           + 1 voutcount = 47 bytes offset to first output
-           First output: 8 amount + 1 scriptlen + N script */
-        size_t ofs = 4 + 1 + 41 + 1;  /* 47 */
+        size_t ofs = 4 + 1 + 41 + 1;  /* 47: offset to first output */
+
+        /* Output 0: to_local */
         if (ofs + 8 + 1 + 34 <= old_tx.len) {
             uint8_t spk_len = old_tx.data[ofs + 8];
             if (spk_len == 34) {
+                unsigned char to_local_spk[34];
                 memcpy(to_local_spk, &old_tx.data[ofs + 9], 34);
                 /* Remote commitment's to_local = peer's balance = old_remote */
                 watchtower_watch(wt, channel_id, old_commit_num,
                                    old_txid, 0, old_remote,
                                    to_local_spk, 34);
+            }
+        }
+
+        /* If we have active HTLCs, parse their outputs (vout 2+) and store
+         * in the watchtower entry we just created */
+        if (n_active_htlcs > 0 && wt->n_entries > 0) {
+            watchtower_entry_t *entry = &wt->entries[wt->n_entries - 1];
+            entry->n_htlc_outputs = 0;
+
+            /* Skip output 0 and output 1 to reach HTLC outputs */
+            size_t out_ofs = ofs;
+            for (uint32_t v = 0; v < 2; v++) {
+                if (out_ofs + 9 > old_tx.len) break;
+                uint8_t slen = old_tx.data[out_ofs + 8];
+                out_ofs += 8 + 1 + slen;
+            }
+
+            /* Parse HTLC outputs (vout 2, 3, ...) */
+            size_t htlc_active_idx = 0;
+            for (size_t i = 0; i < old_n_htlcs && htlc_active_idx < n_active_htlcs; i++) {
+                if (old_htlcs[i].state != HTLC_STATE_ACTIVE)
+                    continue;
+
+                if (out_ofs + 8 + 1 > old_tx.len) break;
+                uint64_t amount = 0;
+                for (int b = 0; b < 8; b++)
+                    amount |= ((uint64_t)old_tx.data[out_ofs + b]) << (b * 8);
+                uint8_t slen = old_tx.data[out_ofs + 8];
+                if (slen != 34 || out_ofs + 9 + slen > old_tx.len) {
+                    out_ofs += 8 + 1 + slen;
+                    htlc_active_idx++;
+                    continue;
+                }
+
+                watchtower_htlc_t *wh = &entry->htlc_outputs[entry->n_htlc_outputs];
+                wh->htlc_vout = (uint32_t)(2 + htlc_active_idx);
+                wh->htlc_amount = amount;
+                memcpy(wh->htlc_spk, &old_tx.data[out_ofs + 9], 34);
+                wh->direction = old_htlcs[i].direction;
+                memcpy(wh->payment_hash, old_htlcs[i].payment_hash, 32);
+                wh->cltv_expiry = old_htlcs[i].cltv_expiry;
+                entry->n_htlc_outputs++;
+
+                out_ofs += 8 + 1 + slen;
+                htlc_active_idx++;
+            }
+
+            /* Persist HTLC outputs if DB available */
+            if (wt->db && wt->db->db) {
+                for (size_t h = 0; h < entry->n_htlc_outputs; h++) {
+                    persist_save_old_commitment_htlc(wt->db, channel_id,
+                        old_commit_num, &entry->htlc_outputs[h]);
+                }
             }
         }
     }
@@ -273,6 +344,49 @@ int watchtower_check(watchtower_t *wt) {
             free(penalty_hex);
         }
         tx_buf_free(&penalty_tx);
+
+        /* Sweep HTLC outputs via penalty txs */
+        for (size_t h = 0; h < e->n_htlc_outputs; h++) {
+            /* Temporarily set ch->htlcs[0] to stored HTLC metadata */
+            size_t saved_n = ch->n_htlcs;
+            htlc_t saved_h0;
+            if (saved_n > 0)
+                saved_h0 = ch->htlcs[0];
+            ch->n_htlcs = 1;
+            memset(&ch->htlcs[0], 0, sizeof(htlc_t));
+            ch->htlcs[0].direction = e->htlc_outputs[h].direction;
+            memcpy(ch->htlcs[0].payment_hash, e->htlc_outputs[h].payment_hash, 32);
+            ch->htlcs[0].cltv_expiry = e->htlc_outputs[h].cltv_expiry;
+            ch->htlcs[0].state = HTLC_STATE_ACTIVE;
+
+            tx_buf_t htlc_penalty;
+            tx_buf_init(&htlc_penalty, 512);
+            if (channel_build_htlc_penalty_tx(ch, &htlc_penalty,
+                    e->txid, e->htlc_outputs[h].htlc_vout,
+                    e->htlc_outputs[h].htlc_amount,
+                    e->htlc_outputs[h].htlc_spk, 34,
+                    e->commit_num, 0)) {
+                char *htlc_hex = (char *)malloc(htlc_penalty.len * 2 + 1);
+                if (htlc_hex) {
+                    hex_encode(htlc_penalty.data, htlc_penalty.len, htlc_hex);
+                    char htlc_txid[65];
+                    if (regtest_send_raw_tx(wt->rt, htlc_hex, htlc_txid)) {
+                        printf("  HTLC penalty tx (vout %u) broadcast: %s\n",
+                               e->htlc_outputs[h].htlc_vout, htlc_txid);
+                        penalties_broadcast++;
+                    } else {
+                        fprintf(stderr, "  HTLC penalty tx (vout %u) broadcast failed\n",
+                                e->htlc_outputs[h].htlc_vout);
+                    }
+                    free(htlc_hex);
+                }
+            }
+            tx_buf_free(&htlc_penalty);
+
+            ch->n_htlcs = saved_n;
+            if (saved_n > 0)
+                ch->htlcs[0] = saved_h0;
+        }
 
         /* Remove this entry (swap with last) */
         wt->entries[i] = wt->entries[wt->n_entries - 1];

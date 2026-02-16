@@ -78,6 +78,17 @@ static const char *SCHEMA_SQL =
     "  to_local_spk TEXT NOT NULL,"
     "  PRIMARY KEY (channel_id, commit_num)"
     ");"
+    "CREATE TABLE IF NOT EXISTS old_commitment_htlcs ("
+    "  channel_id INTEGER NOT NULL,"
+    "  commit_num INTEGER NOT NULL,"
+    "  htlc_vout INTEGER NOT NULL,"
+    "  htlc_amount INTEGER NOT NULL,"
+    "  htlc_spk TEXT NOT NULL,"
+    "  direction INTEGER NOT NULL,"
+    "  payment_hash TEXT NOT NULL,"
+    "  cltv_expiry INTEGER NOT NULL,"
+    "  PRIMARY KEY (channel_id, commit_num, htlc_vout)"
+    ");"
     "CREATE TABLE IF NOT EXISTS wire_messages ("
     "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
     "  timestamp INTEGER NOT NULL,"
@@ -922,6 +933,82 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
             spk_lens[count] = decoded > 0 ? (size_t)decoded : 0;
         }
 
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    return count;
+}
+
+/* --- Old commitment HTLC outputs (watchtower) --- */
+
+#include "superscalar/watchtower.h"
+
+int persist_save_old_commitment_htlc(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, const watchtower_htlc_t *htlc) {
+    if (!p || !p->db || !htlc) return 0;
+
+    char spk_hex[69], hash_hex[65];
+    hex_encode(htlc->htlc_spk, 34, spk_hex);
+    hex_encode(htlc->payment_hash, 32, hash_hex);
+
+    const char *sql =
+        "INSERT OR REPLACE INTO old_commitment_htlcs "
+        "(channel_id, commit_num, htlc_vout, htlc_amount, htlc_spk, "
+        "direction, payment_hash, cltv_expiry) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+    sqlite3_bind_int(stmt, 3, (int)htlc->htlc_vout);
+    sqlite3_bind_int64(stmt, 4, (sqlite3_int64)htlc->htlc_amount);
+    sqlite3_bind_text(stmt, 5, spk_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 6, (int)htlc->direction);
+    sqlite3_bind_text(stmt, 7, hash_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 8, (int)htlc->cltv_expiry);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, watchtower_htlc_t *htlcs_out, size_t max_htlcs) {
+    if (!p || !p->db || !htlcs_out) return 0;
+
+    const char *sql =
+        "SELECT htlc_vout, htlc_amount, htlc_spk, direction, payment_hash, cltv_expiry "
+        "FROM old_commitment_htlcs WHERE channel_id = ? AND commit_num = ? "
+        "ORDER BY htlc_vout ASC;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)channel_id);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)commit_num);
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max_htlcs) {
+        watchtower_htlc_t *h = &htlcs_out[count];
+        h->htlc_vout = (uint32_t)sqlite3_column_int(stmt, 0);
+        h->htlc_amount = (uint64_t)sqlite3_column_int64(stmt, 1);
+
+        const char *spk_hex = (const char *)sqlite3_column_text(stmt, 2);
+        if (spk_hex)
+            hex_decode(spk_hex, h->htlc_spk, 34);
+
+        h->direction = (htlc_direction_t)sqlite3_column_int(stmt, 3);
+
+        const char *hash_hex = (const char *)sqlite3_column_text(stmt, 4);
+        if (hash_hex)
+            hex_decode(hash_hex, h->payment_hash, 32);
+
+        h->cltv_expiry = (uint32_t)sqlite3_column_int(stmt, 5);
         count++;
     }
 

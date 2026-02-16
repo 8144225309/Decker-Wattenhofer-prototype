@@ -314,9 +314,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     channel_t *sender_ch = &mgr->entries[sender_idx].channel;
 
-    /* Capture amounts before add_htlc changes them (for watchtower) */
+    /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
     uint64_t old_sender_local = sender_ch->local_amount;
     uint64_t old_sender_remote = sender_ch->remote_amount;
+    size_t old_sender_n_htlcs = sender_ch->n_htlcs;
+    htlc_t old_sender_htlcs[MAX_HTLCS];
+    if (old_sender_n_htlcs > 0)
+        memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
 
     /* Add HTLC to sender's channel (offered from client = received by LSP) */
     uint64_t new_htlc_id;
@@ -367,7 +371,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
-                old_sender_local, old_sender_remote);
+                old_sender_local, old_sender_remote,
+                old_sender_htlcs, old_sender_n_htlcs);
             /* Store next per-commitment point from peer */
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
@@ -424,9 +429,13 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
-    /* Capture amounts before add_htlc changes them (for watchtower) */
+    /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
     uint64_t old_dest_local = dest_ch->local_amount;
     uint64_t old_dest_remote = dest_ch->remote_amount;
+    size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+    htlc_t old_dest_htlcs[MAX_HTLCS];
+    if (old_dest_n_htlcs > 0)
+        memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
     /* Add HTLC to destination's channel (offered from LSP) */
     uint64_t dest_htlc_id;
@@ -482,7 +491,8 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
             watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)dest_idx, old_cn,
-                old_dest_local, old_dest_remote);
+                old_dest_local, old_dest_remote,
+                old_dest_htlcs, old_dest_n_htlcs);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -509,9 +519,13 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     channel_t *ch = &mgr->entries[client_idx].channel;
 
-    /* Capture amounts before fulfill changes them (for watchtower) */
+    /* Capture amounts and HTLC state before fulfill changes them (for watchtower) */
     uint64_t old_ch_local = ch->local_amount;
     uint64_t old_ch_remote = ch->remote_amount;
+    size_t old_ch_n_htlcs = ch->n_htlcs;
+    htlc_t old_ch_htlcs[MAX_HTLCS];
+    if (old_ch_n_htlcs > 0)
+        memcpy(old_ch_htlcs, ch->htlcs, old_ch_n_htlcs * sizeof(htlc_t));
 
     /* Fulfill the HTLC on this channel (LSP offered → client fulfills) */
     if (!channel_fulfill_htlc(ch, htlc_id, preimage)) {
@@ -554,7 +568,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(ch, old_cn, rev_secret);
             watchtower_watch_revoked_commitment(mgr->watchtower, ch,
                 (uint32_t)client_idx, old_cn,
-                old_ch_local, old_ch_remote);
+                old_ch_local, old_ch_remote,
+                old_ch_htlcs, old_ch_n_htlcs);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
@@ -601,6 +616,10 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             /* Found it — fulfill on sender's channel */
             uint64_t old_sender_local = sender_ch->local_amount;
             uint64_t old_sender_remote = sender_ch->remote_amount;
+            size_t old_sender_n_htlcs = sender_ch->n_htlcs;
+            htlc_t old_sender_htlcs[MAX_HTLCS];
+            if (old_sender_n_htlcs > 0)
+                memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
             if (!channel_fulfill_htlc(sender_ch, htlc->id, preimage)) {
                 fprintf(stderr, "LSP: back-fulfill failed\n");
                 continue;
@@ -638,7 +657,8 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)s, old_cn,
-                        old_sender_local, old_sender_remote);
+                        old_sender_local, old_sender_remote,
+                        old_sender_htlcs, old_sender_n_htlcs);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
@@ -813,9 +833,13 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
         channel_t *dest_ch = &mgr->entries[dest_idx].channel;
 
-        /* Capture amounts before add_htlc changes them (for watchtower) */
+        /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
         uint64_t old_dest_local = dest_ch->local_amount;
         uint64_t old_dest_remote = dest_ch->remote_amount;
+        size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+        htlc_t old_dest_htlcs[MAX_HTLCS];
+        if (old_dest_n_htlcs > 0)
+            memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
         /* Add HTLC to destination's channel (offered from LSP) */
         uint64_t dest_htlc_id;
@@ -872,7 +896,8 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                 channel_receive_revocation(dest_ch, old_cn, rev_secret);
                 watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                     (uint32_t)dest_idx, old_cn,
-                    old_dest_local, old_dest_remote);
+                    old_dest_local, old_dest_remote,
+                    old_dest_htlcs, old_dest_n_htlcs);
                 secp256k1_pubkey next_pcp;
                 if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                     channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -1563,9 +1588,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* 4. Add HTLC on sender's channel (HTLC_RECEIVED from LSP perspective) */
     channel_t *sender_ch = &mgr->entries[from_client].channel;
 
-    /* Capture amounts before add_htlc changes them (for watchtower) */
+    /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
     uint64_t old_sender_local = sender_ch->local_amount;
     uint64_t old_sender_remote = sender_ch->remote_amount;
+    size_t old_sender_n_htlcs = sender_ch->n_htlcs;
+    htlc_t old_sender_htlcs[MAX_HTLCS];
+    if (old_sender_n_htlcs > 0)
+        memcpy(old_sender_htlcs, sender_ch->htlcs, old_sender_n_htlcs * sizeof(htlc_t));
 
     uint64_t sender_htlc_id;
     if (!channel_add_htlc(sender_ch, HTLC_RECEIVED, amount_sats,
@@ -1618,7 +1647,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
             watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)from_client, old_cn,
-                old_sender_local, old_sender_remote);
+                old_sender_local, old_sender_remote,
+                old_sender_htlcs, old_sender_n_htlcs);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
@@ -1631,9 +1661,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     /* 7. Forward HTLC to destination client */
     channel_t *dest_ch = &mgr->entries[to_client].channel;
 
-    /* Capture amounts before add_htlc changes them (for watchtower) */
+    /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
     uint64_t old_dest_local = dest_ch->local_amount;
     uint64_t old_dest_remote = dest_ch->remote_amount;
+    size_t old_dest_n_htlcs = dest_ch->n_htlcs;
+    htlc_t old_dest_htlcs[MAX_HTLCS];
+    if (old_dest_n_htlcs > 0)
+        memcpy(old_dest_htlcs, dest_ch->htlcs, old_dest_n_htlcs * sizeof(htlc_t));
 
     uint64_t dest_htlc_id;
     if (!channel_add_htlc(dest_ch, HTLC_OFFERED, amount_sats,
@@ -1683,7 +1717,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
             watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)to_client, old_cn,
-                old_dest_local, old_dest_remote);
+                old_dest_local, old_dest_remote,
+                old_dest_htlcs, old_dest_n_htlcs);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -1710,9 +1745,13 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         }
         cJSON_Delete(ful_msg.json);
 
-        /* Capture amounts before fulfill changes them (for watchtower) */
+        /* Capture amounts and HTLC state before fulfill changes them (for watchtower) */
         uint64_t old_dest_ful_local = dest_ch->local_amount;
         uint64_t old_dest_ful_remote = dest_ch->remote_amount;
+        size_t old_dest_ful_n_htlcs = dest_ch->n_htlcs;
+        htlc_t old_dest_ful_htlcs[MAX_HTLCS];
+        if (old_dest_ful_n_htlcs > 0)
+            memcpy(old_dest_ful_htlcs, dest_ch->htlcs, old_dest_ful_n_htlcs * sizeof(htlc_t));
 
         /* Fulfill on dest channel */
         channel_fulfill_htlc(dest_ch, ful_htlc_id, preimage);
@@ -1743,7 +1782,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
                     watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)to_client, old_cn,
-                        old_dest_ful_local, old_dest_ful_remote);
+                        old_dest_ful_local, old_dest_ful_remote,
+                        old_dest_ful_htlcs, old_dest_ful_n_htlcs);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
@@ -1757,6 +1797,10 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         /* 10. Back-propagate fulfill to sender */
         uint64_t old_sender_ful_local = sender_ch->local_amount;
         uint64_t old_sender_ful_remote = sender_ch->remote_amount;
+        size_t old_sender_ful_n_htlcs = sender_ch->n_htlcs;
+        htlc_t old_sender_ful_htlcs[MAX_HTLCS];
+        if (old_sender_ful_n_htlcs > 0)
+            memcpy(old_sender_ful_htlcs, sender_ch->htlcs, old_sender_ful_n_htlcs * sizeof(htlc_t));
         channel_fulfill_htlc(sender_ch, sender_htlc_id, preimage);
 
         cJSON *ful_fwd = wire_build_update_fulfill_htlc(sender_htlc_id, preimage);
@@ -1789,7 +1833,8 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
                     watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)from_client, old_cn,
-                        old_sender_ful_local, old_sender_ful_remote);
+                        old_sender_ful_local, old_sender_ful_remote,
+                        old_sender_ful_htlcs, old_sender_ful_n_htlcs);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);

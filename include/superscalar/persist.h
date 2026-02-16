@@ -139,6 +139,20 @@ size_t persist_load_old_commitments(persist_t *p, uint32_t channel_id,
                                       size_t *spk_lens,
                                       size_t max_entries);
 
+/* --- Old commitment HTLC outputs (watchtower) --- */
+
+/* Forward declaration to avoid circular include with watchtower.h */
+struct watchtower_htlc;
+typedef struct watchtower_htlc watchtower_htlc_t;
+
+/* Save HTLC output metadata for an old commitment. */
+int persist_save_old_commitment_htlc(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, const watchtower_htlc_t *htlc);
+
+/* Load HTLC output metadata for an old commitment. Returns count loaded. */
+size_t persist_load_old_commitment_htlcs(persist_t *p, uint32_t channel_id,
+    uint64_t commit_num, watchtower_htlc_t *htlcs_out, size_t max_htlcs);
+
 /* --- Wire message logging (Phase 22) --- */
 
 /* Log a wire message to the wire_messages table. */

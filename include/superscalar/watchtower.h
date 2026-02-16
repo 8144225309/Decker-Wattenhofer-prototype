@@ -13,6 +13,15 @@ typedef enum {
     WATCH_FACTORY_NODE     /* Factory state breach — broadcast latest state tx */
 } watchtower_entry_type_t;
 
+typedef struct watchtower_htlc {
+    uint32_t htlc_vout;
+    uint64_t htlc_amount;
+    unsigned char htlc_spk[34];
+    htlc_direction_t direction;
+    unsigned char payment_hash[32];
+    uint32_t cltv_expiry;
+} watchtower_htlc_t;
+
 typedef struct {
     watchtower_entry_type_t type;
     uint32_t channel_id;          /* channel index (commitment) or node index (factory) */
@@ -24,6 +33,10 @@ typedef struct {
     uint64_t to_local_amount;
     unsigned char to_local_spk[34];
     size_t to_local_spk_len;
+
+    /* HTLC outputs on the breached commitment (for penalty sweep) */
+    watchtower_htlc_t htlc_outputs[MAX_HTLCS];
+    size_t n_htlc_outputs;
 
     /* WATCH_FACTORY_NODE fields */
     unsigned char *response_tx;   /* heap-allocated latest state tx to broadcast */
@@ -62,11 +75,14 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
 int watchtower_check(watchtower_t *wt);
 
 /* After receiving a revocation, register the old commitment with the watchtower.
-   Rebuilds the old commitment tx to get its txid and to_local output info. */
+   Rebuilds the old commitment tx to get its txid and to_local output info.
+   old_htlcs/old_n_htlcs: snapshot of HTLC state at the time of the old commitment.
+   Pass NULL/0 if HTLC state is not available (HTLC outputs won't be watched). */
 void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
                                            uint32_t channel_id,
                                            uint64_t old_commit_num,
-                                           uint64_t old_local, uint64_t old_remote);
+                                           uint64_t old_local, uint64_t old_remote,
+                                           const htlc_t *old_htlcs, size_t old_n_htlcs);
 
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);

@@ -280,6 +280,7 @@ extern int test_client_watch_revoked_commitment(void);
 extern int test_lsp_revoke_and_ack_wire(void);
 extern int test_factory_node_watch(void);
 extern int test_factory_and_commitment_entries(void);
+extern int test_htlc_penalty_watch(void);
 
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
@@ -516,6 +517,7 @@ static void run_unit_tests(void) {
     RUN_TEST(test_lsp_revoke_and_ack_wire);
     RUN_TEST(test_factory_node_watch);
     RUN_TEST(test_factory_and_commitment_entries);
+    RUN_TEST(test_htlc_penalty_watch);
 }
 
 static void run_regtest_tests(void) {

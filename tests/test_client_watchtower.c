@@ -184,7 +184,8 @@ int test_client_watch_revoked_commitment(void) {
     /* Client registers the old LSP commitment with watchtower */
     size_t entries_before = wt.n_entries;
     watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
-                                          old_local, old_remote);
+                                          old_local, old_remote,
+                                          NULL, 0);
 
     TEST_ASSERT(wt.n_entries == entries_before + 1,
                 "watchtower should have one more entry");
@@ -312,5 +313,94 @@ int test_factory_and_commitment_entries(void) {
                 "remaining entry should be WATCH_FACTORY_NODE");
 
     watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* Test 7: HTLC penalty watch — watchtower entry stores HTLC output info */
+int test_htlc_penalty_watch(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    unsigned char lsp_sec[32], client_sec[32];
+    memset(lsp_sec, 0x11, 32);
+    memset(client_sec, 0x22, 32);
+
+    channel_t lsp_ch, client_ch;
+    setup_channel_pair(ctx, &lsp_ch, &client_ch, lsp_sec, client_sec);
+
+    /* Exchange HTLC basepoints (setup_channel_pair doesn't do this) */
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    /* Set up watchtower for client side */
+    watchtower_t wt;
+    fee_estimator_t fee;
+    fee_init(&fee, 1000);
+    watchtower_init(&wt, 1, NULL, &fee, NULL);
+    watchtower_set_channel(&wt, 0, &client_ch);
+
+    /* Add 1 HTLC (5000 sats, offered from LSP to client) */
+    unsigned char payment_hash[32];
+    memset(payment_hash, 0x55, 32);
+    uint64_t htlc_id;
+    /* On lsp_ch: HTLC_OFFERED (LSP offers to client) */
+    TEST_ASSERT(channel_add_htlc(&lsp_ch, HTLC_OFFERED, 5000, payment_hash, 500, &htlc_id),
+                "add_htlc on LSP should succeed");
+    /* On client_ch: HTLC_RECEIVED (client receives from LSP) */
+    TEST_ASSERT(channel_add_htlc(&client_ch, HTLC_RECEIVED, 5000, payment_hash, 500, &htlc_id),
+                "add_htlc on client should succeed");
+
+    /* Snapshot the old state before advancing */
+    uint64_t old_cn = client_ch.commitment_number;
+    uint64_t old_local = client_ch.local_amount;
+    uint64_t old_remote = client_ch.remote_amount;
+    size_t old_n_htlcs = client_ch.n_htlcs;
+    htlc_t old_htlcs[MAX_HTLCS];
+    memcpy(old_htlcs, client_ch.htlcs, old_n_htlcs * sizeof(htlc_t));
+
+    /* Advance commitment */
+    lsp_ch.commitment_number++;
+    channel_generate_local_pcs(&lsp_ch, lsp_ch.commitment_number);
+    client_ch.commitment_number++;
+    channel_generate_local_pcs(&client_ch, client_ch.commitment_number);
+
+    /* LSP reveals old secret to client */
+    unsigned char lsp_old_secret[32];
+    channel_get_revocation_secret(&lsp_ch, old_cn, lsp_old_secret);
+    channel_receive_revocation(&client_ch, old_cn, lsp_old_secret);
+
+    /* Exchange new PCPs */
+    secp256k1_pubkey lsp_new_pcp;
+    channel_get_per_commitment_point(&lsp_ch, lsp_ch.commitment_number + 1, &lsp_new_pcp);
+    channel_set_remote_pcp(&client_ch, client_ch.commitment_number + 1, &lsp_new_pcp);
+
+    /* Register old commitment WITH HTLC state */
+    size_t entries_before = wt.n_entries;
+    watchtower_watch_revoked_commitment(&wt, &client_ch, 0, old_cn,
+                                          old_local, old_remote,
+                                          old_htlcs, old_n_htlcs);
+
+    TEST_ASSERT(wt.n_entries == entries_before + 1,
+                "watchtower should have one more entry");
+
+    watchtower_entry_t *entry = &wt.entries[entries_before];
+    TEST_ASSERT(entry->channel_id == 0, "entry channel_id should be 0");
+    TEST_ASSERT(entry->commit_num == old_cn, "entry commit_num should match");
+
+    /* Verify HTLC output was stored */
+    TEST_ASSERT(entry->n_htlc_outputs == 1,
+                "entry should have 1 HTLC output");
+    TEST_ASSERT(entry->htlc_outputs[0].htlc_vout == 2,
+                "HTLC output vout should be 2");
+    TEST_ASSERT(entry->htlc_outputs[0].htlc_amount == 5000,
+                "HTLC output amount should be 5000");
+    TEST_ASSERT(entry->htlc_outputs[0].direction == HTLC_RECEIVED,
+                "HTLC direction should be RECEIVED (client's perspective)");
+    TEST_ASSERT(memcmp(entry->htlc_outputs[0].payment_hash, payment_hash, 32) == 0,
+                "HTLC payment_hash should match");
+    TEST_ASSERT(entry->htlc_outputs[0].cltv_expiry == 500,
+                "HTLC cltv_expiry should be 500");
+
+    secp256k1_context_destroy(ctx);
     return 1;
 }
