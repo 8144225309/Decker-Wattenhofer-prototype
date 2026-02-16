@@ -168,3 +168,48 @@ int test_dw_counter_full_cycle(void) {
 
     return 1;
 }
+
+/* ---- Edge case: single-layer single-state (min config) ---- */
+
+int test_dw_counter_single_state(void) {
+    dw_counter_t ctr;
+    dw_counter_init(&ctr, 1, 144, 1);
+
+    /* With max_states=1, counter starts exhausted (state 0 is the only state) */
+    TEST_ASSERT(dw_counter_is_exhausted(&ctr), "single-state is immediately exhausted");
+    TEST_ASSERT(!dw_counter_advance(&ctr), "cannot advance single-state");
+    TEST_ASSERT_EQ(ctr.current_epoch, 0, "epoch stays at 0");
+
+    return 1;
+}
+
+/* ---- Edge case: DW delay invariants ---- */
+
+int test_dw_delay_invariants(void) {
+    /* DW invariant: within any single layer, newer state = strictly lower delay.
+       Newest state (max-1) has zero delay. Oldest state (0) has max delay. */
+    dw_counter_t ctr;
+    dw_counter_init(&ctr, 3, 10, 4);
+
+    /* Per-layer: state N+1 always has strictly lower delay than state N */
+    for (uint32_t layer = 0; layer < ctr.n_layers; layer++) {
+        for (uint32_t s = 0; s + 1 < ctr.layers[layer].config.max_states; s++) {
+            uint16_t d0 = dw_delay_for_state(&ctr.layers[layer].config, s);
+            uint16_t d1 = dw_delay_for_state(&ctr.layers[layer].config, s + 1);
+            TEST_ASSERT(d1 < d0, "newer state must have strictly lower delay");
+        }
+    }
+
+    /* Newest state (max_states-1) has zero delay at every layer */
+    for (uint32_t layer = 0; layer < ctr.n_layers; layer++) {
+        uint32_t max_s = ctr.layers[layer].config.max_states - 1;
+        uint16_t d = dw_delay_for_state(&ctr.layers[layer].config, max_s);
+        TEST_ASSERT_EQ(d, 0, "newest state delay is zero");
+    }
+
+    /* Oldest state (0) has max delay = step * (max_states-1) */
+    uint16_t d0 = dw_delay_for_state(&ctr.layers[0].config, 0);
+    TEST_ASSERT_EQ(d0, 10 * 3, "oldest state delay = step * (max-1)");
+
+    return 1;
+}

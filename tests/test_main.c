@@ -283,6 +283,18 @@ extern int test_factory_node_watch(void);
 extern int test_factory_and_commitment_entries(void);
 extern int test_htlc_penalty_watch(void);
 
+/* Edge Cases + Failure Modes */
+extern int test_dw_counter_single_state(void);
+extern int test_dw_delay_invariants(void);
+extern int test_commitment_number_overflow(void);
+extern int test_htlc_double_fulfill_rejected(void);
+extern int test_htlc_fail_after_fulfill_rejected(void);
+extern int test_htlc_fulfill_after_fail_rejected(void);
+extern int test_htlc_max_count_enforcement(void);
+extern int test_htlc_dust_amount_rejected(void);
+extern int test_htlc_reserve_enforcement(void);
+extern int test_factory_advance_past_exhaustion(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -520,6 +532,18 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_node_watch);
     RUN_TEST(test_factory_and_commitment_entries);
     RUN_TEST(test_htlc_penalty_watch);
+
+    printf("\n=== Edge Cases + Failure Modes ===\n");
+    RUN_TEST(test_dw_counter_single_state);
+    RUN_TEST(test_dw_delay_invariants);
+    RUN_TEST(test_commitment_number_overflow);
+    RUN_TEST(test_htlc_double_fulfill_rejected);
+    RUN_TEST(test_htlc_fail_after_fulfill_rejected);
+    RUN_TEST(test_htlc_fulfill_after_fail_rejected);
+    RUN_TEST(test_htlc_max_count_enforcement);
+    RUN_TEST(test_htlc_dust_amount_rejected);
+    RUN_TEST(test_htlc_reserve_enforcement);
+    RUN_TEST(test_factory_advance_past_exhaustion);
 }
 
 static void run_regtest_tests(void) {

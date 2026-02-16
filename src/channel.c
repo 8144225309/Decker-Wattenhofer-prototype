@@ -1065,6 +1065,8 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
                       uint32_t cltv_expiry, uint64_t *htlc_id_out) {
     if (ch->n_htlcs >= MAX_HTLCS)
         return 0;
+    if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
+        return 0;  /* commitment number would overflow storage */
 
     /* Reject HTLC amount below dust */
     if (amount_sats < CHANNEL_DUST_LIMIT_SATS)
@@ -1115,6 +1117,8 @@ int channel_add_htlc(channel_t *ch, htlc_direction_t direction,
 
 int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
                            const unsigned char *preimage32) {
+    if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
+        return 0;
     /* Find HTLC by id */
     htlc_t *h = NULL;
     for (size_t i = 0; i < ch->n_htlcs; i++) {
@@ -1153,6 +1157,8 @@ int channel_fulfill_htlc(channel_t *ch, uint64_t htlc_id,
 }
 
 int channel_fail_htlc(channel_t *ch, uint64_t htlc_id) {
+    if (ch->commitment_number + 1 >= CHANNEL_MAX_SECRETS)
+        return 0;
     /* Find HTLC by id */
     htlc_t *h = NULL;
     for (size_t i = 0; i < ch->n_htlcs; i++) {

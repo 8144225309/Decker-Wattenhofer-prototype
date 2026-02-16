@@ -53,6 +53,7 @@ static void usage(const char *prog) {
         "  --regtest           Shorthand for --network regtest\n"
         "  --keyfile PATH      Load/save secret key from encrypted file\n"
         "  --passphrase PASS   Passphrase for keyfile (default: prompt or empty)\n"
+        "  --cltv-timeout N    Factory CLTV timeout (absolute block height; auto: +35 regtest, +1008 non-regtest)\n"
         "  --cli-path PATH     Path to bitcoin-cli binary (default: bitcoin-cli)\n"
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
@@ -318,6 +319,7 @@ int main(int argc, char *argv[]) {
     const char *cli_path = NULL;
     const char *rpcuser = NULL;
     const char *rpcpassword = NULL;
+    int64_t cltv_timeout_arg = -1;  /* -1 = auto */
     int breach_test = 0;
     int test_expiry = 0;
     int test_distrib = 0;
@@ -361,6 +363,8 @@ int main(int argc, char *argv[]) {
             rpcuser = argv[++i];
         else if (strcmp(argv[i], "--rpcpassword") == 0 && i + 1 < argc)
             rpcpassword = argv[++i];
+        else if (strcmp(argv[i], "--cltv-timeout") == 0 && i + 1 < argc)
+            cltv_timeout_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--breach-test") == 0)
             breach_test = 1;
         else if (strcmp(argv[i], "--test-expiry") == 0)
@@ -651,10 +655,17 @@ int main(int argc, char *argv[]) {
     uint32_t cltv_timeout = 0;
     {
         int cur_height = regtest_get_block_height(&rt);
-        if (cur_height > 0)
-            cltv_timeout = (uint32_t)cur_height + 35;
+        if (cltv_timeout_arg > 0) {
+            cltv_timeout = (uint32_t)cltv_timeout_arg;
+        } else if (cur_height > 0) {
+            /* Auto: regtest +35 blocks, non-regtest +1008 (~1 week) */
+            int offset = is_regtest ? 35 : 1008;
+            cltv_timeout = (uint32_t)cur_height + offset;
+        }
     }
 
+    printf("LSP: CLTV timeout: block %u (current: %d)\n",
+           cltv_timeout, regtest_get_block_height(&rt));
     printf("LSP: starting factory creation ceremony...\n");
     if (!lsp_run_factory_creation(&lsp,
                                    funding_txid, funding_vout,
@@ -1735,7 +1746,12 @@ int main(int argc, char *argv[]) {
         uint32_t cltv2 = 0;
         {
             int cur_h = regtest_get_block_height(&rt);
-            if (cur_h > 0) cltv2 = (uint32_t)cur_h + 35;
+            if (cltv_timeout_arg > 0) {
+                cltv2 = (uint32_t)cltv_timeout_arg;
+            } else if (cur_h > 0) {
+                int offset = is_regtest ? 35 : 1008;
+                cltv2 = (uint32_t)cur_h + offset;
+            }
         }
 
         /* Run factory creation ceremony (sends FACTORY_PROPOSE to clients,
