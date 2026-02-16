@@ -36,7 +36,7 @@ cmake .. && make -j$(nproc)
 
 ## Tests
 
-153 tests (134 unit + 19 regtest integration).
+159 tests (140 unit + 19 regtest integration).
 
 ```bash
 cd build
@@ -97,8 +97,11 @@ bash ../tools/demo.sh
 These flags run after the `--demo` payment sequence completes:
 
 ```bash
-# Watchtower breach test
+# Watchtower breach test (LSP detects its own revoked commitment)
 ./superscalar_lsp --port 9735 --demo --breach-test
+
+# Cheat daemon (broadcast revoked commitment, sleep — clients detect breach)
+./superscalar_lsp --port 9735 --demo --cheat-daemon
 
 # CLTV timeout recovery (mine past timeout, LSP recovers via script-path)
 ./superscalar_lsp --port 9735 --demo --test-expiry
@@ -111,6 +114,22 @@ These flags run after the `--demo` payment sequence completes:
 
 # Full factory rotation (PTLC wire msgs + new factory + payments)
 ./superscalar_lsp --port 9735 --demo --test-rotation
+```
+
+### Test Orchestrator
+
+Multi-party scenario testing with automatic process management. Stdlib-only Python3.
+
+```bash
+python3 tools/test_orchestrator.py --list                        # Show scenarios
+python3 tools/test_orchestrator.py --scenario all_watch          # All clients detect breach
+python3 tools/test_orchestrator.py --scenario partial_watch --k 2  # 2 of 4 detect
+python3 tools/test_orchestrator.py --scenario nobody_home        # No clients, breach undetected
+python3 tools/test_orchestrator.py --scenario late_arrival       # Clients restart after breach
+python3 tools/test_orchestrator.py --scenario cooperative_close  # Clean shutdown
+python3 tools/test_orchestrator.py --scenario timeout_expiry     # LSP reclaims via CLTV
+python3 tools/test_orchestrator.py --scenario factory_breach     # Old factory tree broadcast
+python3 tools/test_orchestrator.py --scenario all                # Run all scenarios
 ```
 
 ---
@@ -243,6 +262,7 @@ superscalar_lsp [OPTIONS]
 | `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
 | `--report` | PATH | — | Write JSON diagnostic report |
 | `--breach-test` | — | off | Broadcast revoked commitment, trigger penalty |
+| `--cheat-daemon` | — | off | Broadcast revoked commitment, sleep (clients detect) |
 | `--test-expiry` | — | off | Mine past CLTV, recover via timeout script |
 | `--test-distrib` | — | off | Broadcast pre-signed distribution tx |
 | `--test-turnover` | — | off | PTLC key turnover, close with extracted keys |
@@ -259,12 +279,15 @@ superscalar_client [OPTIONS]
 | `--seckey` | HEX | **required** | 32-byte secret key |
 | `--port` | PORT | 9735 | LSP port |
 | `--host` | HOST | 127.0.0.1 | LSP host |
-| `--daemon` | — | off | Daemon mode (auto-fulfill HTLCs) |
+| `--daemon` | — | off | Daemon mode (auto-fulfill HTLCs, client watchtower) |
 | `--db` | PATH | — | SQLite persistence |
 | `--network` | MODE | regtest | Network mode |
 | `--fee-rate` | N | 1000 | Fee rate (sat/kvB) |
 | `--keyfile` | PATH | — | Encrypted keyfile |
 | `--passphrase` | PASS | — | Keyfile passphrase |
+| `--cli-path` | PATH | bitcoin-cli | Bitcoin CLI binary |
+| `--rpcuser` | USER | rpcuser | Bitcoin RPC username |
+| `--rpcpassword` | PASS | rpcpass | Bitcoin RPC password |
 
 ### superscalar_bridge
 
@@ -345,7 +368,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-39 message types over TCP with length-prefixed JSON framing:
+40 message types over TCP with length-prefixed JSON framing:
 
 | Category | Messages |
 |----------|----------|
@@ -353,6 +376,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 | Factory | PROPOSE, NONCES, PSIGS, READY, FACTORY_PROPOSE |
 | Channel | BASEPOINTS, CHANNEL_NONCES, CHANNEL_READY, CLOSE_REQUEST, CLOSE_COMPLETE |
 | HTLC | ADD_HTLC, COMMITMENT_SIGNED, REVOKE_AND_ACK, FULFILL_HTLC, FAIL_HTLC |
+| Revocation | LSP_REVOKE_AND_ACK |
 | Bridge | BRIDGE_HELLO through BRIDGE_PAY_RESULT (8 types) |
 | Reconnect | RECONNECT, RECONNECT_ACK |
 | Invoice | CREATE_INVOICE, INVOICE_CREATED, REGISTER_INVOICE |
@@ -386,14 +410,14 @@ CLN (lightningd)
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, migration |
-| `wire` | wire.c | TCP transport, JSON framing, 39 message types |
+| `wire` | wire.c | TCP transport, JSON framing, 40 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
 | `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, watchtower, multi-factory |
-| `persist` | persist.c | SQLite3: 17 tables for full state persistence |
+| `persist` | persist.c | SQLite3: 19 tables for full state persistence |
 | `bridge` | bridge.c | CLN bridge daemon |
 | `fee` | fee.c | Configurable fee estimation |
-| `watchtower` | watchtower.c | Breach detection + penalty broadcast |
+| `watchtower` | watchtower.c | Breach detection + penalty broadcast (LSP + client-side, factory nodes) |
 | `keyfile` | keyfile.c | Encrypted keyfile storage |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
