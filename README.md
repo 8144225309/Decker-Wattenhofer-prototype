@@ -12,7 +12,7 @@ A Bitcoin channel factory protocol combining:
 ## Quick Start
 
 ```bash
-# Build (Linux/WSL — fetches secp256k1-zkp + cJSON automatically)
+# Build (fetches secp256k1-zkp + cJSON automatically)
 mkdir -p build && cd build && cmake .. && make -j$(nproc)
 
 # Run the basic demo (needs bitcoind -regtest running)
