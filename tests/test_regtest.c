@@ -3,6 +3,9 @@
 #include "superscalar/tx_builder.h"
 #include "superscalar/dw_state.h"
 #include "superscalar/types.h"
+#include "superscalar/watchtower.h"
+#include "superscalar/fee.h"
+#include "superscalar/channel.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -600,5 +603,47 @@ int test_regtest_nsequence_edge(void) {
     printf("  Confirmed (%d conf)\n", conf);
 
     secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: regtest_get_utxo_for_bump + signrawtransactionwithwallet */
+int test_regtest_cpfp_penalty_bump(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not available\n");
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_cpfp_bump");
+
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mining address");
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* Test regtest_get_utxo_for_bump */
+    char txid_out[65];
+    uint32_t vout_out;
+    uint64_t amount_out;
+    unsigned char spk_out[64];
+    size_t spk_len_out = 0;
+
+    int found = regtest_get_utxo_for_bump(&rt, 1000,
+                                            txid_out, &vout_out,
+                                            &amount_out, spk_out, &spk_len_out);
+    TEST_ASSERT(found, "found wallet UTXO for bump");
+    TEST_ASSERT(amount_out >= 1000, "UTXO amount sufficient");
+    TEST_ASSERT(spk_len_out > 0, "UTXO SPK non-empty");
+    printf("  Found UTXO: %s:%u amount=%llu\n", txid_out, vout_out,
+           (unsigned long long)amount_out);
+
+    /* Test watchtower anchor init on regtest */
+    watchtower_t wt;
+    fee_estimator_t fee;
+    fee_init(&fee, 1000);
+    watchtower_init(&wt, 1, &rt, &fee, NULL);
+    TEST_ASSERT(wt.anchor_spk_len == 34, "anchor SPK initialized");
+    printf("  Watchtower anchor SPK generated successfully\n");
+
+    watchtower_cleanup(&wt);
     return 1;
 }

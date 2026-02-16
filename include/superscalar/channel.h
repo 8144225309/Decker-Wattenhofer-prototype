@@ -249,7 +249,9 @@ int channel_build_penalty_tx(const channel_t *ch,
                                uint64_t to_local_amount,
                                const unsigned char *to_local_spk,
                                size_t to_local_spk_len,
-                               uint64_t old_commitment_num);
+                               uint64_t old_commitment_num,
+                               const unsigned char *anchor_spk,
+                               size_t anchor_spk_len);
 
 /* --- Cooperative close --- */
 
@@ -317,6 +319,7 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     const unsigned char *commitment_txid, uint32_t htlc_vout,
     uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
-    uint64_t old_commitment_num, size_t htlc_index);
+    uint64_t old_commitment_num, size_t htlc_index,
+    const unsigned char *anchor_spk, size_t anchor_spk_len);
 
 #endif /* SUPERSCALAR_CHANNEL_H */

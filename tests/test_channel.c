@@ -581,7 +581,7 @@ int test_channel_penalty_tx(void) {
     TEST_ASSERT(channel_build_penalty_tx(&remote_ch, &penalty_tx,
                                            local_txid, 0,
                                            to_local_amount, to_local_spk, 34,
-                                           0),
+                                           0, NULL, 0),
                 "build penalty tx");
 
     TEST_ASSERT(penalty_tx.len > 0, "penalty tx non-empty");
@@ -1770,7 +1770,7 @@ int test_htlc_penalty(void) {
     TEST_ASSERT(channel_build_htlc_penalty_tx(&remote_ch, &penalty_tx,
                                                 local_txid, 2,
                                                 htlc_amount, htlc_spk, 34,
-                                                1, 0),
+                                                1, 0, NULL, 0),
                 "build htlc penalty tx");
 
     TEST_ASSERT(penalty_tx.len > 0, "penalty tx non-empty");
@@ -3214,7 +3214,7 @@ int test_regtest_channel_penalty(void) {
     TEST_ASSERT(channel_build_penalty_tx(&honest_ch, &penalty_tx,
                                            commit0_txid, 0,
                                            to_local_amount, to_local_spk, 34,
-                                           0),
+                                           0, NULL, 0),
                 "build penalty tx");
 
     char *penalty_hex = (char *)malloc(penalty_tx.len * 2 + 1);

@@ -512,3 +512,91 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
 
     return -1;  /* timeout */
 }
+
+int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
+                                char *txid_out, uint32_t *vout_out,
+                                uint64_t *amount_out,
+                                unsigned char *spk_out, size_t *spk_len_out) {
+    if (!rt || !txid_out || !vout_out || !amount_out) return 0;
+
+    char *result = regtest_exec(rt, "listunspent", "1 9999999");
+    if (!result) return 0;
+
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json || !cJSON_IsArray(json)) {
+        if (json) cJSON_Delete(json);
+        return 0;
+    }
+
+    double min_btc = (double)min_amount_sats / 100000000.0;
+    int found = 0;
+
+    int n = cJSON_GetArraySize(json);
+    for (int i = 0; i < n; i++) {
+        cJSON *utxo = cJSON_GetArrayItem(json, i);
+        cJSON *amount = cJSON_GetObjectItem(utxo, "amount");
+        if (!amount || !cJSON_IsNumber(amount)) continue;
+        if (amount->valuedouble < min_btc) continue;
+
+        cJSON *txid = cJSON_GetObjectItem(utxo, "txid");
+        cJSON *vout = cJSON_GetObjectItem(utxo, "vout");
+        if (!txid || !cJSON_IsString(txid) || !vout || !cJSON_IsNumber(vout))
+            continue;
+
+        strncpy(txid_out, txid->valuestring, 65);
+        *vout_out = (uint32_t)vout->valueint;
+        *amount_out = (uint64_t)(amount->valuedouble * 100000000.0 + 0.5);
+
+        if (spk_out && spk_len_out) {
+            cJSON *spk = cJSON_GetObjectItem(utxo, "scriptPubKey");
+            if (spk && cJSON_IsString(spk)) {
+                int decoded = hex_decode(spk->valuestring, spk_out, 256);
+                if (decoded > 0)
+                    *spk_len_out = (size_t)decoded;
+            }
+        }
+
+        found = 1;
+        break;
+    }
+
+    cJSON_Delete(json);
+    return found;
+}
+
+char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
+                                        const char *prevtxs_json) {
+    if (!rt || !unsigned_hex) return NULL;
+
+    char *params;
+    if (prevtxs_json) {
+        size_t plen = strlen(unsigned_hex) + strlen(prevtxs_json) + 16;
+        params = (char *)malloc(plen);
+        if (!params) return NULL;
+        snprintf(params, plen, "\"%s\" '%s'", unsigned_hex, prevtxs_json);
+    } else {
+        size_t plen = strlen(unsigned_hex) + 8;
+        params = (char *)malloc(plen);
+        if (!params) return NULL;
+        snprintf(params, plen, "\"%s\"", unsigned_hex);
+    }
+
+    char *result = regtest_exec(rt, "signrawtransactionwithwallet", params);
+    free(params);
+    if (!result) return NULL;
+
+    cJSON *json = cJSON_Parse(result);
+    free(result);
+    if (!json) return NULL;
+
+    cJSON *hex = cJSON_GetObjectItem(json, "hex");
+    if (!hex || !cJSON_IsString(hex)) {
+        cJSON_Delete(json);
+        return NULL;
+    }
+
+    char *signed_hex = strdup(hex->valuestring);
+    cJSON_Delete(json);
+    return signed_hex;
+}

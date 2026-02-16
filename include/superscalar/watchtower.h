@@ -5,6 +5,8 @@
 #include "persist.h"
 #include "regtest.h"
 #include "fee.h"
+#include <secp256k1.h>
+#include <secp256k1_extrakeys.h>
 
 #define WATCHTOWER_MAX_WATCH 64
 
@@ -44,6 +46,17 @@ typedef struct {
 } watchtower_entry_t;
 
 #define WATCHTOWER_MAX_CHANNELS 8
+#define WATCHTOWER_MAX_PENDING 16
+#define WATCHTOWER_ANCHOR_AMOUNT 330  /* sats */
+
+/* Pending penalty tx awaiting confirmation (for CPFP bump) */
+typedef struct {
+    char txid[65];              /* penalty tx we broadcast */
+    uint32_t anchor_vout;       /* anchor output index (always 1) */
+    uint64_t anchor_amount;     /* 330 sats */
+    int cycles_in_mempool;      /* how many 5s cycles it's been stuck */
+    int bumped;                 /* already broadcast CPFP child */
+} watchtower_pending_t;
 
 typedef struct {
     watchtower_entry_t entries[WATCHTOWER_MAX_WATCH];
@@ -53,6 +66,18 @@ typedef struct {
     regtest_t *rt;                 /* for chain queries + broadcasting */
     fee_estimator_t *fee;
     persist_t *db;
+
+    /* Anchor key for CPFP fee bumping */
+    unsigned char anchor_seckey[32];
+    secp256k1_keypair anchor_keypair;
+    secp256k1_xonly_pubkey anchor_xonly;
+    unsigned char anchor_spk[34];       /* P2TR scriptPubKey */
+    size_t anchor_spk_len;
+    secp256k1_context *ctx;
+
+    /* Pending penalty txs awaiting confirmation */
+    watchtower_pending_t pending[WATCHTOWER_MAX_PENDING];
+    size_t n_pending;
 } watchtower_t;
 
 /* Initialize watchtower. Load old commitments from DB if available. */
@@ -96,5 +121,14 @@ int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
 
 /* Free heap-allocated response_tx buffers in factory entries. */
 void watchtower_cleanup(watchtower_t *wt);
+
+/* Build a CPFP child tx to bump a stuck penalty tx.
+   Uses anchor output from penalty tx + wallet UTXO.
+   Returns 1 on success, 0 on failure. */
+int watchtower_build_cpfp_tx(watchtower_t *wt,
+                               tx_buf_t *cpfp_tx_out,
+                               const char *parent_txid,
+                               uint32_t anchor_vout,
+                               uint64_t anchor_amount);
 
 #endif /* SUPERSCALAR_WATCHTOWER_H */

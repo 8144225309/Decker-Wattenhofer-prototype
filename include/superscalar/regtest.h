@@ -45,4 +45,16 @@ double regtest_get_balance(regtest_t *rt);
 int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
                                     int timeout_secs);
 
+/* Find a wallet UTXO suitable for CPFP bump funding.
+   Returns 1 on success with UTXO details filled. */
+int regtest_get_utxo_for_bump(regtest_t *rt, uint64_t min_amount_sats,
+                                char *txid_out, uint32_t *vout_out,
+                                uint64_t *amount_out,
+                                unsigned char *spk_out, size_t *spk_len_out);
+
+/* Sign a raw tx using the wallet's keys. Returns signed hex (caller frees).
+   prevtxs_json: JSON array of prevtx objects for non-wallet inputs, or NULL. */
+char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
+                                        const char *prevtxs_json);
+
 #endif /* SUPERSCALAR_REGTEST_H */

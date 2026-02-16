@@ -86,6 +86,7 @@ add_executable(test_superscalar
     tests/test_daemon.c
     tests/test_reconnect.c
     tests/test_client_watchtower.c
+    tests/test_cpfp.c
 )
 target_include_directories(test_superscalar PRIVATE ${secp256k1-zkp_SOURCE_DIR}/include)
 target_include_directories(test_superscalar PRIVATE ${cjson_SOURCE_DIR})

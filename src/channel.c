@@ -725,7 +725,9 @@ int channel_build_penalty_tx(const channel_t *ch,
                                uint64_t to_local_amount,
                                const unsigned char *to_local_spk,
                                size_t to_local_spk_len,
-                               uint64_t old_commitment_num) {
+                               uint64_t old_commitment_num,
+                               const unsigned char *anchor_spk,
+                               size_t anchor_spk_len) {
     /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
     if (!channel_get_received_revocation(ch, old_commitment_num, pcp_secret))
@@ -807,14 +809,27 @@ int channel_build_penalty_tx(const channel_t *ch,
     secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
                                         &out_tweaked_full);
 
-    /* Fee: computed from fee rate (~152 vB penalty tx) */
-    uint64_t penalty_fee = (ch->fee_rate_sat_per_kvb * 152 + 999) / 1000;
-    uint64_t penalty_amount = to_local_amount > penalty_fee ? to_local_amount - penalty_fee : 0;
+    /* Fee: computed from fee rate.
+       With anchor: ~195 vB (1-in, 2-out). Without: ~152 vB (1-in, 1-out). */
+    int has_anchor = (anchor_spk && anchor_spk_len == 34);
+    uint64_t vsize = has_anchor ? 195 : 152;
+    uint64_t anchor_amount = 330;
+    uint64_t penalty_fee = (ch->fee_rate_sat_per_kvb * vsize + 999) / 1000;
+    uint64_t deduction = penalty_fee + (has_anchor ? anchor_amount : 0);
+    uint64_t penalty_amount = to_local_amount > deduction ? to_local_amount - deduction : 0;
 
-    tx_output_t output;
-    build_p2tr_script_pubkey(output.script_pubkey, &out_tweaked);
-    output.script_pubkey_len = 34;
-    output.amount_sats = penalty_amount;
+    tx_output_t outputs[2];
+    size_t n_outputs = 1;
+    build_p2tr_script_pubkey(outputs[0].script_pubkey, &out_tweaked);
+    outputs[0].script_pubkey_len = 34;
+    outputs[0].amount_sats = penalty_amount;
+
+    if (has_anchor) {
+        memcpy(outputs[1].script_pubkey, anchor_spk, 34);
+        outputs[1].script_pubkey_len = 34;
+        outputs[1].amount_sats = anchor_amount;
+        n_outputs = 2;
+    }
 
     /* 8. Build unsigned penalty tx */
     tx_buf_t unsigned_tx;
@@ -822,7 +837,7 @@ int channel_build_penalty_tx(const channel_t *ch,
     unsigned char penalty_txid[32];
     if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
                             commitment_txid, to_local_vout,
-                            0xFFFFFFFE, &output, 1)) {
+                            0xFFFFFFFE, outputs, n_outputs)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }
@@ -1619,7 +1634,8 @@ int channel_build_htlc_timeout_tx(const channel_t *ch, tx_buf_t *signed_tx_out,
 int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     const unsigned char *commitment_txid, uint32_t htlc_vout,
     uint64_t htlc_amount, const unsigned char *htlc_spk, size_t htlc_spk_len,
-    uint64_t old_commitment_num, size_t htlc_index)
+    uint64_t old_commitment_num, size_t htlc_index,
+    const unsigned char *anchor_spk, size_t anchor_spk_len)
 {
     /* 1. Retrieve per_commitment_secret from received revocations */
     unsigned char pcp_secret[32];
@@ -1729,13 +1745,26 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     secp256k1_xonly_pubkey_from_pubkey(ch->ctx, &out_tweaked, NULL,
                                         &out_tweaked_full);
 
-    uint64_t htlc_penalty_fee = (ch->fee_rate_sat_per_kvb * 152 + 999) / 1000;
-    uint64_t penalty_amount = htlc_amount > htlc_penalty_fee ? htlc_amount - htlc_penalty_fee : 0;
+    /* Fee: with anchor ~195 vB, without ~152 vB */
+    int has_anchor = (anchor_spk && anchor_spk_len == 34);
+    uint64_t vsize = has_anchor ? 195 : 152;
+    uint64_t anchor_amount = 330;
+    uint64_t htlc_penalty_fee = (ch->fee_rate_sat_per_kvb * vsize + 999) / 1000;
+    uint64_t deduction = htlc_penalty_fee + (has_anchor ? anchor_amount : 0);
+    uint64_t penalty_amount = htlc_amount > deduction ? htlc_amount - deduction : 0;
 
-    tx_output_t output;
-    build_p2tr_script_pubkey(output.script_pubkey, &out_tweaked);
-    output.script_pubkey_len = 34;
-    output.amount_sats = penalty_amount;
+    tx_output_t outputs[2];
+    size_t n_outputs = 1;
+    build_p2tr_script_pubkey(outputs[0].script_pubkey, &out_tweaked);
+    outputs[0].script_pubkey_len = 34;
+    outputs[0].amount_sats = penalty_amount;
+
+    if (has_anchor) {
+        memcpy(outputs[1].script_pubkey, anchor_spk, 34);
+        outputs[1].script_pubkey_len = 34;
+        outputs[1].amount_sats = anchor_amount;
+        n_outputs = 2;
+    }
 
     /* 7. Build unsigned penalty tx */
     tx_buf_t unsigned_tx;
@@ -1743,7 +1772,7 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     unsigned char penalty_txid[32];
     if (!build_unsigned_tx(&unsigned_tx, penalty_txid,
                             commitment_txid, htlc_vout,
-                            0xFFFFFFFE, &output, 1)) {
+                            0xFFFFFFFE, outputs, n_outputs)) {
         tx_buf_free(&unsigned_tx);
         return 0;
     }

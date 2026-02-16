@@ -284,6 +284,14 @@ extern int test_factory_node_watch(void);
 extern int test_factory_and_commitment_entries(void);
 extern int test_htlc_penalty_watch(void);
 
+/* CPFP Anchor System */
+extern int test_penalty_tx_has_anchor(void);
+extern int test_htlc_penalty_tx_has_anchor(void);
+extern int test_watchtower_pending_tracking(void);
+extern int test_penalty_fee_updated(void);
+extern int test_watchtower_anchor_init(void);
+extern int test_regtest_cpfp_penalty_bump(void);
+
 /* Edge Cases + Failure Modes */
 extern int test_dw_counter_single_state(void);
 extern int test_dw_delay_invariants(void);
@@ -535,6 +543,13 @@ static void run_unit_tests(void) {
     RUN_TEST(test_factory_and_commitment_entries);
     RUN_TEST(test_htlc_penalty_watch);
 
+    printf("\n=== CPFP Anchor System ===\n");
+    RUN_TEST(test_penalty_tx_has_anchor);
+    RUN_TEST(test_htlc_penalty_tx_has_anchor);
+    RUN_TEST(test_watchtower_pending_tracking);
+    RUN_TEST(test_penalty_fee_updated);
+    RUN_TEST(test_watchtower_anchor_init);
+
     printf("\n=== Edge Cases + Failure Modes ===\n");
     RUN_TEST(test_dw_counter_single_state);
     RUN_TEST(test_dw_delay_invariants);
@@ -577,6 +592,9 @@ static void run_regtest_tests(void) {
     printf("\n=== Regtest Phase 10 (Channel Operations) ===\n");
     RUN_TEST(test_regtest_intra_factory_payment);
     RUN_TEST(test_regtest_multi_payment);
+
+    printf("\n=== Regtest CPFP Anchor ===\n");
+    RUN_TEST(test_regtest_cpfp_penalty_bump);
 }
 
 int main(int argc, char *argv[]) {
