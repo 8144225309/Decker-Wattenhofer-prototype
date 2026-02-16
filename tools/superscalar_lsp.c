@@ -57,6 +57,7 @@ static void usage(const char *prog) {
         "  --rpcuser USER      Bitcoin RPC username (default: rpcuser)\n"
         "  --rpcpassword PASS  Bitcoin RPC password (default: rpcpass)\n"
         "  --breach-test       After demo: broadcast revoked commitment, trigger penalty\n"
+        "  --cheat-daemon      After demo: broadcast revoked commitment, sleep (no penalty)\n"
         "  --test-expiry       After demo: mine past CLTV, recover via timeout script\n"
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
@@ -370,6 +371,8 @@ int main(int argc, char *argv[]) {
             test_turnover = 1;
         else if (strcmp(argv[i], "--test-rotation") == 0)
             test_rotation = 1;
+        else if (strcmp(argv[i], "--cheat-daemon") == 0)
+            breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -997,6 +1000,21 @@ int main(int argc, char *argv[]) {
 
         /* Mine 1 block so watchtower can detect it */
         regtest_mine_blocks(&rt, 1, mine_addr);
+
+        if (breach_test == 2) {
+            /* --cheat-daemon: LSP does NOT run watchtower — sleep so clients can detect */
+            printf("CHEAT DAEMON: revoked commitment broadcast, sleeping for clients...\n");
+            for (int s = 0; s < 30 && !g_shutdown; s++)
+                sleep(1);
+            printf("=== CHEAT DAEMON COMPLETE ===\n");
+            report_add_string(&rpt, "result", "cheat_daemon_complete");
+            report_close(&rpt);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
+        }
 
         /* Watchtower check: should detect breach and broadcast penalty */
         printf("Running watchtower check...\n");

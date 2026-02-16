@@ -54,6 +54,9 @@
 #define MSG_PTLC_ADAPTED_SIG    0x4D  /* Client → LSP: adapted signature */
 #define MSG_PTLC_COMPLETE       0x4E  /* LSP → Client: turnover acknowledged */
 
+/* Bidirectional revocation (Client Watchtower) */
+#define MSG_LSP_REVOKE_AND_ACK  0x50  /* LSP → Client: LSP's own revocation */
+
 /* Basepoint exchange (Gap #1) */
 #define MSG_CHANNEL_BASEPOINTS  0x4F  /* Both: exchange channel basepoint pubkeys */
 

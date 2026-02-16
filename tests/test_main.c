@@ -273,6 +273,14 @@ extern int test_basepoint_independence(void);
 extern int test_random_basepoints(void);
 extern int test_persist_basepoints(void);
 
+/* Client Watchtower (Bidirectional Revocation) */
+extern int test_client_watchtower_init(void);
+extern int test_bidirectional_revocation(void);
+extern int test_client_watch_revoked_commitment(void);
+extern int test_lsp_revoke_and_ack_wire(void);
+extern int test_factory_node_watch(void);
+extern int test_factory_and_commitment_entries(void);
+
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
     RUN_TEST(test_dw_layer_init);
@@ -500,6 +508,14 @@ static void run_unit_tests(void) {
     printf("\n=== Random Basepoints ===\n");
     RUN_TEST(test_random_basepoints);
     RUN_TEST(test_persist_basepoints);
+
+    printf("\n=== Client Watchtower ===\n");
+    RUN_TEST(test_client_watchtower_init);
+    RUN_TEST(test_bidirectional_revocation);
+    RUN_TEST(test_client_watch_revoked_commitment);
+    RUN_TEST(test_lsp_revoke_and_ack_wire);
+    RUN_TEST(test_factory_node_watch);
+    RUN_TEST(test_factory_and_commitment_entries);
 }
 
 static void run_regtest_tests(void) {

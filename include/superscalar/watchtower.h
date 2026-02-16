@@ -8,14 +8,26 @@
 
 #define WATCHTOWER_MAX_WATCH 64
 
+typedef enum {
+    WATCH_COMMITMENT,      /* Channel commitment breach — build penalty tx */
+    WATCH_FACTORY_NODE     /* Factory state breach — broadcast latest state tx */
+} watchtower_entry_type_t;
+
 typedef struct {
-    uint32_t channel_id;
-    uint64_t commit_num;
-    unsigned char txid[32];       /* commitment txid to watch for (internal byte order) */
+    watchtower_entry_type_t type;
+    uint32_t channel_id;          /* channel index (commitment) or node index (factory) */
+    uint64_t commit_num;          /* commitment number or DW epoch */
+    unsigned char txid[32];       /* txid to watch for (internal byte order) */
+
+    /* WATCH_COMMITMENT fields */
     uint32_t to_local_vout;
     uint64_t to_local_amount;
     unsigned char to_local_spk[34];
     size_t to_local_spk_len;
+
+    /* WATCH_FACTORY_NODE fields */
+    unsigned char *response_tx;   /* heap-allocated latest state tx to broadcast */
+    size_t response_tx_len;
 } watchtower_entry_t;
 
 #define WATCHTOWER_MAX_CHANNELS 8
@@ -49,7 +61,24 @@ int watchtower_watch(watchtower_t *wt, uint32_t channel_id,
    Returns number of penalties broadcast. */
 int watchtower_check(watchtower_t *wt);
 
+/* After receiving a revocation, register the old commitment with the watchtower.
+   Rebuilds the old commitment tx to get its txid and to_local output info. */
+void watchtower_watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
+                                           uint32_t channel_id,
+                                           uint64_t old_commit_num,
+                                           uint64_t old_local, uint64_t old_remote);
+
 /* Remove entries for a channel (e.g., after cooperative close). */
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id);
+
+/* Watch for an old factory state node. If detected, broadcast latest state tx.
+   response_tx is copied (caller can free theirs). */
+int watchtower_watch_factory_node(watchtower_t *wt, uint32_t node_idx,
+                                    const unsigned char *old_txid32,
+                                    const unsigned char *response_tx,
+                                    size_t response_tx_len);
+
+/* Free heap-allocated response_tx buffers in factory entries. */
+void watchtower_cleanup(watchtower_t *wt);
 
 #endif /* SUPERSCALAR_WATCHTOWER_H */

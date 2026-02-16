@@ -12,91 +12,37 @@
 
 extern void sha256(const unsigned char *, size_t, unsigned char *);
 
-/* After receiving a revocation, register the old commitment with the watchtower.
-   We rebuild the old commitment tx to get its txid and to_local output info. */
-static void watch_revoked_commitment(watchtower_t *wt, channel_t *ch,
-                                       uint32_t channel_id,
-                                       uint64_t old_commit_num,
-                                       uint64_t old_local, uint64_t old_remote) {
-    if (!wt)
+/* watch_revoked_commitment moved to watchtower.c as watchtower_watch_revoked_commitment() */
+
+/* Send the LSP's own revocation secret to a client after each commitment update.
+   This enables bidirectional revocation so clients can detect LSP breaches.
+   old_cn: the commitment number whose secret is being revealed. */
+static void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
+                                  size_t client_idx, uint64_t old_cn) {
+    if (!mgr || !lsp || client_idx >= mgr->n_channels) return;
+
+    channel_t *ch = &mgr->entries[client_idx].channel;
+
+    /* Get LSP's old per-commitment secret (local PCS) */
+    unsigned char lsp_rev_secret[32];
+    if (!channel_get_revocation_secret(ch, old_cn, lsp_rev_secret))
         return;
 
-    /* Save current state (including HTLC state — the old commitment may have
-     * had different active HTLCs than the current channel state) */
-    uint64_t saved_num = ch->commitment_number;
-    uint64_t saved_local = ch->local_amount;
-    uint64_t saved_remote = ch->remote_amount;
-    size_t saved_n_htlcs = ch->n_htlcs;
-    htlc_t saved_htlcs[MAX_HTLCS];
-    if (saved_n_htlcs > 0)
-        memcpy(saved_htlcs, ch->htlcs, saved_n_htlcs * sizeof(htlc_t));
-
-    /* Temporarily set to old state.
-     * We clear HTLCs because we don't track per-commitment HTLC state.
-     * Build the REMOTE commitment (what the client holds) since that's
-     * what would appear on-chain in a breach scenario.
-     * The old remote PCP can be derived from the just-received revocation secret
-     * (which is stored in received_revocations[old_commit_num]). */
-    ch->commitment_number = old_commit_num;
-    ch->local_amount = old_local;
-    ch->remote_amount = old_remote;
-    ch->n_htlcs = 0;
-
-    /* Ensure old remote PCP is available: derive from stored revocation secret */
-    {
-        unsigned char old_rev_secret[32];
-        if (channel_get_received_revocation(ch, old_commit_num, old_rev_secret)) {
-            secp256k1_pubkey old_pcp;
-            if (secp256k1_ec_pubkey_create(ch->ctx, &old_pcp, old_rev_secret)) {
-                channel_set_remote_pcp(ch, old_commit_num, &old_pcp);
-            }
-            memset(old_rev_secret, 0, 32);
-        }
-    }
-
-    tx_buf_t old_tx;
-    tx_buf_init(&old_tx, 512);
-    unsigned char old_txid[32];
-    int ok = channel_build_commitment_tx_for_remote(ch, &old_tx, old_txid);
-
-    /* Restore state */
-    ch->commitment_number = saved_num;
-    ch->local_amount = saved_local;
-    ch->remote_amount = saved_remote;
-    ch->n_htlcs = saved_n_htlcs;
-    if (saved_n_htlcs > 0)
-        memcpy(ch->htlcs, saved_htlcs, saved_n_htlcs * sizeof(htlc_t));
-
-    if (!ok) {
-        tx_buf_free(&old_tx);
+    /* Get LSP's next per-commitment point */
+    secp256k1_pubkey next_pcp;
+    if (!channel_get_per_commitment_point(ch, ch->commitment_number + 1, &next_pcp)) {
+        memset(lsp_rev_secret, 0, 32);
         return;
     }
 
-    /* to_local is vout 0, its SPK is the first output scriptPubKey */
-    /* Extract to_local_spk from the old commitment tx output 0 */
-    unsigned char to_local_spk[34];
-    /* In our commitment tx, output[0] = to_local with a P2TR SPK (34 bytes) */
-    /* Parse the first output's SPK from the unsigned raw tx (no segwit marker/flag) */
-    if (old_tx.len > 60) {
-        /* Unsigned tx layout (no segwit marker/flag):
-           4 version + 1 vincount +
-           (32 prevhash + 4 vout + 1 scriptlen + 0 script + 4 sequence) = 41 vin bytes
-           + 1 voutcount = 47 bytes offset to first output
-           First output: 8 amount + 1 scriptlen + N script */
-        size_t ofs = 4 + 1 + 41 + 1;  /* 47 */
-        if (ofs + 8 + 1 + 34 <= old_tx.len) {
-            uint8_t spk_len = old_tx.data[ofs + 8];
-            if (spk_len == 34) {
-                memcpy(to_local_spk, &old_tx.data[ofs + 9], 34);
-                /* Remote commitment's to_local = client's balance = old_remote */
-                watchtower_watch(wt, channel_id, old_commit_num,
-                                   old_txid, 0, old_remote,
-                                   to_local_spk, 34);
-            }
-        }
-    }
+    /* Build and send using same format as REVOKE_AND_ACK but with LSP type */
+    cJSON *j = wire_build_revoke_and_ack(
+        mgr->entries[client_idx].channel_id,
+        lsp_rev_secret, mgr->ctx, &next_pcp);
+    wire_send(lsp->client_fds[client_idx], MSG_LSP_REVOKE_AND_ACK, j);
+    cJSON_Delete(j);
 
-    tx_buf_free(&old_tx);
+    memset(lsp_rev_secret, 0, 32);
 }
 
 /*
@@ -416,13 +362,15 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
-            watch_revoked_commitment(mgr->watchtower, sender_ch,
+            watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)sender_idx, old_cn,
                 old_sender_local, old_sender_remote);
             /* Store next per-commitment point from peer */
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+            /* Bidirectional: send LSP's own revocation to sender */
+            lsp_send_revocation(mgr, lsp, sender_idx, old_cn);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -529,12 +477,14 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
-            watch_revoked_commitment(mgr->watchtower, dest_ch,
+            watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)dest_idx, old_cn,
                 old_dest_local, old_dest_remote);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+            /* Bidirectional: send LSP's own revocation to dest */
+            lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -599,12 +549,14 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = ch->commitment_number - 1;
             channel_receive_revocation(ch, old_cn, rev_secret);
-            watch_revoked_commitment(mgr->watchtower, ch,
+            watchtower_watch_revoked_commitment(mgr->watchtower, ch,
                 (uint32_t)client_idx, old_cn,
                 old_ch_local, old_ch_remote);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+            /* Bidirectional: send LSP's own revocation to this client */
+            lsp_send_revocation(mgr, lsp, client_idx, old_cn);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -681,12 +633,14 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
-                    watch_revoked_commitment(mgr->watchtower, sender_ch,
+                    watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)s, old_cn,
                         old_sender_local, old_sender_remote);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+                    /* Bidirectional: send LSP's own revocation to sender */
+                    lsp_send_revocation(mgr, lsp, s, old_cn);
                 }
             }
             if (ack_msg.json) cJSON_Delete(ack_msg.json);
@@ -913,12 +867,14 @@ int lsp_channels_handle_bridge_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                             rev_secret, next_point)) {
                 uint64_t old_cn = dest_ch->commitment_number - 1;
                 channel_receive_revocation(dest_ch, old_cn, rev_secret);
-                watch_revoked_commitment(mgr->watchtower, dest_ch,
+                watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                     (uint32_t)dest_idx, old_cn,
                     old_dest_local, old_dest_remote);
                 secp256k1_pubkey next_pcp;
                 if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                     channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+                /* Bidirectional: send LSP's own revocation to dest */
+                lsp_send_revocation(mgr, lsp, dest_idx, old_cn);
             }
             cJSON_Delete(ack_msg.json);
         }
@@ -1657,12 +1613,14 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = sender_ch->commitment_number - 1;
             channel_receive_revocation(sender_ch, old_cn, rev_secret);
-            watch_revoked_commitment(mgr->watchtower, sender_ch,
+            watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                 (uint32_t)from_client, old_cn,
                 old_sender_local, old_sender_remote);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+            /* Bidirectional: send LSP's own revocation to sender */
+            lsp_send_revocation(mgr, lsp, from_client, old_cn);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -1720,12 +1678,14 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
-            watch_revoked_commitment(mgr->watchtower, dest_ch,
+            watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                 (uint32_t)to_client, old_cn,
                 old_dest_local, old_dest_remote);
             secp256k1_pubkey next_pcp;
             if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                 channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+            /* Bidirectional: send LSP's own revocation to dest */
+            lsp_send_revocation(mgr, lsp, to_client, old_cn);
         }
         cJSON_Delete(ack_msg.json);
     }
@@ -1778,12 +1738,14 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = dest_ch->commitment_number - 1;
                     channel_receive_revocation(dest_ch, old_cn, rev_secret);
-                    watch_revoked_commitment(mgr->watchtower, dest_ch,
+                    watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
                         (uint32_t)to_client, old_cn,
                         old_dest_ful_local, old_dest_ful_remote);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(dest_ch, dest_ch->commitment_number + 1, &next_pcp);
+                    /* Bidirectional: send LSP's own revocation to dest */
+                    lsp_send_revocation(mgr, lsp, to_client, old_cn);
                 }
             }
             if (ack.json) cJSON_Delete(ack.json);
@@ -1822,12 +1784,14 @@ int lsp_channels_initiate_payment(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                                 rev_secret, next_point)) {
                     uint64_t old_cn = sender_ch->commitment_number - 1;
                     channel_receive_revocation(sender_ch, old_cn, rev_secret);
-                    watch_revoked_commitment(mgr->watchtower, sender_ch,
+                    watchtower_watch_revoked_commitment(mgr->watchtower, sender_ch,
                         (uint32_t)from_client, old_cn,
                         old_sender_ful_local, old_sender_ful_remote);
                     secp256k1_pubkey next_pcp;
                     if (secp256k1_ec_pubkey_parse(mgr->ctx, &next_pcp, next_point, 33))
                         channel_set_remote_pcp(sender_ch, sender_ch->commitment_number + 1, &next_pcp);
+                    /* Bidirectional: send LSP's own revocation to sender */
+                    lsp_send_revocation(mgr, lsp, from_client, old_cn);
                 }
             }
             if (ack.json) cJSON_Delete(ack.json);

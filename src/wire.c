@@ -94,6 +94,7 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4D: return "PTLC_ADAPTED_SIG";
     case 0x4E: return "PTLC_COMPLETE";
     case 0x4F: return "CHANNEL_BASEPOINTS";
+    case 0x50: return "LSP_REVOKE_AND_ACK";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }

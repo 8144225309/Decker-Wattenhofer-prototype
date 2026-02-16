@@ -6,6 +6,9 @@
 #include "superscalar/persist.h"
 #include "superscalar/keyfile.h"
 #include "superscalar/adaptor.h"
+#include "superscalar/regtest.h"
+#include "superscalar/watchtower.h"
+#include "superscalar/fee.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -207,7 +210,46 @@ typedef struct {
     int saved_initial;  /* 1 after first save of factory+channel */
     client_invoice_t invoices[MAX_CLIENT_INVOICES];
     size_t n_invoices;
+    watchtower_t *wt;
+    fee_estimator_t *fee;
+    regtest_t *rt;
 } daemon_cb_data_t;
+
+/* Receive and process LSP's own revocation (bidirectional revocation).
+   Call after each client_handle_commitment_signed in daemon mode. */
+static void client_recv_lsp_revocation(int fd, channel_t *ch, daemon_cb_data_t *cbd,
+                                         secp256k1_context *ctx) {
+    wire_msg_t rev_msg;
+    if (!wire_recv(fd, &rev_msg))
+        return;
+    if (rev_msg.msg_type != MSG_LSP_REVOKE_AND_ACK) {
+        /* Not a revocation — might be an error or unexpected msg; silently skip */
+        cJSON_Delete(rev_msg.json);
+        return;
+    }
+    uint32_t rev_chan_id;
+    unsigned char lsp_rev_secret[32], lsp_next_point[33];
+    if (wire_parse_revoke_and_ack(rev_msg.json, &rev_chan_id,
+                                    lsp_rev_secret, lsp_next_point)) {
+        uint64_t old_cn = ch->commitment_number - 1;
+        channel_receive_revocation(ch, old_cn, lsp_rev_secret);
+
+        /* Register with client watchtower */
+        if (cbd && cbd->wt) {
+            watchtower_watch_revoked_commitment(cbd->wt, ch,
+                rev_chan_id, old_cn,
+                ch->local_amount, ch->remote_amount);
+        }
+
+        /* Store LSP's next per-commitment point */
+        secp256k1_pubkey next_pcp;
+        if (secp256k1_ec_pubkey_parse(ctx, &next_pcp, lsp_next_point, 33))
+            channel_set_remote_pcp(ch, ch->commitment_number + 1, &next_pcp);
+
+        memset(lsp_rev_secret, 0, 32);
+    }
+    cJSON_Delete(rev_msg.json);
+}
 
 /* Daemon mode callback: select() loop handling incoming HTLCs and close */
 static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
@@ -228,6 +270,26 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         printf("Client %u: persisted factory + channel + basepoints to DB\n", my_index);
     }
 
+    /* Wire channel into client watchtower */
+    if (cbd && cbd->wt) {
+        watchtower_set_channel(cbd->wt, 0, ch);
+
+        /* Register factory STATE nodes with watchtower (first entry only).
+           After a factory_advance(), old state txids should be re-registered
+           with the new (latest) signed txs as responses. For now, we register
+           current state nodes so the infrastructure is wired. */
+        if (!cbd->saved_initial && factory) {
+            for (size_t ni = 0; ni < factory->n_nodes; ni++) {
+                factory_node_t *fn = &factory->nodes[ni];
+                if (fn->type == NODE_STATE && fn->is_signed &&
+                    fn->signed_tx.len > 0) {
+                    /* No old txid to watch yet (first epoch) — store current
+                       state for future advance-based watches. */
+                }
+            }
+        }
+    }
+
     secp256k1_pubkey my_pubkey;
     secp256k1_keypair_pub(ctx, &my_pubkey, keypair);
 
@@ -246,7 +308,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         struct timeval tv = { .tv_sec = 2, .tv_usec = 0 };
         int ret = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (ret < 0) continue;  /* EINTR */
-        if (ret == 0) continue;  /* timeout */
+        if (ret == 0) {
+            /* Periodic watchtower check on timeout */
+            if (cbd && cbd->wt)
+                watchtower_check(cbd->wt);
+            continue;
+        }
 
         wire_msg_t msg;
         if (!wire_recv(fd, &msg)) {
@@ -267,6 +334,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             if (msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
                 cJSON_Delete(msg.json);
+                /* Receive LSP's own revocation (bidirectional) */
+                client_recv_lsp_revocation(fd, ch, cbd, ctx);
             } else {
                 cJSON_Delete(msg.json);
             }
@@ -320,8 +389,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
                     /* Handle COMMITMENT_SIGNED for the fulfill */
                     if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
                         client_handle_commitment_signed(fd, ch, ctx, &msg);
+                        if (msg.json) cJSON_Delete(msg.json);
+                        /* Receive LSP's own revocation (bidirectional) */
+                        client_recv_lsp_revocation(fd, ch, cbd, ctx);
+                    } else {
+                        if (msg.json) cJSON_Delete(msg.json);
                     }
-                    if (msg.json) cJSON_Delete(msg.json);
 
                     /* Persist balance after fulfill */
                     if (cbd && cbd->db) {
@@ -335,6 +408,8 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
         case MSG_COMMITMENT_SIGNED:
             client_handle_commitment_signed(fd, ch, ctx, &msg);
             cJSON_Delete(msg.json);
+            /* Receive LSP's own revocation (bidirectional) */
+            client_recv_lsp_revocation(fd, ch, cbd, ctx);
             /* Persist balance after commitment update */
             if (cbd && cbd->db) {
                 persist_update_channel_balance(cbd->db, my_index - 1,
@@ -357,8 +432,12 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             /* Handle follow-up COMMITMENT_SIGNED */
             if (wire_recv(fd, &msg) && msg.msg_type == MSG_COMMITMENT_SIGNED) {
                 client_handle_commitment_signed(fd, ch, ctx, &msg);
+                if (msg.json) cJSON_Delete(msg.json);
+                /* Receive LSP's own revocation (bidirectional) */
+                client_recv_lsp_revocation(fd, ch, cbd, ctx);
+            } else {
+                if (msg.json) cJSON_Delete(msg.json);
             }
-            if (msg.json) cJSON_Delete(msg.json);
             /* Persist balance after fulfill */
             if (cbd && cbd->db) {
                 persist_update_channel_balance(cbd->db, my_index - 1,
@@ -552,6 +631,11 @@ int main(int argc, char *argv[]) {
     const char *db_path = NULL;
     const char *keyfile_path = NULL;
     const char *passphrase = "";
+    const char *network = "regtest";
+    const char *cli_path = "bitcoin-cli";
+    const char *rpcuser = "rpcuser";
+    const char *rpcpassword = "rpcpass";
+    int fee_rate = 1000;
 
     scripted_action_t actions[MAX_ACTIONS];
     size_t n_actions = 0;
@@ -570,19 +654,19 @@ int main(int argc, char *argv[]) {
         else if (strcmp(argv[i], "--report") == 0 && i + 1 < argc)
             report_path = argv[++i];
         else if (strcmp(argv[i], "--fee-rate") == 0 && i + 1 < argc)
-            ++i; /* parsed but not used by client (fee rate is LSP-managed) */
+            fee_rate = atoi(argv[++i]);
         else if (strcmp(argv[i], "--db") == 0 && i + 1 < argc)
             db_path = argv[++i];
         else if (strcmp(argv[i], "--network") == 0 && i + 1 < argc)
-            ++i; /* parsed but not used by client (network is LSP-managed) */
+            network = argv[++i];
         else if (strcmp(argv[i], "--regtest") == 0)
-            ; /* accepted for backward compat */
+            network = "regtest";
         else if (strcmp(argv[i], "--cli-path") == 0 && i + 1 < argc)
-            ++i; /* parsed but not used by client (LSP manages chain) */
+            cli_path = argv[++i];
         else if (strcmp(argv[i], "--rpcuser") == 0 && i + 1 < argc)
-            ++i; /* parsed but not used by client (LSP manages chain) */
+            rpcuser = argv[++i];
         else if (strcmp(argv[i], "--rpcpassword") == 0 && i + 1 < argc)
-            ++i; /* parsed but not used by client (LSP manages chain) */
+            rpcpassword = argv[++i];
         else if (strcmp(argv[i], "--keyfile") == 0 && i + 1 < argc)
             keyfile_path = argv[++i];
         else if (strcmp(argv[i], "--passphrase") == 0 && i + 1 < argc)
@@ -739,9 +823,26 @@ int main(int argc, char *argv[]) {
     signal(SIGINT, sigint_handler);
     signal(SIGTERM, sigint_handler);
 
+    /* Initialize regtest + watchtower for client-side breach detection */
+    regtest_t rt;
+    int rt_ok = regtest_init_full(&rt, network, cli_path, rpcuser, rpcpassword);
+    if (!rt_ok)
+        fprintf(stderr, "Client: regtest init failed (watchtower disabled)\n");
+
+    static watchtower_t client_wt;
+    fee_estimator_t client_fee;
+    fee_init(&client_fee, fee_rate);
+    watchtower_init(&client_wt, 1, rt_ok ? &rt : NULL, &client_fee,
+                      use_db ? &db : NULL);
+
     int ok;
     if (daemon_mode) {
-        daemon_cb_data_t cbd = { use_db ? &db : NULL, 0 };
+        daemon_cb_data_t cbd;
+        memset(&cbd, 0, sizeof(cbd));
+        cbd.db = use_db ? &db : NULL;
+        cbd.wt = &client_wt;
+        cbd.fee = &client_fee;
+        cbd.rt = rt_ok ? &rt : NULL;
 
         /* Load persisted client invoices (Phase 23) */
         if (use_db) {
