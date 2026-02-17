@@ -853,3 +853,250 @@ int test_regtest_wire_factory(void) {
     TEST_ASSERT(all_children_ok, "all clients");
     return 1;
 }
+
+/* Arity-1 regtest test: factory creation with 14-node tree + cooperative close */
+int test_regtest_wire_factory_arity1(void) {
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: regtest not available\n");
+        return 1;
+    }
+    if (!regtest_create_wallet(&rt, "test_wire_arity1")) {
+        char *lr = regtest_exec(&rt, "loadwallet", "\"test_wire_arity1\"");
+        if (lr) free(lr);
+        strncpy(rt.wallet, "test_wire_arity1", sizeof(rt.wallet) - 1);
+    }
+
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    /* Compute funding SPK (5-of-5 MuSig2 taproot) */
+    secp256k1_pubkey pks[5];
+    for (int i = 0; i < 5; i++)
+        secp256k1_keypair_pub(ctx, &pks[i], &kps[i]);
+
+    musig_keyagg_t ka;
+    musig_aggregate_keys(ctx, &ka, pks, 5);
+
+    unsigned char internal_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, internal_ser, &ka.agg_pubkey);
+    unsigned char tweak_val[32];
+    sha256_tagged("TapTweak", internal_ser, 32, tweak_val);
+    musig_keyagg_t ka_copy = ka;
+    secp256k1_pubkey tweaked_pk;
+    secp256k1_musig_pubkey_xonly_tweak_add(ctx, &tweaked_pk, &ka_copy.cache, tweak_val);
+    secp256k1_xonly_pubkey tweaked_xonly;
+    secp256k1_xonly_pubkey_from_pubkey(ctx, &tweaked_xonly, NULL, &tweaked_pk);
+    unsigned char fund_spk[34];
+    build_p2tr_script_pubkey(fund_spk, &tweaked_xonly);
+
+    /* Derive bech32m address */
+    unsigned char tweaked_ser[32];
+    secp256k1_xonly_pubkey_serialize(ctx, tweaked_ser, &tweaked_xonly);
+    char tweaked_hex[65];
+    hex_encode(tweaked_ser, 32, tweaked_hex);
+
+    char params[512];
+    snprintf(params, sizeof(params), "\"rawtr(%s)\"", tweaked_hex);
+    char *desc_result = regtest_exec(&rt, "getdescriptorinfo", params);
+    TEST_ASSERT(desc_result != NULL, "getdescriptorinfo");
+
+    char checksummed_desc[256];
+    char *dstart = strstr(desc_result, "\"descriptor\"");
+    TEST_ASSERT(dstart != NULL, "parse descriptor field");
+    dstart = strchr(dstart + 12, '"'); dstart++;
+    char *dend = strchr(dstart, '"');
+    size_t dlen = (size_t)(dend - dstart);
+    memcpy(checksummed_desc, dstart, dlen);
+    checksummed_desc[dlen] = '\0';
+    free(desc_result);
+
+    snprintf(params, sizeof(params), "\"%s\"", checksummed_desc);
+    char *addr_result = regtest_exec(&rt, "deriveaddresses", params);
+    TEST_ASSERT(addr_result != NULL, "deriveaddresses");
+
+    char fund_addr[128] = {0};
+    char *astart = strchr(addr_result, '"'); astart++;
+    char *aend = strchr(astart, '"');
+    size_t alen = (size_t)(aend - astart);
+    memcpy(fund_addr, astart, alen);
+    fund_addr[alen] = '\0';
+    free(addr_result);
+
+    /* Fund */
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mine address");
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    char *bal_s = regtest_exec(&rt, "getbalance", "");
+    double wallet_bal = bal_s ? atof(bal_s) : 0;
+    if (bal_s) free(bal_s);
+
+    if (wallet_bal < 0.01) {
+        static const char *faucet_wallets[] = {
+            "test_dw", "test_factory", "test_wire_factory", NULL
+        };
+        int funded = 0;
+        for (int w = 0; faucet_wallets[w] && !funded; w++) {
+            regtest_t faucet;
+            memcpy(&faucet, &rt, sizeof(faucet));
+            faucet.wallet[0] = '\0';
+            char wparams[128];
+            snprintf(wparams, sizeof(wparams), "\"%s\"", faucet_wallets[w]);
+            char *lr = regtest_exec(&faucet, "loadwallet", wparams);
+            if (lr) free(lr);
+            strncpy(faucet.wallet, faucet_wallets[w],
+                    sizeof(faucet.wallet) - 1);
+            char sp[256];
+            snprintf(sp, sizeof(sp), "\"%s\" 0.01", mine_addr);
+            char *sr = regtest_exec(&faucet, "sendtoaddress", sp);
+            if (sr && !strstr(sr, "error")) {
+                free(sr);
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                funded = 1;
+            } else {
+                if (sr) free(sr);
+            }
+        }
+        if (!funded) {
+            printf("  SKIP: no funded wallet available\n");
+            secp256k1_context_destroy(ctx);
+            return 1;
+        }
+    }
+
+    char funding_txid_hex[65];
+    TEST_ASSERT(regtest_fund_address(&rt, fund_addr, 0.001, funding_txid_hex),
+                "fund factory");
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    unsigned char funding_txid[32];
+    hex_decode(funding_txid_hex, funding_txid, 32);
+    reverse_bytes(funding_txid, 32);
+
+    uint64_t funding_amount = 0;
+    unsigned char actual_spk[256];
+    size_t actual_spk_len = 0;
+    uint32_t funding_vout = 0;
+    for (uint32_t v = 0; v < 2; v++) {
+        regtest_get_tx_output(&rt, funding_txid_hex, v,
+                              &funding_amount, actual_spk, &actual_spk_len);
+        if (actual_spk_len == 34 && memcmp(actual_spk, fund_spk, 34) == 0) {
+            funding_vout = v;
+            break;
+        }
+    }
+    TEST_ASSERT(funding_amount > 0, "funding amount > 0");
+
+    /* Use different port than arity-2 test */
+    int port = 19935 + (getpid() % 1000);
+
+    /* Fork 4 client processes */
+    pid_t child_pids[4];
+    for (int c = 0; c < 4; c++) {
+        pid_t pid = fork();
+        if (pid == 0) {
+            usleep(100000 * (c + 1));
+            secp256k1_context *child_ctx = test_ctx();
+            secp256k1_keypair child_kp;
+            secp256k1_keypair_create(child_ctx, &child_kp, seckeys[c + 1]);
+
+            int ok = client_run_ceremony(child_ctx, &child_kp, "127.0.0.1", port);
+            secp256k1_context_destroy(child_ctx);
+            _exit(ok ? 0 : 1);
+        }
+        child_pids[c] = pid;
+    }
+
+    /* Parent: LSP with arity-1 */
+    lsp_t lsp;
+    lsp_init(&lsp, ctx, &kps[0], port, 4);
+
+    int lsp_ok = 1;
+    if (!lsp_accept_clients(&lsp)) {
+        fprintf(stderr, "LSP: accept clients failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Set arity-1 BEFORE factory creation */
+    lsp.factory.leaf_arity = FACTORY_ARITY_1;
+
+    if (lsp_ok && !lsp_run_factory_creation(&lsp,
+                                             funding_txid, funding_vout,
+                                             funding_amount,
+                                             fund_spk, 34,
+                                             10, 4, 200)) {
+        fprintf(stderr, "LSP: factory creation (arity-1) failed\n");
+        lsp_ok = 0;
+    }
+
+    /* Verify arity-1 tree: 14 nodes, 4 leaf nodes */
+    if (lsp_ok) {
+        TEST_ASSERT(lsp.factory.n_nodes == 14, "14 nodes");
+        TEST_ASSERT(lsp.factory.n_leaf_nodes == 4, "4 leaf nodes");
+        TEST_ASSERT(lsp.factory.leaf_arity == FACTORY_ARITY_1, "arity-1");
+        TEST_ASSERT(lsp.factory.counter.n_layers == 3, "3 DW layers");
+        printf("  Arity-1 factory: %zu nodes, %d leaf nodes, %u DW layers\n",
+               lsp.factory.n_nodes, lsp.factory.n_leaf_nodes,
+               lsp.factory.counter.n_layers);
+    }
+
+    /* Cooperative close (same as arity-2 — 5-of-5 on funding output) */
+    if (lsp_ok) {
+        uint64_t close_total = funding_amount - 500;
+        uint64_t per_party = close_total / 5;
+
+        tx_output_t close_outputs[5];
+        for (int i = 0; i < 5; i++) {
+            close_outputs[i].amount_sats = per_party;
+            memcpy(close_outputs[i].script_pubkey, fund_spk, 34);
+            close_outputs[i].script_pubkey_len = 34;
+        }
+        close_outputs[4].amount_sats = close_total - per_party * 4;
+
+        tx_buf_t close_tx;
+        tx_buf_init(&close_tx, 512);
+
+        if (!lsp_run_cooperative_close(&lsp, &close_tx, close_outputs, 5)) {
+            fprintf(stderr, "LSP: cooperative close (arity-1) failed\n");
+            lsp_ok = 0;
+        } else {
+            char close_hex[close_tx.len * 2 + 1];
+            hex_encode(close_tx.data, close_tx.len, close_hex);
+            char close_txid[65];
+            if (regtest_send_raw_tx(&rt, close_hex, close_txid)) {
+                regtest_mine_blocks(&rt, 1, mine_addr);
+                int conf = regtest_get_confirmations(&rt, close_txid);
+                if (conf < 1) {
+                    fprintf(stderr, "LSP: close tx not confirmed\n");
+                    lsp_ok = 0;
+                }
+            } else {
+                fprintf(stderr, "LSP: broadcast close tx failed\n");
+                lsp_ok = 0;
+            }
+        }
+        tx_buf_free(&close_tx);
+    }
+
+    lsp_cleanup(&lsp);
+
+    int all_children_ok = 1;
+    for (int c = 0; c < 4; c++) {
+        int status;
+        waitpid(child_pids[c], &status, 0);
+        if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+            fprintf(stderr, "Client %d (arity-1) exited with status %d\n", c + 1,
+                    WIFEXITED(status) ? WEXITSTATUS(status) : -1);
+            all_children_ok = 0;
+        }
+    }
+
+    secp256k1_context_destroy(ctx);
+
+    TEST_ASSERT(lsp_ok, "LSP arity-1 ceremony");
+    TEST_ASSERT(all_children_ok, "all arity-1 clients");
+    return 1;
+}

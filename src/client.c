@@ -43,16 +43,22 @@ static int client_init_channel(channel_t *ch, secp256k1_context *ctx,
                                  const unsigned char *local_delay_sec32,
                                  const unsigned char *local_revoc_sec32,
                                  const unsigned char *local_htlc_sec32) {
-    /* Map client index to leaf output */
+    /* Map client index to leaf output (arity-aware) */
     size_t client_idx = (size_t)(my_index - 1);  /* my_index is 1-based */
     size_t node_idx;
     uint32_t vout;
-    if (client_idx < 2) {
-        node_idx = 4;
-        vout = (uint32_t)client_idx;
+    if (factory->leaf_arity == FACTORY_ARITY_1) {
+        if (client_idx >= (size_t)factory->n_leaf_nodes) return 0;
+        node_idx = factory->leaf_node_indices[client_idx];
+        vout = 0;
     } else {
-        node_idx = 5;
-        vout = (uint32_t)(client_idx - 2);
+        if (client_idx < 2) {
+            node_idx = factory->leaf_node_indices[0];
+            vout = (uint32_t)client_idx;
+        } else {
+            node_idx = factory->leaf_node_indices[1];
+            vout = (uint32_t)(client_idx - 2);
+        }
     }
 
     const factory_node_t *state_node = &factory->nodes[node_idx];
@@ -230,12 +236,24 @@ int client_do_close_ceremony(int fd, secp256k1_context *ctx,
         msg = *initial_msg;
         got_propose = 1;
     } else {
-        /* Receive CLOSE_PROPOSE */
-        if (!wire_recv(fd, &msg) || check_msg_error(&msg) ||
-            msg.msg_type != MSG_CLOSE_PROPOSE) {
-            fprintf(stderr, "Client: expected CLOSE_PROPOSE\n");
-            if (msg.json) cJSON_Delete(msg.json);
-            return 0;
+        /* Receive CLOSE_PROPOSE, skipping any LSP revocation messages */
+        for (;;) {
+            if (!wire_recv(fd, &msg) || check_msg_error(&msg)) {
+                fprintf(stderr, "Client: expected CLOSE_PROPOSE\n");
+                if (msg.json) cJSON_Delete(msg.json);
+                return 0;
+            }
+            if (msg.msg_type == 0x50) {  /* MSG_LSP_REVOKE_AND_ACK */
+                cJSON_Delete(msg.json);
+                continue;
+            }
+            if (msg.msg_type != MSG_CLOSE_PROPOSE) {
+                fprintf(stderr, "Client: expected CLOSE_PROPOSE, got 0x%02x\n",
+                        msg.msg_type);
+                cJSON_Delete(msg.json);
+                return 0;
+            }
+            break;
         }
         got_propose = 1;
     }
@@ -428,12 +446,16 @@ int client_do_factory_rotation(int fd, secp256k1_context *ctx,
     uint32_t states_per_layer = (uint32_t)sp->valuedouble;
     uint32_t cltv_timeout = (uint32_t)ct->valuedouble;
     uint64_t fee_per_tx = (uint64_t)fp->valuedouble;
+    cJSON *arity_item = cJSON_GetObjectItem(pj, "leaf_arity");
+    int rot_leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
 
     /* Build factory locally */
     factory_init_from_pubkeys(factory_out, ctx, all_pubkeys, n_participants,
                               step_blocks, states_per_layer);
     factory_out->cltv_timeout = cltv_timeout;
     factory_out->fee_per_tx = fee_per_tx;
+    if (rot_leaf_arity == 1)
+        factory_set_arity(factory_out, FACTORY_ARITY_1);
     factory_set_funding(factory_out, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 
@@ -798,6 +820,8 @@ int client_run_with_channels(secp256k1_context *ctx,
     uint32_t states_per_layer = (uint32_t)cJSON_GetObjectItem(msg.json, "states_per_layer")->valuedouble;
     uint32_t cltv_timeout = (uint32_t)cJSON_GetObjectItem(msg.json, "cltv_timeout")->valuedouble;
     uint64_t fee_per_tx = (uint64_t)cJSON_GetObjectItem(msg.json, "fee_per_tx")->valuedouble;
+    cJSON *arity_item = cJSON_GetObjectItem(msg.json, "leaf_arity");
+    int leaf_arity = (arity_item && cJSON_IsNumber(arity_item)) ? (int)arity_item->valuedouble : 2;
     cJSON_Delete(msg.json);
 
     /* Build factory locally */
@@ -806,6 +830,8 @@ int client_run_with_channels(secp256k1_context *ctx,
                               step_blocks, states_per_layer);
     factory.cltv_timeout = cltv_timeout;
     factory.fee_per_tx = fee_per_tx;
+    if (leaf_arity == 1)
+        factory_set_arity(&factory, FACTORY_ARITY_1);
     factory_set_funding(&factory, funding_txid, funding_vout, funding_amount,
                         funding_spk, spk_len);
 

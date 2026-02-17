@@ -1,4 +1,5 @@
 #include "superscalar/factory.h"
+#include "superscalar/musig.h"
 #include "superscalar/shachain.h"
 #include "superscalar/regtest.h"
 #include "cJSON.h"
@@ -2201,6 +2202,455 @@ int test_factory_epoch_reset_after_leaf_mode(void) {
     /* Verify all nodes signed */
     for (size_t i = 0; i < f.n_nodes; i++)
         TEST_ASSERT(f.nodes[i].is_signed, "node signed after reset");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Arity-1 tests ---- */
+
+/* Helper: create an arity-1 factory with funding */
+static int setup_arity1_factory(factory_t *f, secp256k1_context *ctx,
+                                  secp256k1_keypair *kps) {
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    if (!compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked))
+        return 0;
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_init(f, ctx, kps, 5, 2, 4);  /* step=2, states=4 */
+    factory_set_arity(f, FACTORY_ARITY_1);
+    factory_set_funding(f, fake_txid, 0, 1000000, fund_spk, 34);
+    return 1;
+}
+
+int test_factory_build_tree_arity1(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree arity-1");
+    TEST_ASSERT_EQ(f.n_nodes, 14, "14 nodes");
+
+    /* Check node types: kickoff/state alternating at each level */
+    TEST_ASSERT(f.nodes[0].type == NODE_KICKOFF, "n0 kickoff");
+    TEST_ASSERT(f.nodes[1].type == NODE_STATE,   "n1 state");
+    TEST_ASSERT(f.nodes[2].type == NODE_KICKOFF, "n2 kickoff");
+    TEST_ASSERT(f.nodes[3].type == NODE_KICKOFF, "n3 kickoff");
+    TEST_ASSERT(f.nodes[4].type == NODE_STATE,   "n4 state");
+    TEST_ASSERT(f.nodes[5].type == NODE_STATE,   "n5 state");
+    for (int i = 6; i <= 9; i++)
+        TEST_ASSERT(f.nodes[i].type == NODE_KICKOFF, "level-2 kickoff");
+    for (int i = 10; i <= 13; i++)
+        TEST_ASSERT(f.nodes[i].type == NODE_STATE, "level-2 state");
+
+    /* Check signer counts */
+    TEST_ASSERT_EQ(f.nodes[0].n_signers, 5, "root: 5 signers");
+    TEST_ASSERT_EQ(f.nodes[1].n_signers, 5, "state_root: 5 signers");
+    TEST_ASSERT_EQ(f.nodes[4].n_signers, 3, "state_left: 3 signers");
+    TEST_ASSERT_EQ(f.nodes[5].n_signers, 3, "state_right: 3 signers");
+    for (int i = 6; i <= 9; i++)
+        TEST_ASSERT_EQ(f.nodes[i].n_signers, 2, "level-2 kickoff: 2 signers");
+    for (int i = 10; i <= 13; i++)
+        TEST_ASSERT_EQ(f.nodes[i].n_signers, 2, "level-2 state: 2 signers");
+
+    /* Check parent links for level-2 */
+    TEST_ASSERT_EQ(f.nodes[6].parent_index, 4, "kickoff_A -> state_left");
+    TEST_ASSERT_EQ(f.nodes[7].parent_index, 4, "kickoff_B -> state_left");
+    TEST_ASSERT_EQ(f.nodes[8].parent_index, 5, "kickoff_C -> state_right");
+    TEST_ASSERT_EQ(f.nodes[9].parent_index, 5, "kickoff_D -> state_right");
+    TEST_ASSERT_EQ(f.nodes[10].parent_index, 6, "state_A -> kickoff_A");
+    TEST_ASSERT_EQ(f.nodes[11].parent_index, 7, "state_B -> kickoff_B");
+    TEST_ASSERT_EQ(f.nodes[12].parent_index, 8, "state_C -> kickoff_C");
+    TEST_ASSERT_EQ(f.nodes[13].parent_index, 9, "state_D -> kickoff_D");
+
+    /* Leaf node indices */
+    TEST_ASSERT_EQ(f.leaf_node_indices[0], 10, "leaf_idx 0 = node 10");
+    TEST_ASSERT_EQ(f.leaf_node_indices[1], 11, "leaf_idx 1 = node 11");
+    TEST_ASSERT_EQ(f.leaf_node_indices[2], 12, "leaf_idx 2 = node 12");
+    TEST_ASSERT_EQ(f.leaf_node_indices[3], 13, "leaf_idx 3 = node 13");
+
+    /* All txids non-zero */
+    unsigned char zero[32];
+    memset(zero, 0, 32);
+    for (size_t i = 0; i < 14; i++)
+        TEST_ASSERT(memcmp(f.nodes[i].txid, zero, 32) != 0, "txid non-zero");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_leaf_outputs(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Each leaf state node (10-13) should have 2 outputs: channel + L-stock */
+    for (int i = 10; i <= 13; i++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "node %d has 2 outputs", i);
+        TEST_ASSERT_EQ(f.nodes[i].n_outputs, 2, msg);
+        /* Both outputs should have 34-byte SPK */
+        TEST_ASSERT_EQ(f.nodes[i].outputs[0].script_pubkey_len, 34, "chan spk len");
+        TEST_ASSERT_EQ(f.nodes[i].outputs[1].script_pubkey_len, 34, "lstock spk len");
+        /* Amounts should be non-zero */
+        snprintf(msg, sizeof(msg), "node %d chan amount > 0", i);
+        TEST_ASSERT(f.nodes[i].outputs[0].amount_sats > 0, msg);
+        snprintf(msg, sizeof(msg), "node %d lstock amount > 0", i);
+        TEST_ASSERT(f.nodes[i].outputs[1].amount_sats > 0, msg);
+    }
+
+    /* Mid-level state nodes (4,5) should have 2 child outputs, not 3 leaf outputs */
+    TEST_ASSERT_EQ(f.nodes[4].n_outputs, 2, "state_left: 2 child outputs");
+    TEST_ASSERT_EQ(f.nodes[5].n_outputs, 2, "state_right: 2 child outputs");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_sign_all(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all 14 nodes");
+
+    for (size_t i = 0; i < 14; i++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "node %zu is signed", i);
+        TEST_ASSERT(f.nodes[i].is_signed, msg);
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_advance(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* 3 DW layers, states=4: 4^3 = 64 total epochs */
+    TEST_ASSERT_EQ(f.counter.n_layers, 3, "3 DW layers");
+
+    /* Advance once and check nSequences change */
+    uint32_t old_leaf_nseq = f.nodes[10].nsequence;
+    TEST_ASSERT(factory_advance(&f), "advance epoch 1");
+    TEST_ASSERT(f.nodes[10].nsequence != old_leaf_nseq, "leaf nseq changed");
+
+    /* All nodes should still be signed */
+    for (size_t i = 0; i < 14; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "signed after advance");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_advance_leaf(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Per-leaf advance for all 4 leaves (sides 0-3) */
+    for (int side = 0; side < 4; side++) {
+        char msg[64];
+        snprintf(msg, sizeof(msg), "advance leaf %d", side);
+        TEST_ASSERT(factory_advance_leaf(&f, side), msg);
+    }
+
+    /* All leaf nodes should be signed */
+    for (int i = 10; i <= 13; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "leaf signed after advance");
+
+    TEST_ASSERT(f.per_leaf_enabled, "per-leaf enabled");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_leaf_independence(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Advance leaf 0 (client A) twice, leave others at initial state */
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance leaf 0 first");
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance leaf 0 second");
+
+    /* Leaf 0 should have advanced */
+    TEST_ASSERT_EQ(f.leaf_layers[0].current_state, 2, "leaf 0 at state 2");
+    /* Other leaves should still be at initial state */
+    TEST_ASSERT_EQ(f.leaf_layers[1].current_state, 0, "leaf 1 at state 0");
+    TEST_ASSERT_EQ(f.leaf_layers[2].current_state, 0, "leaf 2 at state 0");
+    TEST_ASSERT_EQ(f.leaf_layers[3].current_state, 0, "leaf 3 at state 0");
+
+    /* Advance leaf 2 (client C) once */
+    TEST_ASSERT(factory_advance_leaf(&f, 2), "advance leaf 2");
+    TEST_ASSERT_EQ(f.leaf_layers[2].current_state, 1, "leaf 2 at state 1");
+    /* Leaf 0 unchanged */
+    TEST_ASSERT_EQ(f.leaf_layers[0].current_state, 2, "leaf 0 still at 2");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_coop_close(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Build cooperative close (5-of-5 on funding output, same as arity-2) */
+    tx_output_t close_outs[5];
+    uint64_t per_participant = (f.funding_amount_sats - 500) / 5;
+    for (int i = 0; i < 5; i++) {
+        secp256k1_xonly_pubkey xonly;
+        secp256k1_xonly_pubkey_from_pubkey(ctx, &xonly, NULL, &f.pubkeys[i]);
+        build_p2tr_script_pubkey(close_outs[i].script_pubkey, &xonly);
+        close_outs[i].script_pubkey_len = 34;
+        close_outs[i].amount_sats = per_participant;
+    }
+
+    tx_buf_t close_tx;
+    tx_buf_init(&close_tx, 512);
+    TEST_ASSERT(factory_build_cooperative_close(&f, &close_tx, NULL,
+                                                 close_outs, 5),
+                "cooperative close");
+    TEST_ASSERT(close_tx.len > 0, "close tx non-empty");
+
+    tx_buf_free(&close_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_client_to_leaf(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Arity-1 mapping: client_idx -> node 10+client_idx, vout 0 */
+    for (int c = 0; c < 4; c++) {
+        size_t expected_node = 10 + (size_t)c;
+        TEST_ASSERT_EQ(f.leaf_node_indices[c], expected_node, "leaf index mapping");
+
+        /* Each leaf node should have the channel at vout 0 */
+        const factory_node_t *node = &f.nodes[expected_node];
+        TEST_ASSERT_EQ(node->n_outputs, 2, "2 outputs");
+        TEST_ASSERT(node->outputs[0].amount_sats > 0, "channel amount > 0");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* ---- Arity-1 Hardening Tests ---- */
+
+int test_factory_arity1_cltv_strict_ordering(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    f.cltv_timeout = 200;  /* Enough room for 5 tiers of TIMEOUT_STEP_BLOCKS=5 */
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Verify 5-tier strict CLTV ordering:
+       sr (root_cltv=200) > kl/kri (195) > sl/sri (190) > ka-kd (185) > sa-sd (180)
+       Every child CLTV must be strictly less than its parent. */
+
+    /* Node indices: kr=0, sr=1, kl=2, kri=3, sl=4, sri=5,
+       ka=6, kb=7, kc=8, kd=9, sa=10, sb=11, sc=12, sd=13 */
+    uint32_t sr_cltv  = f.nodes[1].cltv_timeout;   /* root state */
+    uint32_t kl_cltv  = f.nodes[2].cltv_timeout;   /* mid kickoff left */
+    uint32_t kri_cltv = f.nodes[3].cltv_timeout;   /* mid kickoff right */
+    uint32_t sl_cltv  = f.nodes[4].cltv_timeout;   /* mid state left */
+    uint32_t sri_cltv = f.nodes[5].cltv_timeout;   /* mid state right */
+
+    /* Tier 1 > Tier 2: root state > mid kickoffs */
+    TEST_ASSERT(sr_cltv > kl_cltv, "sr > kl cltv");
+    TEST_ASSERT(sr_cltv > kri_cltv, "sr > kri cltv");
+    /* Tier 2 > Tier 3: mid kickoffs > mid states */
+    TEST_ASSERT(kl_cltv > sl_cltv, "kl > sl cltv");
+    TEST_ASSERT(kri_cltv > sri_cltv, "kri > sri cltv");
+
+    /* Tier 3 > Tier 4 > Tier 5: for each per-client subtree */
+    for (int i = 0; i < 4; i++) {
+        int ko_idx = 6 + i;   /* ka=6, kb=7, kc=8, kd=9 */
+        int st_idx = 10 + i;  /* sa=10, sb=11, sc=12, sd=13 */
+        uint32_t parent_st_cltv = (i < 2) ? sl_cltv : sri_cltv;
+        uint32_t ko_cltv = f.nodes[ko_idx].cltv_timeout;
+        uint32_t st_cltv = f.nodes[st_idx].cltv_timeout;
+
+        /* mid state > leaf kickoff > leaf state */
+        TEST_ASSERT(parent_st_cltv > ko_cltv, "parent state > leaf kickoff cltv");
+        TEST_ASSERT(ko_cltv > st_cltv, "leaf kickoff > leaf state cltv");
+    }
+
+    /* Verify exact values */
+    TEST_ASSERT_EQ(sr_cltv, 200, "sr = 200");
+    TEST_ASSERT_EQ(kl_cltv, 195, "kl = 195");
+    TEST_ASSERT_EQ(sl_cltv, 190, "sl = 190");
+    TEST_ASSERT_EQ(f.nodes[6].cltv_timeout, 185, "ka = 185");
+    TEST_ASSERT_EQ(f.nodes[10].cltv_timeout, 180, "sa = 180");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_min_funding_reject(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+
+    /* Set a tiny funding amount that should be rejected */
+    f.funding_amount_sats = 1000;  /* Way below minimum for 14-node tree */
+    TEST_ASSERT(!factory_build_tree(&f), "tiny funding rejected");
+
+    /* Set minimum valid amount: 14*fee_per_tx + 8*1092 */
+    uint64_t min = 14 * f.fee_per_tx + 8 * 1092;
+    f.funding_amount_sats = min;
+    /* Reset node count for fresh build */
+    f.n_nodes = 0;
+    TEST_ASSERT(factory_build_tree(&f), "minimum funding accepted");
+
+    /* Verify outputs are non-dust */
+    for (int i = 0; i < 4; i++) {
+        size_t leaf = f.leaf_node_indices[i];
+        for (uint32_t j = 0; j < f.nodes[leaf].n_outputs; j++) {
+            TEST_ASSERT(f.nodes[leaf].outputs[j].amount_sats >= 546,
+                        "leaf output above dust");
+        }
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_arity1_input_amounts_consistent(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* For every node except root kickoff, input_amount should equal
+       the parent's output amount at the correct vout */
+    for (size_t i = 1; i < f.n_nodes; i++) {
+        const factory_node_t *node = &f.nodes[i];
+        int parent_idx = node->parent_index;
+        if (parent_idx < 0) continue;
+
+        const factory_node_t *parent = &f.nodes[parent_idx];
+        uint32_t vout = node->parent_vout;
+        TEST_ASSERT(vout < parent->n_outputs, "parent vout in range");
+        TEST_ASSERT_EQ(node->input_amount, parent->outputs[vout].amount_sats,
+                        "input_amount matches parent output");
+    }
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test factory_advance_leaf_unsigned + per-node split-round signing.
+   Simulates the LSP/client split-round protocol used in daemon mode. */
+int test_factory_arity1_split_round_leaf_advance(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    factory_t f;
+    TEST_ASSERT(setup_arity1_factory(&f, ctx, kps), "setup");
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Advance leaf 0 using the unsigned + split-round path */
+    int rc = factory_advance_leaf_unsigned(&f, 0);
+    TEST_ASSERT_EQ(rc, 1, "advance unsigned returns 1");
+    TEST_ASSERT_EQ(f.per_leaf_enabled, 1, "per_leaf enabled");
+
+    size_t node_idx = f.leaf_node_indices[0];
+    factory_node_t *node = &f.nodes[node_idx];
+
+    /* Node should be rebuilt but NOT signed */
+    TEST_ASSERT(node->is_built, "node built after advance");
+
+    /* Init signing session for this node */
+    TEST_ASSERT(factory_session_init_node(&f, node_idx), "session init");
+
+    /* Generate nonces for each signer (simulating LSP + client) */
+    secp256k1_musig_secnonce secnonces[2];
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+        secp256k1_keypair_sec(ctx, seckey, &kps[participant]);
+        secp256k1_keypair_pub(ctx, &pk, &kps[participant]);
+
+        secp256k1_musig_pubnonce pubnonce;
+        TEST_ASSERT(musig_generate_nonce(ctx, &secnonces[j], &pubnonce,
+                                           seckey, &pk, &node->keyagg.cache),
+                    "nonce gen");
+        memset(seckey, 0, 32);
+        TEST_ASSERT(factory_session_set_nonce(&f, node_idx, j, &pubnonce),
+                    "set nonce");
+    }
+
+    /* Finalize nonces */
+    TEST_ASSERT(factory_session_finalize_node(&f, node_idx), "finalize node");
+
+    /* Create partial sigs */
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+        TEST_ASSERT(musig_create_partial_sig(ctx, &psig, &secnonces[j],
+                                               &kps[participant],
+                                               &node->signing_session),
+                    "partial sig");
+        TEST_ASSERT(factory_session_set_partial_sig(&f, node_idx, j, &psig),
+                    "set partial sig");
+    }
+
+    /* Aggregate + finalize */
+    TEST_ASSERT(factory_session_complete_node(&f, node_idx), "complete node");
+    TEST_ASSERT(node->is_signed, "node signed after complete");
+    TEST_ASSERT(node->signed_tx.len > 0, "signed tx not empty");
+
+    /* Verify the signed tx is valid — advance again using the full path
+       and compare DW state progression */
+    uint32_t state_after_split = f.leaf_layers[0].current_state;
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance leaf full");
+    TEST_ASSERT(f.leaf_layers[0].current_state > state_after_split,
+                "state advanced further");
 
     factory_free(&f);
     secp256k1_context_destroy(ctx);

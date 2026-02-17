@@ -628,3 +628,71 @@ int test_persist_basepoints(void) {
     persist_close(&db);
     return 1;
 }
+
+/* ---- Test: DW counter with N leaf states (arity-1 support) ---- */
+
+int test_persist_dw_counter_with_leaves_4(void) {
+    persist_t db;
+    TEST_ASSERT(persist_open(&db, NULL), "open");
+
+    /* Save with 4 leaf states (arity-1: 4 clients) */
+    uint32_t layers[] = {5, 2, 1};
+    uint32_t leaf_states[] = {3, 0, 7, 2};
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 42, 10, 3, layers,
+                                                      1, leaf_states, 4),
+                "save with 4 leaves");
+
+    /* Load and verify */
+    uint32_t epoch, n_layers;
+    uint32_t loaded_layers[8];
+    int per_leaf_enabled;
+    uint32_t loaded_leaves[8];
+    int n_leaf_nodes;
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 42, &epoch, &n_layers,
+                                                      loaded_layers, 8,
+                                                      &per_leaf_enabled,
+                                                      loaded_leaves, &n_leaf_nodes, 8),
+                "load with 4 leaves");
+
+    TEST_ASSERT_EQ(epoch, 10, "epoch");
+    TEST_ASSERT_EQ(n_layers, 3, "n_layers");
+    TEST_ASSERT_EQ(loaded_layers[0], 5, "layer 0");
+    TEST_ASSERT_EQ(loaded_layers[1], 2, "layer 1");
+    TEST_ASSERT_EQ(loaded_layers[2], 1, "layer 2");
+    TEST_ASSERT_EQ(per_leaf_enabled, 1, "per_leaf enabled");
+    TEST_ASSERT_EQ(n_leaf_nodes, 4, "n_leaf_nodes");
+    TEST_ASSERT_EQ(loaded_leaves[0], 3, "leaf 0");
+    TEST_ASSERT_EQ(loaded_leaves[1], 0, "leaf 1");
+    TEST_ASSERT_EQ(loaded_leaves[2], 7, "leaf 2");
+    TEST_ASSERT_EQ(loaded_leaves[3], 2, "leaf 3");
+
+    /* Overwrite with 2 leaf states (arity-2 compatibility) */
+    uint32_t layers2[] = {1, 0};
+    uint32_t leaf_states2[] = {4, 6};
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 42, 5, 2, layers2,
+                                                      1, leaf_states2, 2),
+                "save with 2 leaves");
+
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 42, &epoch, &n_layers,
+                                                      loaded_layers, 8,
+                                                      &per_leaf_enabled,
+                                                      loaded_leaves, &n_leaf_nodes, 8),
+                "load with 2 leaves");
+    TEST_ASSERT_EQ(n_leaf_nodes, 2, "n_leaf_nodes after overwrite");
+    TEST_ASSERT_EQ(loaded_leaves[0], 4, "leaf 0 after overwrite");
+    TEST_ASSERT_EQ(loaded_leaves[1], 6, "leaf 1 after overwrite");
+
+    /* Save with per_leaf disabled */
+    TEST_ASSERT(persist_save_dw_counter_with_leaves(&db, 42, 0, 2, layers2,
+                                                      0, NULL, 0),
+                "save with per_leaf disabled");
+    TEST_ASSERT(persist_load_dw_counter_with_leaves(&db, 42, &epoch, &n_layers,
+                                                      loaded_layers, 8,
+                                                      &per_leaf_enabled,
+                                                      loaded_leaves, &n_leaf_nodes, 8),
+                "load with per_leaf disabled");
+    TEST_ASSERT_EQ(per_leaf_enabled, 0, "per_leaf disabled");
+
+    persist_close(&db);
+    return 1;
+}

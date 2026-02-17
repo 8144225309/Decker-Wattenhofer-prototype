@@ -68,6 +68,7 @@ static void usage(const char *prog) {
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --no-jit            Disable JIT channel fallback\n"
+        "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -334,6 +335,7 @@ int main(int argc, char *argv[]) {
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int no_jit = 0;
+    int leaf_arity = 2;              /* 1 or 2, default arity-2 */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -394,6 +396,8 @@ int main(int argc, char *argv[]) {
             jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
         else if (strcmp(argv[i], "--no-jit") == 0)
             no_jit = 1;
+        else if (strcmp(argv[i], "--arity") == 0 && i + 1 < argc)
+            leaf_arity = atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -403,6 +407,14 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* Test flags require regtest (they mine blocks for nSequence/CLTV) */
+    if (!is_regtest && (breach_test || test_expiry || test_distrib ||
+                        test_turnover || test_rotation)) {
+        fprintf(stderr, "Error: --cheat-daemon, --test-expiry, --test-distrib, "
+                "--test-turnover, and --test-rotation require --network regtest\n");
+        return 1;
+    }
 
     /* Resolve active/dying block defaults */
     uint32_t active_blocks = (active_blocks_arg > 0) ? (uint32_t)active_blocks_arg
@@ -704,6 +716,8 @@ int main(int argc, char *argv[]) {
 
     printf("LSP: CLTV timeout: block %u (current: %d)\n",
            cltv_timeout, regtest_get_block_height(&rt));
+    if (leaf_arity == 1)
+        lsp.factory.leaf_arity = FACTORY_ARITY_1;
     printf("LSP: starting factory creation ceremony...\n");
     if (!lsp_run_factory_creation(&lsp,
                                    funding_txid, funding_vout,
@@ -733,14 +747,14 @@ int main(int argc, char *argv[]) {
     /* Log DW counter initial state */
     {
         uint32_t epoch = dw_counter_epoch(&lsp.factory.counter);
-        uint16_t d0 = dw_delay_for_state(&lsp.factory.counter.layers[0].config,
-                                           lsp.factory.counter.layers[0].current_state);
-        uint16_t d1 = (lsp.factory.counter.n_layers > 1)
-            ? dw_delay_for_state(&lsp.factory.counter.layers[1].config,
-                                  lsp.factory.counter.layers[1].current_state)
-            : 0;
-        printf("LSP: DW epoch %u/%u (nSeq delays: %u, %u blocks)\n",
-               epoch, lsp.factory.counter.total_states, d0, d1);
+        printf("LSP: DW epoch %u/%u (nSeq delays:", epoch,
+               lsp.factory.counter.total_states);
+        for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++) {
+            uint16_t d = dw_delay_for_state(&lsp.factory.counter.layers[li].config,
+                                              lsp.factory.counter.layers[li].current_state);
+            printf(" L%u=%u", li, d);
+        }
+        printf(" blocks)\n");
     }
 
     /* Set fee estimator on factory (for computed fees) */
@@ -774,9 +788,13 @@ int main(int argc, char *argv[]) {
             fprintf(stderr, "LSP: warning: failed to persist factory\n");
         if (!persist_save_tree_nodes(&db, &lsp.factory, 0))
             fprintf(stderr, "LSP: warning: failed to persist tree nodes\n");
-        /* Save initial DW counter state (Phase 23) */
-        uint32_t init_layers[] = {4, 4};  /* states_per_layer for each DW layer */
-        persist_save_dw_counter(&db, 0, 0, 2, init_layers);
+        /* Save initial DW counter state — use actual layer count (2 for arity-2, 3 for arity-1) */
+        {
+            uint32_t init_layers[DW_MAX_LAYERS];
+            for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++)
+                init_layers[li] = lsp.factory.counter.layers[li].config.max_states;
+            persist_save_dw_counter(&db, 0, 0, lsp.factory.counter.n_layers, init_layers);
+        }
         /* Save ladder factory state (Tier 2) */
         persist_save_ladder_factory(&db, 0, "active", 1, 1, 0,
             lsp.factory.created_block, lsp.factory.active_blocks,
@@ -904,6 +922,7 @@ int main(int argc, char *argv[]) {
         strncpy(mgr.rot_mine_addr, mine_addr, sizeof(mgr.rot_mine_addr) - 1);
         mgr.rot_step_blocks = step_blocks;
         mgr.rot_states_per_layer = 4;
+        mgr.rot_leaf_arity = leaf_arity;
         mgr.rot_is_regtest = is_regtest;
         mgr.rot_funding_sats = funding_sats;
         mgr.rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
@@ -975,16 +994,14 @@ int main(int argc, char *argv[]) {
             /* DW counter tracking after demo payments */
             if (dw_counter_advance(&lsp.factory.counter)) {
                 uint32_t epoch = dw_counter_epoch(&lsp.factory.counter);
-                uint16_t d0 = dw_delay_for_state(
-                    &lsp.factory.counter.layers[0].config,
-                    lsp.factory.counter.layers[0].current_state);
-                uint16_t d1 = (lsp.factory.counter.n_layers > 1)
-                    ? dw_delay_for_state(
-                          &lsp.factory.counter.layers[1].config,
-                          lsp.factory.counter.layers[1].current_state)
-                    : 0;
-                printf("LSP: DW advanced to epoch %u (new delays: %u, %u blocks)\n",
-                       epoch, d0, d1);
+                printf("LSP: DW advanced to epoch %u (delays:", epoch);
+                for (uint32_t li = 0; li < lsp.factory.counter.n_layers; li++) {
+                    uint16_t d = dw_delay_for_state(
+                        &lsp.factory.counter.layers[li].config,
+                        lsp.factory.counter.layers[li].current_state);
+                    printf(" L%u=%u", li, d);
+                }
+                printf(" blocks)\n");
                 printf("  Note: In production, factory tree would be re-signed "
                        "via split-round MuSig2.\n");
                 if (use_db) {
@@ -1205,22 +1222,58 @@ int main(int argc, char *argv[]) {
                    sr_txid_str, nseq_blocks);
         }
 
-        /* Step 3: Broadcast kickoff_left (node 2, key-path pre-signed, no nSeq wait) */
-        factory_node_t *kickoff_left = &lsp.factory.nodes[2];
+        /* Build broadcast chain: walk from first leaf state up to state_root,
+           collecting intermediate kickoff+state nodes to broadcast.
+           Works for both arity-2 (3 nodes: kl) and arity-1 (5 nodes: kl,sl,ka). */
+        size_t first_leaf_idx = lsp.factory.leaf_node_indices[0];
+        int chain[16];  /* node indices to broadcast (root-to-leaf order) */
+        int chain_len = 0;
         {
-            char *kl_hex = malloc(kickoff_left->signed_tx.len * 2 + 1);
-            hex_encode(kickoff_left->signed_tx.data, kickoff_left->signed_tx.len, kl_hex);
-            char kl_txid_str[65];
-            if (!regtest_send_raw_tx(&rt, kl_hex, kl_txid_str)) {
-                fprintf(stderr, "EXPIRY TEST: kickoff_left broadcast failed\n");
-                free(kl_hex);
+            /* Walk from first leaf's kickoff parent up to state_root */
+            int ko_idx = lsp.factory.nodes[first_leaf_idx].parent_index;
+            while (ko_idx >= 0) {
+                int parent_state = lsp.factory.nodes[ko_idx].parent_index;
+                if (parent_state < 0 || parent_state == 1) break; /* stop at state_root children */
+                chain[chain_len++] = parent_state; /* state node (grandparent) */
+                chain[chain_len++] = ko_idx;       /* kickoff node */
+                ko_idx = lsp.factory.nodes[parent_state].parent_index;
+            }
+            chain[chain_len++] = ko_idx; /* the kickoff that's a direct child of state_root */
+        }
+        /* Reverse chain to get root-to-leaf order */
+        for (int a = 0, b = chain_len - 1; a < b; a++, b--) {
+            int tmp = chain[a]; chain[a] = chain[b]; chain[b] = tmp;
+        }
+
+        /* Step 3..N: Broadcast intermediate nodes down to the deepest kickoff */
+        int step = 3;
+        for (int ci = 0; ci < chain_len; ci++) {
+            factory_node_t *nd = &lsp.factory.nodes[chain[ci]];
+            uint32_t nseq = nd->nsequence;
+            int nseq_blocks = (nseq == NSEQUENCE_DISABLE_BIP68) ? 0 : (int)(nseq & 0xFFFF);
+            if (nseq_blocks > 0)
+                regtest_mine_blocks(&rt, nseq_blocks, mine_addr);
+
+            char *hex = malloc(nd->signed_tx.len * 2 + 1);
+            hex_encode(nd->signed_tx.data, nd->signed_tx.len, hex);
+            char txid_str[65];
+            if (!regtest_send_raw_tx(&rt, hex, txid_str)) {
+                fprintf(stderr, "EXPIRY TEST: node[%d] broadcast failed\n", chain[ci]);
+                free(hex);
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
-            free(kl_hex);
+            free(hex);
             regtest_mine_blocks(&rt, 1, mine_addr);
-            printf("3. kickoff_left broadcast: %s\n", kl_txid_str);
+            printf("%d. node[%d] (%s) broadcast: %s%s\n", step++, chain[ci],
+                   nd->type == NODE_KICKOFF ? "kickoff" : "state", txid_str,
+                   nseq_blocks > 0 ? " (waited nSeq)" : "");
         }
+
+        /* The deepest kickoff is the last in the chain */
+        factory_node_t *deepest_kickoff = &lsp.factory.nodes[chain[chain_len - 1]];
+        /* The leaf state node that times out this kickoff's output */
+        factory_node_t *leaf_state = &lsp.factory.nodes[first_leaf_idx];
 
         /* LSP pubkey for signing + destination */
         secp256k1_xonly_pubkey lsp_xonly;
@@ -1232,28 +1285,28 @@ int main(int argc, char *argv[]) {
         if (fee_sats == 0) fee_sats = 500;
         uint64_t leaf_recovered = 0, mid_recovered = 0;
 
-        /* Step 4: Mine to leaf CLTV (cltv_timeout - 10) */
-        factory_node_t *state_left = &lsp.factory.nodes[4];
-        uint32_t leaf_cltv = state_left->cltv_timeout;
+        /* Mine to leaf CLTV (deepest state node's timeout) */
+        uint32_t leaf_cltv = leaf_state->cltv_timeout;
         {
             int height = regtest_get_block_height(&rt);
             int needed = (int)leaf_cltv - height;
             if (needed > 0) {
-                printf("4. Mining %d blocks to reach leaf CLTV %u...\n",
-                       needed, leaf_cltv);
+                printf("%d. Mining %d blocks to reach leaf CLTV %u...\n",
+                       step++, needed, leaf_cltv);
                 regtest_mine_blocks(&rt, needed, mine_addr);
             }
         }
 
-        /* Step 5: Spend kickoff_left:0 via state_left timeout script-path */
+        /* Leaf recovery: Spend deepest_kickoff:0 via leaf_state timeout script-path */
         {
-            if (!state_left->has_taptree) {
-                fprintf(stderr, "EXPIRY TEST: state_left has no taptree\n");
+            if (!leaf_state->has_taptree) {
+                fprintf(stderr, "EXPIRY TEST: leaf state node[%zu] has no taptree\n",
+                        first_leaf_idx);
                 lsp_cleanup(&lsp); memset(lsp_seckey, 0, 32);
                 secp256k1_context_destroy(ctx); return 1;
             }
 
-            uint64_t spend_amount = kickoff_left->outputs[0].amount_sats;
+            uint64_t spend_amount = deepest_kickoff->outputs[0].amount_sats;
             if (fee_sats >= spend_amount) fee_sats = 500;
 
             tx_output_t tout;
@@ -1264,7 +1317,7 @@ int main(int argc, char *argv[]) {
             tx_buf_t tu;
             tx_buf_init(&tu, 256);
             if (!build_unsigned_tx_with_locktime(&tu, NULL,
-                    kickoff_left->txid, 0, 0xFFFFFFFEu, leaf_cltv,
+                    deepest_kickoff->txid, 0, 0xFFFFFFFEu, leaf_cltv,
                     &tout, 1)) {
                 fprintf(stderr, "EXPIRY TEST: leaf build failed\n");
                 tx_buf_free(&tu);
@@ -1274,8 +1327,8 @@ int main(int argc, char *argv[]) {
 
             unsigned char sh[32];
             compute_tapscript_sighash(sh, tu.data, tu.len, 0,
-                state_left->spending_spk, state_left->spending_spk_len,
-                spend_amount, 0xFFFFFFFEu, &state_left->timeout_leaf);
+                leaf_state->spending_spk, leaf_state->spending_spk_len,
+                spend_amount, 0xFFFFFFFEu, &leaf_state->timeout_leaf);
 
             unsigned char sig[64], aux[32];
             memset(aux, 0xEE, 32);
@@ -1284,14 +1337,14 @@ int main(int argc, char *argv[]) {
             unsigned char cb[65];
             size_t cb_len;
             tapscript_build_control_block(cb, &cb_len,
-                state_left->output_parity,
-                &state_left->keyagg.agg_pubkey, ctx);
+                leaf_state->output_parity,
+                &leaf_state->keyagg.agg_pubkey, ctx);
 
             tx_buf_t ts;
             tx_buf_init(&ts, 512);
             finalize_script_path_tx(&ts, tu.data, tu.len, sig,
-                state_left->timeout_leaf.script,
-                state_left->timeout_leaf.script_len, cb, cb_len);
+                leaf_state->timeout_leaf.script,
+                leaf_state->timeout_leaf.script_len, cb, cb_len);
             tx_buf_free(&tu);
 
             char *hex = malloc(ts.len * 2 + 1);
@@ -1308,24 +1361,25 @@ int main(int argc, char *argv[]) {
             }
             regtest_mine_blocks(&rt, 1, mine_addr);
             leaf_recovered = tout.amount_sats;
-            printf("5. Leaf recovery: %llu sats (state_left timeout) txid: %s\n",
-                   (unsigned long long)leaf_recovered, txid_str);
+            printf("%d. Leaf recovery: %llu sats (node[%zu] timeout) txid: %s\n",
+                   step++, (unsigned long long)leaf_recovered, first_leaf_idx, txid_str);
         }
 
-        /* Step 6: Mine to mid CLTV (cltv_timeout - 5) */
-        factory_node_t *kickoff_right = &lsp.factory.nodes[3];
+        /* Mid recovery: Spend state_root:1 via kickoff_right timeout.
+           kickoff_right is the second child of state_root (vout 1). */
+        factory_node_t *kickoff_right = &lsp.factory.nodes[state_root->child_indices[1]];
         uint32_t mid_cltv = kickoff_right->cltv_timeout;
         {
             int height = regtest_get_block_height(&rt);
             int needed = (int)mid_cltv - height;
             if (needed > 0) {
-                printf("6. Mining %d blocks to reach mid CLTV %u...\n",
-                       needed, mid_cltv);
+                printf("%d. Mining %d blocks to reach mid CLTV %u...\n",
+                       step++, needed, mid_cltv);
                 regtest_mine_blocks(&rt, needed, mine_addr);
             }
         }
 
-        /* Step 7: Spend state_root:1 via kickoff_right timeout script-path */
+        /* Spend state_root:1 via kickoff_right timeout script-path */
         {
             if (!kickoff_right->has_taptree) {
                 fprintf(stderr, "EXPIRY TEST: kickoff_right has no taptree\n");
@@ -1388,8 +1442,8 @@ int main(int argc, char *argv[]) {
             }
             regtest_mine_blocks(&rt, 1, mine_addr);
             mid_recovered = tout.amount_sats;
-            printf("7. Mid recovery: %llu sats (kickoff_right timeout) txid: %s\n",
-                   (unsigned long long)mid_recovered, txid_str);
+            printf("%d. Mid recovery: %llu sats (kickoff_right timeout) txid: %s\n",
+                   step++, (unsigned long long)mid_recovered, txid_str);
         }
 
         printf("\nLeaf recovery: %llu sats\n", (unsigned long long)leaf_recovered);

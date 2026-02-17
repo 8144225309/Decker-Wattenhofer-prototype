@@ -17,6 +17,11 @@
 
 #define NSEQUENCE_DISABLE_BIP68 0xFFFFFFFFu
 
+typedef enum {
+    FACTORY_ARITY_2 = 2,    /* 2 clients per leaf (3-of-3), 6 nodes, 2 DW layers */
+    FACTORY_ARITY_1 = 1,    /* 1 client per leaf (2-of-2), 14 nodes, 3 DW layers */
+} factory_arity_t;
+
 typedef enum { NODE_KICKOFF, NODE_STATE } factory_node_type_t;
 
 /* Factory lifecycle states (Phase 8) */
@@ -112,8 +117,11 @@ typedef struct {
     int has_shachain;
 
     /* Per-leaf DW layers (for independent leaf advance) */
-    dw_layer_t leaf_layers[2];    /* [0]=left, [1]=right */
+    dw_layer_t leaf_layers[8];    /* up to 8 leaf nodes (arity-1: 4, arity-2: 2) */
+    int n_leaf_nodes;              /* number of leaf state nodes */
+    size_t leaf_node_indices[8];   /* maps leaf_idx → node index in nodes[] */
     int per_leaf_enabled;          /* activated after first leaf advance */
+    factory_arity_t leaf_arity;    /* FACTORY_ARITY_2 (default) or FACTORY_ARITY_1 */
 
     /* Lifecycle (Phase 8) */
     uint32_t created_block;        /* block height when funding confirmed */
@@ -132,6 +140,10 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
                                const secp256k1_pubkey *pubkeys, size_t n_participants,
                                uint16_t step_blocks, uint32_t states_per_layer);
 
+/* Set factory arity. Must be called after init, before build_tree.
+   Reinitializes DW counter with correct layer count for the arity. */
+void factory_set_arity(factory_t *f, factory_arity_t arity);
+
 void factory_set_funding(factory_t *f,
                          const unsigned char *txid, uint32_t vout,
                          uint64_t amount_sats,
@@ -145,13 +157,25 @@ int factory_advance(factory_t *f);
    Reclaims all N^2 states. Requires all signers to participate. */
 int factory_reset_epoch(factory_t *f);
 
-/* Advance only one leaf subtree. leaf_side: 0=left, 1=right.
-   Rebuilds + re-signs only the affected state node (node 4 or 5).
+/* Advance only one leaf subtree. leaf_side: 0..n_leaf_nodes-1.
+   Rebuilds + re-signs only the affected state node.
    Returns 0 if fully exhausted (need cooperative epoch reset). */
 int factory_advance_leaf(factory_t *f, int leaf_side);
 
+/* Advance leaf DW counter + rebuild unsigned tx, but do NOT sign.
+   Use for split-round signing: call this, then use factory_session_*_node()
+   to exchange nonces and partial sigs with the counterparty.
+   Returns 0 if fully exhausted (need cooperative epoch reset).
+   Returns -1 if leaf exhausted and root advanced (full rebuild needed). */
+int factory_advance_leaf_unsigned(factory_t *f, int leaf_side);
+
 /* Sign a single node (local-only, all keypairs available). */
 int factory_sign_node(factory_t *f, size_t node_idx);
+
+/* Per-node split-round signing helpers (for leaf advance in daemon mode). */
+int factory_session_init_node(factory_t *f, size_t node_idx);
+int factory_session_finalize_node(factory_t *f, size_t node_idx);
+int factory_session_complete_node(factory_t *f, size_t node_idx);
 
 void factory_free(factory_t *f);
 

@@ -295,6 +295,18 @@ typedef struct {
     size_t current;
 } multi_payment_data_t;
 
+/* Helper: receive next non-revocation message, consuming any
+   MSG_LSP_REVOKE_AND_ACK (0x50) along the way.  The LSP sends
+   bidirectional revocations at 9 sites; test clients don't track
+   watchtower state, so we simply skip them. */
+static int recv_skip_revocations(int fd, wire_msg_t *out) {
+    for (;;) {
+        if (!wire_recv(fd, out)) return 0;
+        if (out->msg_type != 0x50) return 1;  /* MSG_LSP_REVOKE_AND_ACK */
+        cJSON_Delete(out->json);
+    }
+}
+
 static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
                                      secp256k1_context *ctx,
                                      const secp256k1_keypair *keypair,
@@ -319,7 +331,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for COMMITMENT_SIGNED (acknowledging HTLC) */
             wire_msg_t msg;
-            if (!wire_recv(fd, &msg)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv failed after send\n", my_index);
                 return 0;
             }
@@ -334,7 +346,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Wait for FULFILL_HTLC */
-            if (!wire_recv(fd, &msg)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
                 return 0;
             }
@@ -356,7 +368,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!wire_recv(fd, &msg)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -372,7 +384,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
             /* Wait for ADD_HTLC from LSP */
             wire_msg_t msg;
-            if (!wire_recv(fd, &msg)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv ADD_HTLC failed\n", my_index);
                 return 0;
             }
@@ -387,7 +399,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             }
 
             /* Handle COMMITMENT_SIGNED */
-            if (!wire_recv(fd, &msg)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit failed\n", my_index);
                 return 0;
             }
@@ -419,7 +431,7 @@ static int multi_payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
             client_fulfill_payment(fd, ch, htlc_id, act->preimage);
 
             /* Handle COMMITMENT_SIGNED for the fulfill */
-            if (!wire_recv(fd, &msg)) {
+            if (!recv_skip_revocations(fd, &msg)) {
                 fprintf(stderr, "Client %u: recv commit after fulfill failed\n", my_index);
                 return 0;
             }
@@ -465,7 +477,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
         /* Wait for COMMITMENT_SIGNED from LSP (acknowledging the HTLC) */
         wire_msg_t msg;
-        if (!wire_recv(fd, &msg)) {
+        if (!recv_skip_revocations(fd, &msg)) {
             fprintf(stderr, "Client %u: recv failed\n", my_index);
             return 0;
         }
@@ -479,7 +491,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
         /* Wait for FULFILL_HTLC from LSP (payment succeeded) */
-        if (!wire_recv(fd, &msg)) {
+        if (!recv_skip_revocations(fd, &msg)) {
             fprintf(stderr, "Client %u: recv fulfill failed\n", my_index);
             return 0;
         }
@@ -501,7 +513,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
         /* Handle COMMITMENT_SIGNED for the fulfill */
-        if (!wire_recv(fd, &msg)) {
+        if (!recv_skip_revocations(fd, &msg)) {
             fprintf(stderr, "Client %u: recv commit failed\n", my_index);
             return 0;
         }
@@ -517,7 +529,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
 
         /* Wait for ADD_HTLC from LSP */
         wire_msg_t msg;
-        if (!wire_recv(fd, &msg)) {
+        if (!recv_skip_revocations(fd, &msg)) {
             fprintf(stderr, "Client %u: recv failed\n", my_index);
             return 0;
         }
@@ -532,7 +544,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
         }
 
         /* Handle COMMITMENT_SIGNED */
-        if (!wire_recv(fd, &msg)) {
+        if (!recv_skip_revocations(fd, &msg)) {
             fprintf(stderr, "Client %u: recv commit failed\n", my_index);
             return 0;
         }
@@ -557,7 +569,7 @@ static int payment_client_cb(int fd, channel_t *ch, uint32_t my_index,
         client_fulfill_payment(fd, ch, htlc_id, data->preimage);
 
         /* Handle COMMITMENT_SIGNED for the fulfill */
-        if (!wire_recv(fd, &msg)) {
+        if (!recv_skip_revocations(fd, &msg)) {
             fprintf(stderr, "Client %u: recv commit failed\n", my_index);
             return 0;
         }

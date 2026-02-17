@@ -156,6 +156,7 @@ extern int test_wire_psig_bundle(void);
 extern int test_wire_close_unsigned(void);
 extern int test_wire_distributed_signing(void);
 extern int test_regtest_wire_factory(void);
+extern int test_regtest_wire_factory_arity1(void);
 
 /* Phase 10: Channel operations over wire */
 extern int test_channel_msg_round_trip(void);
@@ -356,6 +357,21 @@ extern int test_htlc_max_count_enforcement(void);
 extern int test_htlc_dust_amount_rejected(void);
 extern int test_htlc_reserve_enforcement(void);
 extern int test_factory_advance_past_exhaustion(void);
+
+/* Arity-1 tests */
+extern int test_factory_build_tree_arity1(void);
+extern int test_factory_arity1_leaf_outputs(void);
+extern int test_factory_arity1_sign_all(void);
+extern int test_factory_arity1_advance(void);
+extern int test_factory_arity1_advance_leaf(void);
+extern int test_factory_arity1_leaf_independence(void);
+extern int test_factory_arity1_coop_close(void);
+extern int test_factory_arity1_client_to_leaf(void);
+extern int test_factory_arity1_cltv_strict_ordering(void);
+extern int test_factory_arity1_min_funding_reject(void);
+extern int test_factory_arity1_input_amounts_consistent(void);
+extern int test_factory_arity1_split_round_leaf_advance(void);
+extern int test_persist_dw_counter_with_leaves_4(void);
 
 static void run_unit_tests(void) {
     printf("\n=== DW State Machine ===\n");
@@ -667,6 +683,23 @@ static void run_unit_tests(void) {
     RUN_TEST(test_htlc_dust_amount_rejected);
     RUN_TEST(test_htlc_reserve_enforcement);
     RUN_TEST(test_factory_advance_past_exhaustion);
+
+    printf("\n=== Arity-1 Leaves ===\n");
+    RUN_TEST(test_factory_build_tree_arity1);
+    RUN_TEST(test_factory_arity1_leaf_outputs);
+    RUN_TEST(test_factory_arity1_sign_all);
+    RUN_TEST(test_factory_arity1_advance);
+    RUN_TEST(test_factory_arity1_advance_leaf);
+    RUN_TEST(test_factory_arity1_leaf_independence);
+    RUN_TEST(test_factory_arity1_coop_close);
+    RUN_TEST(test_factory_arity1_client_to_leaf);
+
+    printf("\n=== Arity-1 Hardening ===\n");
+    RUN_TEST(test_factory_arity1_cltv_strict_ordering);
+    RUN_TEST(test_factory_arity1_min_funding_reject);
+    RUN_TEST(test_factory_arity1_input_amounts_consistent);
+    RUN_TEST(test_factory_arity1_split_round_leaf_advance);
+    RUN_TEST(test_persist_dw_counter_with_leaves_4);
 }
 
 static void run_regtest_tests(void) {
@@ -694,6 +727,7 @@ static void run_regtest_tests(void) {
 
     printf("\n=== Regtest Phase 9 (Wire Protocol) ===\n");
     RUN_TEST(test_regtest_wire_factory);
+    RUN_TEST(test_regtest_wire_factory_arity1);
 
     printf("\n=== Regtest Phase 10 (Channel Operations) ===\n");
     RUN_TEST(test_regtest_intra_factory_payment);

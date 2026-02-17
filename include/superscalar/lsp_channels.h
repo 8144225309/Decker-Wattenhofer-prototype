@@ -73,6 +73,7 @@ typedef struct {
     uint32_t rot_states_per_layer;
     int rot_is_regtest;
     uint64_t rot_funding_sats;
+    int rot_leaf_arity;            /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
     int rot_auto_rotate;           /* 1 = auto-rotate enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 
@@ -81,6 +82,9 @@ typedef struct {
     size_t n_jit_channels;
     int jit_enabled;               /* 1 = JIT enabled (default), 0 = --no-jit */
     uint64_t jit_funding_sats;     /* per-client JIT funding amount */
+
+    /* Factory arity (Upgrade 2) */
+    int leaf_arity;                /* FACTORY_ARITY_1 or FACTORY_ARITY_2 */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

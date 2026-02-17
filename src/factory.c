@@ -92,17 +92,18 @@ static int build_single_p2tr_spk(
 }
 
 /* Get nSequence for a node based on its type and DW layer.
-   When per-leaf mode is enabled, leaf state nodes (dw_layer_index==1)
-   use their independent per-leaf DW layer instead of the global counter. */
+   When per-leaf mode is enabled, leaf state nodes use their independent
+   per-leaf DW layer instead of the global counter. Uses leaf_node_indices[]
+   for arity-agnostic lookup. */
 static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     if (node->type == NODE_KICKOFF)
         return NSEQUENCE_DISABLE_BIP68;
-    if (f->per_leaf_enabled && node->dw_layer_index == 1) {
-        /* Node 4 = left (side 0), Node 5 = right (side 1) */
+    if (f->per_leaf_enabled) {
         int node_idx = (int)(node - f->nodes);
-        int side = node_idx - 4;
-        if (side >= 0 && side < 2)
-            return dw_current_nsequence(&f->leaf_layers[side]);
+        for (int i = 0; i < f->n_leaf_nodes; i++) {
+            if ((int)f->leaf_node_indices[i] == node_idx)
+                return dw_current_nsequence(&f->leaf_layers[i]);
+        }
     }
     return dw_current_nsequence(&f->counter.layers[node->dw_layer_index]);
 }
@@ -218,7 +219,8 @@ static int build_l_stock_spk(const factory_t *f, unsigned char *spk_out34) {
 }
 
 /* Update L-stock outputs on leaf state nodes after epoch change.
-   Called by factory_advance() after counter advance. */
+   Called by factory_advance() after counter advance.
+   L-stock is always the last output of a leaf node. */
 static int update_l_stock_outputs(factory_t *f) {
     if (!f->has_shachain)
         return 1;  /* nothing to update */
@@ -229,11 +231,11 @@ static int update_l_stock_outputs(factory_t *f) {
         if (node->type != NODE_STATE || node->n_children > 0)
             continue;
 
-        /* Output index 2 is always the L-stock */
-        if (node->n_outputs < 3)
+        if (node->n_outputs < 2)
             continue;
 
-        if (!build_l_stock_spk(f, node->outputs[2].script_pubkey))
+        /* L-stock is always the last output */
+        if (!build_l_stock_spk(f, node->outputs[node->n_outputs - 1].script_pubkey))
             return 0;
     }
     return 1;
@@ -372,12 +374,14 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
         (void)ok;
     }
 
-    /* 2 DW layers: root state = layer 0, leaf states = layer 1 */
+    /* Default arity-2: 2 DW layers, 2 leaf nodes */
+    f->leaf_arity = FACTORY_ARITY_2;
+    f->n_leaf_nodes = 2;
     dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
 
     /* Per-leaf layers mirror global layer 1 initially */
-    dw_layer_init(&f->leaf_layers[0], step_blocks, states_per_layer);
-    dw_layer_init(&f->leaf_layers[1], step_blocks, states_per_layer);
+    for (int i = 0; i < 2; i++)
+        dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
     f->per_leaf_enabled = 0;
 }
 
@@ -395,10 +399,23 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
         f->pubkeys[i] = pubkeys[i];
     /* keypairs left zeroed — signing requires split-round API */
 
+    /* Default arity-2: 2 DW layers, 2 leaf nodes */
+    f->leaf_arity = FACTORY_ARITY_2;
+    f->n_leaf_nodes = 2;
     dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
 
-    dw_layer_init(&f->leaf_layers[0], step_blocks, states_per_layer);
-    dw_layer_init(&f->leaf_layers[1], step_blocks, states_per_layer);
+    for (int i = 0; i < 2; i++)
+        dw_layer_init(&f->leaf_layers[i], step_blocks, states_per_layer);
+    f->per_leaf_enabled = 0;
+}
+
+void factory_set_arity(factory_t *f, factory_arity_t arity) {
+    f->leaf_arity = arity;
+    int n_layers = (arity == FACTORY_ARITY_1) ? 3 : 2;
+    dw_counter_init(&f->counter, n_layers, f->step_blocks, f->states_per_layer);
+    f->n_leaf_nodes = (arity == FACTORY_ARITY_1) ? 4 : 2;
+    for (int i = 0; i < f->n_leaf_nodes; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
     f->per_leaf_enabled = 0;
 }
 
@@ -413,15 +430,47 @@ void factory_set_funding(factory_t *f,
     f->funding_spk_len = spk_len;
 }
 
-int factory_build_tree(factory_t *f) {
-    if (f->n_participants != 5) return 0;  /* 4 clients + 1 LSP */
+/* Set up single-client leaf outputs: 1 channel + 1 L-stock */
+static int setup_single_leaf_outputs(
+    factory_t *f,
+    factory_node_t *node,
+    uint32_t client_idx,
+    uint64_t input_amount
+) {
+    uint64_t output_total = input_amount - f->fee_per_tx;
+    uint64_t per_output = output_total / 2;
+    uint64_t remainder = output_total - per_output * 2;
 
-    /* Override fee_per_tx from fee estimator if available */
-    if (f->fee) {
-        /* Average tree tx: ~3 outputs */
-        f->fee_per_tx = fee_for_factory_tx(f->fee, 3);
+    if (per_output < CHANNEL_DUST_LIMIT_SATS) {
+        fprintf(stderr, "Factory: single leaf output %llu below dust limit\n",
+                (unsigned long long)per_output);
+        return 0;
     }
 
+    node->n_outputs = 2;
+
+    /* Channel: MuSig(client, LSP) */
+    {
+        secp256k1_pubkey pks[2] = { f->pubkeys[client_idx], f->pubkeys[0] };
+        musig_keyagg_t ka;
+        secp256k1_xonly_pubkey tw;
+        if (!build_musig_p2tr_spk(f->ctx, node->outputs[0].script_pubkey,
+                                   &tw, NULL, &ka, pks, 2, NULL))
+            return 0;
+        node->outputs[0].script_pubkey_len = 34;
+        node->outputs[0].amount_sats = per_output;
+    }
+
+    /* L stock: LSP only, optionally with hashlock burn path */
+    if (!build_l_stock_spk(f, node->outputs[1].script_pubkey))
+        return 0;
+    node->outputs[1].script_pubkey_len = 34;
+    node->outputs[1].amount_sats = per_output + remainder;
+
+    return 1;
+}
+
+static int factory_build_tree_arity2(factory_t *f) {
     /* Participant indices: LSP=0, A=1, B=2, C=3, D=4 */
     uint32_t all[] = {0, 1, 2, 3, 4};
     uint32_t left_set[] = {0, 1, 2};       /* L, A, B */
@@ -446,6 +495,10 @@ int factory_build_tree(factory_t *f) {
 
     if (kr < 0 || sr < 0 || kl < 0 || kri < 0 || sl < 0 || sri < 0)
         return 0;
+
+    /* Record leaf node indices */
+    f->leaf_node_indices[0] = (size_t)sl;
+    f->leaf_node_indices[1] = (size_t)sri;
 
     /* ---- Phase 2: Setup outputs and amounts ---- */
     uint64_t fee = f->fee_per_tx;
@@ -497,6 +550,195 @@ int factory_build_tree(factory_t *f) {
 
     /* ---- Phase 3: Build unsigned txs top-down ---- */
     return build_all_unsigned_txs(f);
+}
+
+static int factory_build_tree_arity1(factory_t *f) {
+    /*
+     * Arity-1 tree (14 nodes, 3 DW layers):
+     *   kickoff_root[0] (5-of-5) → state_root[1] (5-of-5, DW L0)
+     *     ├─ kickoff_left[2] (3-of-3) → state_left[4] (3-of-3, DW L1)
+     *     │    ├─ kickoff_A[6] (2-of-2) → state_A[10] (2-of-2, DW L2) → [chan_A, L_stock]
+     *     │    └─ kickoff_B[7] (2-of-2) → state_B[11] (2-of-2, DW L2) → [chan_B, L_stock]
+     *     └─ kickoff_right[3] (3-of-3) → state_right[5] (3-of-3, DW L1)
+     *          ├─ kickoff_C[8] (2-of-2) → state_C[12] (2-of-2, DW L2) → [chan_C, L_stock]
+     *          └─ kickoff_D[9] (2-of-2) → state_D[13] (2-of-2, DW L2) → [chan_D, L_stock]
+     */
+
+    /* Minimum funding validation: from funding to each leaf output, there are
+       6 fee deductions along the path (kr,sr,kl/kri,sl/sri,ka-kd,sa-sd).
+       Each leaf output = (funding - 14*fee) / 8 (integer math, worst case).
+       Each leaf needs at least 2*dust (channel + L-stock) = 2*546 = 1092 sats.
+       So: (funding - 14*fee) / 8 >= 1092 ⟹ funding >= 14*fee + 8*1092. */
+    uint64_t min_funding = 14 * f->fee_per_tx + 8 * 1092;
+    if (f->funding_amount_sats < min_funding) {
+        fprintf(stderr, "factory_build_tree_arity1: funding %lu sats below minimum %lu\n",
+                (unsigned long)f->funding_amount_sats, (unsigned long)min_funding);
+        return 0;
+    }
+
+    uint32_t all[] = {0, 1, 2, 3, 4};
+    uint32_t left_set[] = {0, 1, 2};       /* L, A, B */
+    uint32_t right_set[] = {0, 3, 4};      /* L, C, D */
+    uint32_t set_a[] = {0, 1};             /* L, A */
+    uint32_t set_b[] = {0, 2};             /* L, B */
+    uint32_t set_c[] = {0, 3};             /* L, C */
+    uint32_t set_d[] = {0, 4};             /* L, D */
+
+    /* Staggered CLTVs: 5 tiers with TIMEOUT_STEP_BLOCKS between each position.
+       Root has longest timeout, leaves have shortest. Each child must have a
+       strictly shorter CLTV than its parent to ensure bottom-up timeout ordering.
+       Positions: sr > kl/kri > sl/sri > ka-kd > sa-sd */
+    uint32_t cltv = f->cltv_timeout;
+    uint32_t step = TIMEOUT_STEP_BLOCKS;
+    uint32_t root_cltv      = cltv;
+    uint32_t mid_ko_cltv    = (cltv > step)   ? cltv - step   : 0;  /* level-1 kickoffs */
+    uint32_t mid_st_cltv    = (cltv > 2*step) ? cltv - 2*step : 0;  /* level-1 states */
+    uint32_t leaf_ko_cltv   = (cltv > 3*step) ? cltv - 3*step : 0;  /* level-2 kickoffs */
+    uint32_t leaf_st_cltv   = (cltv > 4*step) ? cltv - 4*step : 0;  /* level-2 states */
+
+    /* Level 0: root (5-of-5) */
+    int kr  = add_node(f, NODE_KICKOFF, all, 5,         -1, 0, -1, 0);
+    int sr  = add_node(f, NODE_STATE,   all, 5,         kr, 0,  0, root_cltv);
+
+    /* Level 1: mid (3-of-3) */
+    int kl  = add_node(f, NODE_KICKOFF, left_set, 3,    sr, 0, -1, mid_ko_cltv);
+    int kri = add_node(f, NODE_KICKOFF, right_set, 3,   sr, 1, -1, mid_ko_cltv);
+    int sl  = add_node(f, NODE_STATE,   left_set, 3,    kl, 0,  1, mid_st_cltv);
+    int sri = add_node(f, NODE_STATE,   right_set, 3,  kri, 0,  1, mid_st_cltv);
+
+    /* Level 2: per-client (2-of-2) */
+    int ka  = add_node(f, NODE_KICKOFF, set_a, 2,       sl, 0, -1, leaf_ko_cltv);
+    int kb  = add_node(f, NODE_KICKOFF, set_b, 2,       sl, 1, -1, leaf_ko_cltv);
+    int kc  = add_node(f, NODE_KICKOFF, set_c, 2,      sri, 0, -1, leaf_ko_cltv);
+    int kd  = add_node(f, NODE_KICKOFF, set_d, 2,      sri, 1, -1, leaf_ko_cltv);
+    int sa  = add_node(f, NODE_STATE,   set_a, 2,       ka, 0,  2, leaf_st_cltv);
+    int sb  = add_node(f, NODE_STATE,   set_b, 2,       kb, 0,  2, leaf_st_cltv);
+    int sc  = add_node(f, NODE_STATE,   set_c, 2,       kc, 0,  2, leaf_st_cltv);
+    int sd  = add_node(f, NODE_STATE,   set_d, 2,       kd, 0,  2, leaf_st_cltv);
+
+    if (kr < 0 || sr < 0 || kl < 0 || kri < 0 || sl < 0 || sri < 0 ||
+        ka < 0 || kb < 0 || kc < 0 || kd < 0 ||
+        sa < 0 || sb < 0 || sc < 0 || sd < 0)
+        return 0;
+
+    /* Record leaf node indices: A=0, B=1, C=2, D=3 */
+    f->leaf_node_indices[0] = (size_t)sa;
+    f->leaf_node_indices[1] = (size_t)sb;
+    f->leaf_node_indices[2] = (size_t)sc;
+    f->leaf_node_indices[3] = (size_t)sd;
+
+    /* ---- Outputs and amounts ---- */
+    uint64_t fee = f->fee_per_tx;
+
+    /* Level 0 amounts */
+    uint64_t kr_out = f->funding_amount_sats - fee;
+    uint64_t sr_per_child = (kr_out - fee) / 2;
+
+    /* Level 1 amounts */
+    uint64_t kl_out = sr_per_child - fee;
+    uint64_t kri_out = sr_per_child - fee;
+    uint64_t sl_per_child = (kl_out - fee) / 2;
+    uint64_t sri_per_child = (kri_out - fee) / 2;
+
+    /* Level 2 amounts */
+    uint64_t ka_out = sl_per_child - fee;
+    uint64_t kb_out = sl_per_child - fee;
+    uint64_t kc_out = sri_per_child - fee;
+    uint64_t kd_out = sri_per_child - fee;
+
+    /* kickoff_root → state_root */
+    f->nodes[kr].n_outputs = 1;
+    f->nodes[kr].outputs[0].amount_sats = kr_out;
+    memcpy(f->nodes[kr].outputs[0].script_pubkey, f->nodes[sr].spending_spk, 34);
+    f->nodes[kr].outputs[0].script_pubkey_len = 34;
+    f->nodes[kr].input_amount = f->funding_amount_sats;
+
+    /* state_root → kickoff_left, kickoff_right */
+    f->nodes[sr].n_outputs = 2;
+    f->nodes[sr].outputs[0].amount_sats = sr_per_child;
+    memcpy(f->nodes[sr].outputs[0].script_pubkey, f->nodes[kl].spending_spk, 34);
+    f->nodes[sr].outputs[0].script_pubkey_len = 34;
+    f->nodes[sr].outputs[1].amount_sats = sr_per_child;
+    memcpy(f->nodes[sr].outputs[1].script_pubkey, f->nodes[kri].spending_spk, 34);
+    f->nodes[sr].outputs[1].script_pubkey_len = 34;
+    f->nodes[sr].input_amount = kr_out;
+
+    /* kickoff_left → state_left */
+    f->nodes[kl].n_outputs = 1;
+    f->nodes[kl].outputs[0].amount_sats = kl_out;
+    memcpy(f->nodes[kl].outputs[0].script_pubkey, f->nodes[sl].spending_spk, 34);
+    f->nodes[kl].outputs[0].script_pubkey_len = 34;
+    f->nodes[kl].input_amount = sr_per_child;
+
+    /* kickoff_right → state_right */
+    f->nodes[kri].n_outputs = 1;
+    f->nodes[kri].outputs[0].amount_sats = kri_out;
+    memcpy(f->nodes[kri].outputs[0].script_pubkey, f->nodes[sri].spending_spk, 34);
+    f->nodes[kri].outputs[0].script_pubkey_len = 34;
+    f->nodes[kri].input_amount = sr_per_child;
+
+    /* state_left → 2 child outputs: kickoff_A, kickoff_B */
+    f->nodes[sl].n_outputs = 2;
+    f->nodes[sl].outputs[0].amount_sats = sl_per_child;
+    memcpy(f->nodes[sl].outputs[0].script_pubkey, f->nodes[ka].spending_spk, 34);
+    f->nodes[sl].outputs[0].script_pubkey_len = 34;
+    f->nodes[sl].outputs[1].amount_sats = sl_per_child;
+    memcpy(f->nodes[sl].outputs[1].script_pubkey, f->nodes[kb].spending_spk, 34);
+    f->nodes[sl].outputs[1].script_pubkey_len = 34;
+    f->nodes[sl].input_amount = kl_out;
+
+    /* state_right → 2 child outputs: kickoff_C, kickoff_D */
+    f->nodes[sri].n_outputs = 2;
+    f->nodes[sri].outputs[0].amount_sats = sri_per_child;
+    memcpy(f->nodes[sri].outputs[0].script_pubkey, f->nodes[kc].spending_spk, 34);
+    f->nodes[sri].outputs[0].script_pubkey_len = 34;
+    f->nodes[sri].outputs[1].amount_sats = sri_per_child;
+    memcpy(f->nodes[sri].outputs[1].script_pubkey, f->nodes[kd].spending_spk, 34);
+    f->nodes[sri].outputs[1].script_pubkey_len = 34;
+    f->nodes[sri].input_amount = kri_out;
+
+    /* Per-client kickoff → state nodes.
+       Left-side (A,B) parents are state_left → input_amount = sl_per_child.
+       Right-side (C,D) parents are state_right → input_amount = sri_per_child. */
+    struct { int ko; int st; uint64_t ko_out; uint64_t parent_per_child; } leaf_pairs[] = {
+        { ka, sa, ka_out, sl_per_child },
+        { kb, sb, kb_out, sl_per_child },
+        { kc, sc, kc_out, sri_per_child },
+        { kd, sd, kd_out, sri_per_child },
+    };
+    uint32_t client_indices[] = { 1, 2, 3, 4 };
+
+    for (int i = 0; i < 4; i++) {
+        int ko = leaf_pairs[i].ko;
+        int st = leaf_pairs[i].st;
+        uint64_t ko_out = leaf_pairs[i].ko_out;
+
+        f->nodes[ko].n_outputs = 1;
+        f->nodes[ko].outputs[0].amount_sats = ko_out;
+        memcpy(f->nodes[ko].outputs[0].script_pubkey, f->nodes[st].spending_spk, 34);
+        f->nodes[ko].outputs[0].script_pubkey_len = 34;
+        f->nodes[ko].input_amount = leaf_pairs[i].parent_per_child;
+
+        f->nodes[st].input_amount = ko_out;
+        if (!setup_single_leaf_outputs(f, &f->nodes[st], client_indices[i], ko_out))
+            return 0;
+    }
+
+    /* ---- Build unsigned txs top-down ---- */
+    return build_all_unsigned_txs(f);
+}
+
+int factory_build_tree(factory_t *f) {
+    if (f->n_participants != 5) return 0;  /* 4 clients + 1 LSP */
+
+    /* Override fee_per_tx from fee estimator if available */
+    if (f->fee) {
+        f->fee_per_tx = fee_for_factory_tx(f->fee, 3);
+    }
+
+    if (f->leaf_arity == FACTORY_ARITY_1)
+        return factory_build_tree_arity1(f);
+    return factory_build_tree_arity2(f);
 }
 
 /* --- Split-round signing API --- */
@@ -676,8 +918,8 @@ int factory_reset_epoch(factory_t *f) {
     dw_counter_reset(&f->counter);
 
     /* Reset per-leaf layers too */
-    dw_layer_init(&f->leaf_layers[0], f->step_blocks, f->states_per_layer);
-    dw_layer_init(&f->leaf_layers[1], f->step_blocks, f->states_per_layer);
+    for (int i = 0; i < f->n_leaf_nodes; i++)
+        dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
     f->per_leaf_enabled = 0;
 
     if (!update_l_stock_outputs(f))
@@ -810,7 +1052,8 @@ fail:
     return 0;
 }
 
-/* Update L-stock output for a specific leaf node after per-leaf advance. */
+/* Update L-stock output for a specific leaf node after per-leaf advance.
+   L-stock is always the last output. */
 static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
     if (!f->has_shachain)
         return 1;  /* nothing to update */
@@ -818,25 +1061,25 @@ static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
     factory_node_t *node = &f->nodes[node_idx];
     if (node->type != NODE_STATE || node->n_children > 0)
         return 1;  /* not a leaf */
-    if (node->n_outputs < 3)
+    if (node->n_outputs < 2)
         return 1;
 
-    return build_l_stock_spk(f, node->outputs[2].script_pubkey);
+    return build_l_stock_spk(f, node->outputs[node->n_outputs - 1].script_pubkey);
 }
 
 int factory_advance_leaf(factory_t *f, int leaf_side) {
-    if (leaf_side < 0 || leaf_side > 1) return 0;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
 
     f->per_leaf_enabled = 1;
 
     /* Advance per-leaf counter */
     if (!dw_advance(&f->leaf_layers[leaf_side])) {
-        /* Leaf exhausted — advance root, reset both leaves */
+        /* Leaf exhausted — advance root layer, reset all leaf layers */
         if (!dw_advance(&f->counter.layers[0]))
             return 0;  /* fully exhausted */
         f->counter.current_epoch++;
-        dw_layer_init(&f->leaf_layers[0], f->step_blocks, f->states_per_layer);
-        dw_layer_init(&f->leaf_layers[1], f->step_blocks, f->states_per_layer);
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
         /* Full rebuild needed when root advances */
         if (!update_l_stock_outputs(f)) return 0;
         if (!build_all_unsigned_txs(f)) return 0;
@@ -844,10 +1087,81 @@ int factory_advance_leaf(factory_t *f, int leaf_side) {
     }
 
     /* Only rebuild + re-sign the leaf node */
-    size_t node_idx = (leaf_side == 0) ? 4 : 5;
+    size_t node_idx = f->leaf_node_indices[leaf_side];
     if (!update_l_stock_for_leaf(f, node_idx)) return 0;
     if (!rebuild_node_tx(f, node_idx)) return 0;
     return factory_sign_node(f, node_idx);
+}
+
+int factory_advance_leaf_unsigned(factory_t *f, int leaf_side) {
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    f->per_leaf_enabled = 1;
+
+    /* Advance per-leaf counter */
+    if (!dw_advance(&f->leaf_layers[leaf_side])) {
+        /* Leaf exhausted — advance root layer, reset all leaf layers */
+        if (!dw_advance(&f->counter.layers[0]))
+            return 0;  /* fully exhausted */
+        f->counter.current_epoch++;
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            dw_layer_init(&f->leaf_layers[i], f->step_blocks, f->states_per_layer);
+        /* Full rebuild needed when root advances */
+        if (!update_l_stock_outputs(f)) return 0;
+        if (!build_all_unsigned_txs(f)) return 0;
+        return -1;  /* caller must do full re-sign */
+    }
+
+    /* Only rebuild the leaf node (no signing) */
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    if (!update_l_stock_for_leaf(f, node_idx)) return 0;
+    if (!rebuild_node_tx(f, node_idx)) return 0;
+    return 1;
+}
+
+/* --- Per-node split-round signing helpers --- */
+
+int factory_session_init_node(factory_t *f, size_t node_idx) {
+    if (node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->is_built) return 0;
+    musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+    node->partial_sigs_received = 0;
+    return 1;
+}
+
+int factory_session_finalize_node(factory_t *f, size_t node_idx) {
+    if (node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+
+    unsigned char sighash[32];
+    if (!compute_node_sighash(f, node, sighash))
+        return 0;
+
+    const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+    return musig_session_finalize_nonces(f->ctx, &node->signing_session,
+                                          sighash, mr, NULL);
+}
+
+int factory_session_complete_node(factory_t *f, size_t node_idx) {
+    if (node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+
+    if (node->partial_sigs_received != (int)node->n_signers)
+        return 0;
+
+    unsigned char sig[64];
+    if (!musig_aggregate_partial_sigs(f->ctx, sig, &node->signing_session,
+                                       node->partial_sigs, node->n_signers))
+        return 0;
+
+    if (!finalize_signed_tx(&node->signed_tx,
+                             node->unsigned_tx.data, node->unsigned_tx.len,
+                             sig))
+        return 0;
+
+    node->is_signed = 1;
+    return 1;
 }
 
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {

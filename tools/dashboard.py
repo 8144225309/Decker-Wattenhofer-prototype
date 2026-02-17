@@ -605,19 +605,16 @@ function rFactory(D){
    // ASCII tree
    const nm=n=>{const sc=n.is_signed?'color:#3fb950':'color:#484f58';const tp=n.type==='kickoff'?'K':'S';return`<span style="${sc};font-weight:700">[${tp}${n.node_index}]</span>`;};
    const nd=n=>{const sc=n.is_signed?'border-color:#3fb950':'border-color:#484f58';return`<div style="display:inline-block;border:1px solid #30363d;${sc};border-radius:4px;padding:4px 8px;margin:2px;font-size:11px;min-width:140px;vertical-align:top"><div style="font-weight:700;margin-bottom:2px">${nm(n)} ${n.type}</div><div class="kv" style="gap:2px 10px"><div class="ki"><span class="k">signers</span><span class="v" style="font-size:10px">[${n.signer_indices}]</span></div><div class="ki"><span class="k">amt</span><span class="v" style="font-size:10px">${n.output_amounts}</span></div><div class="ki"><span class="k">seq</span><span class="v" style="font-size:10px">${n.nsequence===4294967295?'final':n.nsequence}</span></div><div class="ki"><span class="k">txid</span><span class="v h" style="font-size:9px">${th(n.txid)}</span></div></div>${n.is_signed?'<span class="b ok" style="margin-top:3px;display:inline-block">signed</span>':'<span class="b dn" style="margin-top:3px;display:inline-block">unsigned</span>'}</div>`;};
-   // Build tree layout by layers: root(0) -> child(1) -> [left(2), right(3)] -> [left-child(4), right-child(5)]
+   // Build tree layout by BFS layers — works for any depth (arity-1: 14 nodes, arity-2: 6 nodes)
    h+=`<div style="text-align:center;overflow-x:auto;padding:8px">`;
-   // Layer 0: root node (index 0)
-   const r0=nodes.find(n=>n.parent_index===-1||n.parent_index===null);
-   if(r0)h+=`<div>${nd(r0)}</div><div style="color:#30363d;font-size:16px">\u2502</div>`;
-   // Layer 1: first child (index 1, parent=0)
-   const l1=nodes.filter(n=>n.parent_index===0);
-   if(l1.length){h+=`<div>${l1.map(n=>nd(n)).join('')}</div>`;if(nodes.length>2)h+=`<div style="color:#30363d;font-size:16px">\u250C\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2534\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2510</div>`;}
-   // Layer 2: children of layer 1
-   const l2=nodes.filter(n=>l1.some(p=>p.node_index===n.parent_index));
-   if(l2.length){h+=`<div>${l2.map(n=>nd(n)).join('')}</div>`;
-   const l3=nodes.filter(n=>l2.some(p=>p.node_index===n.parent_index));
-   if(l3.length){h+=`<div style="color:#30363d;font-size:16px">\u2502${'&nbsp;'.repeat(16)}\u2502</div>`;h+=`<div>${l3.map(n=>nd(n)).join('')}</div>`;}}
+   let curLayer=nodes.filter(n=>n.parent_index===-1||n.parent_index===null);
+   while(curLayer.length){
+    h+=`<div style="display:flex;justify-content:center;flex-wrap:wrap;gap:4px">${curLayer.map(n=>nd(n)).join('')}</div>`;
+    const curIdx=new Set(curLayer.map(n=>n.node_index));
+    const nextLayer=nodes.filter(n=>curIdx.has(n.parent_index));
+    if(nextLayer.length)h+=`<div style="color:#30363d;font-size:14px">${'\u2502'.repeat(Math.min(nextLayer.length,curLayer.length))}</div>`;
+    curLayer=nextLayer;
+   }
    h+=`</div>`;
   }
   // Detail table

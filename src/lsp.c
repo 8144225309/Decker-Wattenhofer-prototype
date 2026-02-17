@@ -130,8 +130,11 @@ int lsp_run_factory_creation(lsp_t *lsp,
     /* LSP has its own keypair, but we need to use the split-round API.
        Initialize from pubkeys, then we'll use factory_sessions_* */
     factory_t *f = &lsp->factory;
+    factory_arity_t saved_arity = f->leaf_arity;
     factory_init_from_pubkeys(f, lsp->ctx, all_pubkeys, n_total,
                               step_blocks, states_per_layer);
+    if (saved_arity == FACTORY_ARITY_1)
+        factory_set_arity(f, FACTORY_ARITY_1);
     f->cltv_timeout = cltv_timeout;  /* set BEFORE build_tree for staggered taptrees */
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                         funding_spk, funding_spk_len);

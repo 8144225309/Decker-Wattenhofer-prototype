@@ -453,6 +453,7 @@ cJSON *wire_build_factory_propose(const factory_t *f) {
     cJSON_AddNumberToObject(j, "states_per_layer", f->states_per_layer);
     cJSON_AddNumberToObject(j, "cltv_timeout", f->cltv_timeout);
     cJSON_AddNumberToObject(j, "fee_per_tx", (double)f->fee_per_tx);
+    cJSON_AddNumberToObject(j, "leaf_arity", (double)f->leaf_arity);
     return j;
 }
 
@@ -1278,6 +1279,54 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
     *target_factory_id = (uint32_t)tf->valuedouble;
     *local_balance = (uint64_t)lb->valuedouble;
     *remote_balance = (uint64_t)rb->valuedouble;
+    return 1;
+}
+
+/* --- Per-Leaf Advance messages (Upgrade 2) --- */
+
+cJSON *wire_build_leaf_advance_propose(int leaf_side,
+                                        const unsigned char *pubnonce66) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    return j;
+}
+
+int wire_parse_leaf_advance_propose(const cJSON *json, int *leaf_side,
+                                      unsigned char *pubnonce66) {
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    if (!ls || !cJSON_IsNumber(ls)) return 0;
+    *leaf_side = (int)ls->valuedouble;
+    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    return 1;
+}
+
+cJSON *wire_build_leaf_advance_psig(const unsigned char *pubnonce66,
+                                      const unsigned char *partial_sig32) {
+    cJSON *j = cJSON_CreateObject();
+    wire_json_add_hex(j, "pubnonce", pubnonce66, 66);
+    wire_json_add_hex(j, "partial_sig", partial_sig32, 32);
+    return j;
+}
+
+int wire_parse_leaf_advance_psig(const cJSON *json,
+                                    unsigned char *pubnonce66,
+                                    unsigned char *partial_sig32) {
+    if (wire_json_get_hex(json, "pubnonce", pubnonce66, 66) != 66) return 0;
+    if (wire_json_get_hex(json, "partial_sig", partial_sig32, 32) != 32) return 0;
+    return 1;
+}
+
+cJSON *wire_build_leaf_advance_done(int leaf_side) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "leaf_side", leaf_side);
+    return j;
+}
+
+int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side) {
+    cJSON *ls = cJSON_GetObjectItem(json, "leaf_side");
+    if (!ls || !cJSON_IsNumber(ls)) return 0;
+    *leaf_side = (int)ls->valuedouble;
     return 1;
 }
 

@@ -432,6 +432,28 @@ int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
                              uint32_t *target_factory_id,
                              uint64_t *local_balance, uint64_t *remote_balance);
 
+/* --- Per-Leaf Advance message builders (Upgrade 2) --- */
+
+/* LSP -> Client: LEAF_ADVANCE_PROPOSE {leaf_side, pubnonce} */
+cJSON *wire_build_leaf_advance_propose(int leaf_side,
+                                        const unsigned char *pubnonce66);
+
+int wire_parse_leaf_advance_propose(const cJSON *json, int *leaf_side,
+                                      unsigned char *pubnonce66);
+
+/* Client -> LSP: LEAF_ADVANCE_PSIG {pubnonce, partial_sig} */
+cJSON *wire_build_leaf_advance_psig(const unsigned char *pubnonce66,
+                                      const unsigned char *partial_sig32);
+
+int wire_parse_leaf_advance_psig(const cJSON *json,
+                                    unsigned char *pubnonce66,
+                                    unsigned char *partial_sig32);
+
+/* LSP -> All: LEAF_ADVANCE_DONE {leaf_side} */
+cJSON *wire_build_leaf_advance_done(int leaf_side);
+
+int wire_parse_leaf_advance_done(const cJSON *json, int *leaf_side);
+
 /* --- Bundle parsing --- */
 
 /* Parse a nonce or psig bundle array from JSON. Returns count, fills entries[]. */

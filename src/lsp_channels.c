@@ -6,6 +6,7 @@
 #include "superscalar/ladder.h"
 #include "superscalar/regtest.h"
 #include "superscalar/adaptor.h"
+#include "superscalar/musig.h"
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
@@ -65,15 +66,24 @@ static void lsp_send_revocation(lsp_channel_mgr_t *mgr, lsp_t *lsp,
  *   client 3 (D): node[5].txid, vout=1
  */
 
-/* Map client index (0-based) to factory state node and vout */
-static void client_to_leaf(size_t client_idx, size_t *node_idx_out,
-                            uint32_t *vout_out) {
-    if (client_idx < 2) {
-        *node_idx_out = 4;  /* state_left */
-        *vout_out = (uint32_t)client_idx;
+/* Map client index (0-based) to factory state node and vout.
+   Uses factory's leaf_node_indices[] for arity-agnostic lookup. */
+static void client_to_leaf(size_t client_idx, const factory_t *factory,
+                            size_t *node_idx_out, uint32_t *vout_out) {
+    if (factory->leaf_arity == FACTORY_ARITY_1) {
+        /* Arity-1: each client has its own leaf node, channel at vout 0 */
+        *node_idx_out = (client_idx < (size_t)factory->n_leaf_nodes)
+            ? factory->leaf_node_indices[client_idx] : 0;
+        *vout_out = 0;
     } else {
-        *node_idx_out = 5;  /* state_right */
-        *vout_out = (uint32_t)(client_idx - 2);
+        /* Arity-2: 2 clients share a leaf node */
+        if (client_idx < 2) {
+            *node_idx_out = factory->leaf_node_indices[0];
+            *vout_out = (uint32_t)client_idx;
+        } else {
+            *node_idx_out = factory->leaf_node_indices[1];
+            *vout_out = (uint32_t)(client_idx - 2);
+        }
     }
 }
 
@@ -83,7 +93,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
                        const unsigned char *lsp_seckey32,
                        size_t n_clients) {
     if (!mgr || !ctx || !factory || !lsp_seckey32) return 0;
-    if (n_clients > LSP_MAX_CLIENTS || n_clients != 4) return 0;
+    if (n_clients == 0 || n_clients > LSP_MAX_CLIENTS) return 0;
 
     memset(mgr, 0, sizeof(*mgr));
     mgr->ctx = ctx;
@@ -92,6 +102,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
     mgr->n_invoices = 0;
     mgr->n_htlc_origins = 0;
     mgr->next_request_id = 1;
+    mgr->leaf_arity = factory->leaf_arity;
 
     for (size_t c = 0; c < n_clients; c++) {
         lsp_channel_entry_t *entry = &mgr->entries[c];
@@ -103,7 +114,7 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         /* Find leaf output for this client */
         size_t node_idx;
         uint32_t vout;
-        client_to_leaf(c, &node_idx, &vout);
+        client_to_leaf(c, factory, &node_idx, &vout);
 
         const factory_node_t *state_node = &factory->nodes[node_idx];
         if (vout >= state_node->n_outputs) return 0;
@@ -533,6 +544,178 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
     return 1;
 }
 
+/* --- Per-leaf DW advance (arity-1 split-round signing) --- */
+
+/* Advance one leaf's DW counter, do split-round signing with the affected
+   client, and notify all clients. Only operates in arity-1 mode.
+   leaf_side: 0..n_leaf_nodes-1 (same as client index for arity-1).
+   Returns 1 on success, 0 on failure or skip. */
+static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
+    factory_t *f = &lsp->factory;
+
+    /* Only advance for arity-1 (each leaf = 1 client, 2-of-2 signing) */
+    if (f->leaf_arity != FACTORY_ARITY_1) return 1;
+    if (leaf_side < 0 || leaf_side >= f->n_leaf_nodes) return 0;
+
+    /* Step 1: Advance DW counter + rebuild unsigned tx */
+    int rc = factory_advance_leaf_unsigned(f, leaf_side);
+    if (rc == 0) {
+        fprintf(stderr, "LSP: leaf %d DW fully exhausted\n", leaf_side);
+        return 0;
+    }
+    if (rc == -1) {
+        /* Root advanced + full rebuild needed — too complex for per-leaf flow.
+           This is rare and should trigger an epoch reset instead. */
+        printf("LSP: leaf %d exhausted, root advanced — skipping per-leaf signing\n",
+               leaf_side);
+        return 1;
+    }
+
+    size_t node_idx = f->leaf_node_indices[leaf_side];
+    uint32_t client_participant = (uint32_t)(leaf_side + 1);
+
+    /* Step 2: Init signing session for the leaf node */
+    if (!factory_session_init_node(f, node_idx)) {
+        fprintf(stderr, "LSP: session init failed for leaf node %zu\n", node_idx);
+        return 0;
+    }
+
+    /* Step 3: Generate LSP's nonce (participant 0) */
+    int lsp_slot = factory_find_signer_slot(f, node_idx, 0);
+    if (lsp_slot < 0) {
+        fprintf(stderr, "LSP: LSP not signer on leaf node %zu\n", node_idx);
+        return 0;
+    }
+
+    unsigned char lsp_seckey[32];
+    secp256k1_keypair_sec(lsp->ctx, lsp_seckey, &lsp->lsp_keypair);
+
+    secp256k1_musig_secnonce lsp_secnonce;
+    secp256k1_musig_pubnonce lsp_pubnonce;
+    if (!musig_generate_nonce(lsp->ctx, &lsp_secnonce, &lsp_pubnonce,
+                               lsp_seckey, &lsp->lsp_pubkey,
+                               &f->nodes[node_idx].keyagg.cache)) {
+        memset(lsp_seckey, 0, 32);
+        fprintf(stderr, "LSP: nonce gen failed for leaf advance\n");
+        return 0;
+    }
+
+    if (!factory_session_set_nonce(f, node_idx, (size_t)lsp_slot, &lsp_pubnonce)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Step 4: Send LEAF_ADVANCE_PROPOSE to the affected client */
+    unsigned char lsp_pubnonce_ser[66];
+    musig_pubnonce_serialize(lsp->ctx, lsp_pubnonce_ser, &lsp_pubnonce);
+    cJSON *propose = wire_build_leaf_advance_propose(leaf_side, lsp_pubnonce_ser);
+    if (!wire_send(lsp->client_fds[leaf_side], MSG_LEAF_ADVANCE_PROPOSE, propose)) {
+        cJSON_Delete(propose);
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+    cJSON_Delete(propose);
+
+    /* Step 5: Wait for LEAF_ADVANCE_PSIG from client */
+    wire_msg_t psig_msg;
+    if (!wire_recv(lsp->client_fds[leaf_side], &psig_msg) ||
+        psig_msg.msg_type != MSG_LEAF_ADVANCE_PSIG) {
+        fprintf(stderr, "LSP: expected LEAF_ADVANCE_PSIG from client %d, got 0x%02x\n",
+                leaf_side, psig_msg.msg_type);
+        if (psig_msg.json) cJSON_Delete(psig_msg.json);
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    unsigned char client_pubnonce_ser[66], client_psig_ser[32];
+    if (!wire_parse_leaf_advance_psig(psig_msg.json,
+                                        client_pubnonce_ser, client_psig_ser)) {
+        fprintf(stderr, "LSP: failed to parse LEAF_ADVANCE_PSIG\n");
+        cJSON_Delete(psig_msg.json);
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+    cJSON_Delete(psig_msg.json);
+
+    /* Step 6: Set client's nonce + finalize */
+    int client_slot = factory_find_signer_slot(f, node_idx, client_participant);
+    if (client_slot < 0) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    secp256k1_musig_pubnonce client_pubnonce;
+    if (!musig_pubnonce_parse(lsp->ctx, &client_pubnonce, client_pubnonce_ser)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    if (!factory_session_set_nonce(f, node_idx, (size_t)client_slot, &client_pubnonce)) {
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    if (!factory_session_finalize_node(f, node_idx)) {
+        fprintf(stderr, "LSP: session finalize failed for leaf node %zu\n", node_idx);
+        memset(lsp_seckey, 0, 32);
+        return 0;
+    }
+
+    /* Step 7: Create LSP's partial sig */
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(lsp->ctx, &lsp_kp, lsp_seckey);
+    memset(lsp_seckey, 0, 32);
+
+    secp256k1_musig_partial_sig lsp_psig;
+    if (!musig_create_partial_sig(lsp->ctx, &lsp_psig, &lsp_secnonce, &lsp_kp,
+                                    &f->nodes[node_idx].signing_session)) {
+        fprintf(stderr, "LSP: partial sig failed for leaf advance\n");
+        return 0;
+    }
+
+    if (!factory_session_set_partial_sig(f, node_idx, (size_t)lsp_slot, &lsp_psig))
+        return 0;
+
+    /* Step 8: Set client's partial sig */
+    secp256k1_musig_partial_sig client_psig;
+    if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_ser))
+        return 0;
+
+    if (!factory_session_set_partial_sig(f, node_idx, (size_t)client_slot, &client_psig))
+        return 0;
+
+    /* Step 9: Aggregate + finalize */
+    if (!factory_session_complete_node(f, node_idx)) {
+        fprintf(stderr, "LSP: session complete failed for leaf node %zu\n", node_idx);
+        return 0;
+    }
+
+    /* Step 10: Send LEAF_ADVANCE_DONE to all clients */
+    cJSON *done = wire_build_leaf_advance_done(leaf_side);
+    for (size_t i = 0; i < lsp->n_clients; i++) {
+        wire_send(lsp->client_fds[i], MSG_LEAF_ADVANCE_DONE, done);
+    }
+    cJSON_Delete(done);
+
+    /* Step 11: Persist per-leaf DW state */
+    if (mgr->persist) {
+        uint32_t leaf_states[8];
+        for (int i = 0; i < f->n_leaf_nodes; i++)
+            leaf_states[i] = f->leaf_layers[i].current_state;
+        uint32_t layer_states[DW_MAX_LAYERS];
+        for (uint32_t i = 0; i < f->counter.n_layers; i++)
+            layer_states[i] = f->counter.layers[i].config.max_states;
+        persist_save_dw_counter_with_leaves(
+            (persist_t *)mgr->persist, 0, f->counter.current_epoch,
+            f->counter.n_layers, layer_states,
+            f->per_leaf_enabled, leaf_states, f->n_leaf_nodes);
+    }
+
+    printf("LSP: leaf %d advanced (node %zu), DW state %u\n",
+           leaf_side, node_idx, f->leaf_layers[leaf_side].current_state);
+    return 1;
+}
+
 /* Handle FULFILL_HTLC from a client (the payee reveals the preimage). */
 static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                  size_t client_idx, const cJSON *json) {
@@ -627,6 +810,7 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 1;
     }
 
+    int sender_found = -1;
     for (size_t s = 0; s < mgr->n_channels; s++) {
         if (s == client_idx) continue;
         channel_t *sender_ch = &mgr->entries[s].channel;
@@ -695,8 +879,20 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
             printf("LSP: HTLC fulfilled: client %zu -> client %zu (%llu sats)\n",
                    s, client_idx, (unsigned long long)htlc->amount_sats);
+            sender_found = (int)s;
             break;
         }
+    }
+
+    /* Per-leaf DW advance: after payment settles, advance both affected leaves.
+       This is the arity-1 killer feature — only the involved clients' leaves
+       need to be re-signed, not the entire tree. */
+    if (lsp->factory.leaf_arity == FACTORY_ARITY_1) {
+        /* Advance payee's leaf */
+        lsp_advance_leaf(mgr, lsp, (int)client_idx);
+        /* Advance sender's leaf (if found via intra-factory routing) */
+        if (sender_found >= 0 && sender_found != (int)client_idx)
+            lsp_advance_leaf(mgr, lsp, sender_found);
     }
 
     return 1;
@@ -1558,8 +1754,12 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     printf("LSP rotate: funded %llu sats, txid: %s, vout=%u\n",
            (unsigned long long)fund_amount, fund_txid_hex, fund_vout);
 
-    /* Free old factory */
+    /* Free old factory, but preserve arity for new factory */
+    factory_arity_t saved_arity = (factory_arity_t)mgr->rot_leaf_arity;
     factory_free(&lsp->factory);
+    /* Restore arity on the zeroed struct so lsp_run_factory_creation's
+       saved_arity = f->leaf_arity picks it up correctly. */
+    lsp->factory.leaf_arity = saved_arity;
 
     /* Compute cltv_timeout for new factory */
     uint32_t new_cltv = 0;
@@ -1642,6 +1842,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     memcpy(saved_mine_addr, mgr->rot_mine_addr, 128);
     uint16_t saved_step_blocks = mgr->rot_step_blocks;
     uint32_t saved_spl = mgr->rot_states_per_layer;
+    int saved_leaf_arity = mgr->rot_leaf_arity;
     int saved_is_regtest = mgr->rot_is_regtest;
     uint64_t saved_funding_sats = mgr->rot_funding_sats;
     int saved_auto_rotate = mgr->rot_auto_rotate;
@@ -1668,6 +1869,7 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     memcpy(mgr->rot_mine_addr, saved_mine_addr, 128);
     mgr->rot_step_blocks = saved_step_blocks;
     mgr->rot_states_per_layer = saved_spl;
+    mgr->rot_leaf_arity = saved_leaf_arity;
     mgr->rot_is_regtest = saved_is_regtest;
     mgr->rot_funding_sats = saved_funding_sats;
     mgr->rot_auto_rotate = saved_auto_rotate;

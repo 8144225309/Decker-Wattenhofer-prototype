@@ -514,6 +514,7 @@ cmd_start_lsp() {
                 --port 9735 \
                 --clients 1 \
                 --amount 50000 \
+                --arity 1 \
                 --daemon \
                 --db "$LSPDB" \
                 --keyfile "$DATADIR/lsp.key" \

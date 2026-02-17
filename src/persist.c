@@ -24,6 +24,7 @@ static const char *SCHEMA_SQL =
     "  states_per_layer INTEGER,"
     "  cltv_timeout INTEGER,"
     "  fee_per_tx INTEGER,"
+    "  leaf_arity INTEGER DEFAULT 2,"
     "  state TEXT DEFAULT 'active',"
     "  created_at INTEGER DEFAULT (strftime('%%s','now'))"
     ");"
@@ -135,8 +136,8 @@ static const char *SCHEMA_SQL =
     "  n_layers INTEGER NOT NULL,"
     "  layer_states TEXT NOT NULL,"
     "  per_leaf_enabled INTEGER NOT NULL DEFAULT 0,"
-    "  leaf_left_state INTEGER NOT NULL DEFAULT 0,"
-    "  leaf_right_state INTEGER NOT NULL DEFAULT 0"
+    "  n_leaf_nodes INTEGER NOT NULL DEFAULT 2,"
+    "  leaf_states TEXT NOT NULL DEFAULT '0,0'"
     ");"
     "CREATE TABLE IF NOT EXISTS departed_clients ("
     "  factory_id INTEGER NOT NULL,"
@@ -285,8 +286,8 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     const char *sql =
         "INSERT OR REPLACE INTO factories "
         "(id, n_participants, funding_txid, funding_vout, funding_amount, "
-        " step_blocks, states_per_layer, cltv_timeout, fee_per_tx) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -301,6 +302,7 @@ int persist_save_factory(persist_t *p, const factory_t *f,
     sqlite3_bind_int(stmt, 7, (int)f->states_per_layer);
     sqlite3_bind_int(stmt, 8, (int)f->cltv_timeout);
     sqlite3_bind_int64(stmt, 9, (sqlite3_int64)f->fee_per_tx);
+    sqlite3_bind_int(stmt, 10, (int)f->leaf_arity);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -341,7 +343,7 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
 
     const char *sql =
         "SELECT n_participants, funding_txid, funding_vout, funding_amount, "
-        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx "
+        "step_blocks, states_per_layer, cltv_timeout, fee_per_tx, leaf_arity "
         "FROM factories WHERE id = ?;";
 
     sqlite3_stmt *stmt;
@@ -363,6 +365,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
     uint32_t states_per_layer = (uint32_t)sqlite3_column_int(stmt, 5);
     uint32_t cltv_timeout = (uint32_t)sqlite3_column_int(stmt, 6);
     uint64_t fee_per_tx = (uint64_t)sqlite3_column_int64(stmt, 7);
+    int leaf_arity = sqlite3_column_int(stmt, 8);
+    if (leaf_arity != 1) leaf_arity = 2;  /* default to arity-2 */
 
     unsigned char funding_txid[32];
     if (txid_hex)
@@ -433,6 +437,8 @@ int persist_load_factory(persist_t *p, uint32_t factory_id,
                                step_blocks, states_per_layer);
     f->cltv_timeout = cltv_timeout;
     f->fee_per_tx = fee_per_tx;
+    if (leaf_arity == 1)
+        factory_set_arity(f, FACTORY_ARITY_1);
 
     factory_set_funding(f, funding_txid, funding_vout, funding_amount,
                          fund_spk, 34);
@@ -1231,8 +1237,8 @@ int persist_save_dw_counter(persist_t *p, uint32_t factory_id,
     const char *sql =
         "INSERT OR REPLACE INTO dw_counter_state "
         "(factory_id, current_epoch, n_layers, layer_states, "
-        " per_leaf_enabled, leaf_left_state, leaf_right_state) "
-        "VALUES (?, ?, ?, ?, 0, 0, 0);";
+        " per_leaf_enabled, n_leaf_nodes, leaf_states) "
+        "VALUES (?, ?, ?, ?, 0, 2, '0,0');";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -1252,9 +1258,10 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
                                          uint32_t current_epoch, uint32_t n_layers,
                                          const uint32_t *layer_states,
                                          int per_leaf_enabled,
-                                         uint32_t leaf_left_state,
-                                         uint32_t leaf_right_state) {
+                                         const uint32_t *leaf_states,
+                                         int n_leaf_nodes) {
     if (!p || !p->db || !layer_states || n_layers == 0) return 0;
+    if (per_leaf_enabled && (!leaf_states || n_leaf_nodes <= 0)) return 0;
 
     char buf[256];
     buf[0] = '\0';
@@ -1264,10 +1271,21 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
         strncat(buf, tmp, sizeof(buf) - strlen(buf) - 1);
     }
 
+    /* Build comma-separated leaf_states string */
+    char leaf_buf[256];
+    leaf_buf[0] = '\0';
+    int n_leaves = (per_leaf_enabled && leaf_states) ? n_leaf_nodes : 2;
+    for (int i = 0; i < n_leaves; i++) {
+        char tmp[16];
+        uint32_t val = (per_leaf_enabled && leaf_states) ? leaf_states[i] : 0;
+        snprintf(tmp, sizeof(tmp), "%s%u", i > 0 ? "," : "", val);
+        strncat(leaf_buf, tmp, sizeof(leaf_buf) - strlen(leaf_buf) - 1);
+    }
+
     const char *sql =
         "INSERT OR REPLACE INTO dw_counter_state "
         "(factory_id, current_epoch, n_layers, layer_states, "
-        " per_leaf_enabled, leaf_left_state, leaf_right_state) "
+        " per_leaf_enabled, n_leaf_nodes, leaf_states) "
         "VALUES (?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
@@ -1279,8 +1297,8 @@ int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
     sqlite3_bind_int(stmt, 3, (int)n_layers);
     sqlite3_bind_text(stmt, 4, buf, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(stmt, 5, per_leaf_enabled);
-    sqlite3_bind_int(stmt, 6, (int)leaf_left_state);
-    sqlite3_bind_int(stmt, 7, (int)leaf_right_state);
+    sqlite3_bind_int(stmt, 6, n_leaves);
+    sqlite3_bind_text(stmt, 7, leaf_buf, -1, SQLITE_TRANSIENT);
 
     int ok2 = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -1336,13 +1354,14 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
                                          uint32_t *epoch_out, uint32_t *n_layers_out,
                                          uint32_t *layer_states_out, size_t max_layers,
                                          int *per_leaf_enabled_out,
-                                         uint32_t *leaf_left_state_out,
-                                         uint32_t *leaf_right_state_out) {
+                                         uint32_t *leaf_states_out,
+                                         int *n_leaf_nodes_out,
+                                         size_t max_leaf_nodes) {
     if (!p || !p->db) return 0;
 
     const char *sql =
         "SELECT current_epoch, n_layers, layer_states, "
-        "per_leaf_enabled, leaf_left_state, leaf_right_state "
+        "per_leaf_enabled, n_leaf_nodes, leaf_states "
         "FROM dw_counter_state WHERE factory_id = ?;";
 
     sqlite3_stmt *stmt;
@@ -1378,10 +1397,24 @@ int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
 
     if (per_leaf_enabled_out)
         *per_leaf_enabled_out = sqlite3_column_int(stmt, 3);
-    if (leaf_left_state_out)
-        *leaf_left_state_out = (uint32_t)sqlite3_column_int(stmt, 4);
-    if (leaf_right_state_out)
-        *leaf_right_state_out = (uint32_t)sqlite3_column_int(stmt, 5);
+
+    int n_leaf = sqlite3_column_int(stmt, 4);
+    if (n_leaf_nodes_out)
+        *n_leaf_nodes_out = n_leaf;
+
+    const char *leaf_str = (const char *)sqlite3_column_text(stmt, 5);
+    if (leaf_states_out && leaf_str) {
+        char tmp[256];
+        strncpy(tmp, leaf_str, sizeof(tmp) - 1);
+        tmp[sizeof(tmp) - 1] = '\0';
+
+        char *tok = strtok(tmp, ",");
+        size_t idx = 0;
+        while (tok && idx < max_leaf_nodes && idx < (size_t)n_leaf) {
+            leaf_states_out[idx++] = (uint32_t)strtol(tok, NULL, 10);
+            tok = strtok(NULL, ",");
+        }
+    }
 
     sqlite3_finalize(stmt);
     return 1;
