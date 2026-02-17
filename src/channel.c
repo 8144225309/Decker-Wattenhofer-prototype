@@ -813,7 +813,7 @@ int channel_build_penalty_tx(const channel_t *ch,
        With anchor: ~195 vB (1-in, 2-out). Without: ~152 vB (1-in, 1-out). */
     int has_anchor = (anchor_spk && anchor_spk_len == 34);
     uint64_t vsize = has_anchor ? 195 : 152;
-    uint64_t anchor_amount = 330;
+    uint64_t anchor_amount = ANCHOR_OUTPUT_AMOUNT;
     uint64_t penalty_fee = (ch->fee_rate_sat_per_kvb * vsize + 999) / 1000;
     uint64_t deduction = penalty_fee + (has_anchor ? anchor_amount : 0);
     uint64_t penalty_amount = to_local_amount > deduction ? to_local_amount - deduction : 0;
@@ -1748,7 +1748,7 @@ int channel_build_htlc_penalty_tx(const channel_t *ch, tx_buf_t *penalty_tx_out,
     /* Fee: with anchor ~195 vB, without ~152 vB */
     int has_anchor = (anchor_spk && anchor_spk_len == 34);
     uint64_t vsize = has_anchor ? 195 : 152;
-    uint64_t anchor_amount = 330;
+    uint64_t anchor_amount = ANCHOR_OUTPUT_AMOUNT;
     uint64_t htlc_penalty_fee = (ch->fee_rate_sat_per_kvb * vsize + 999) / 1000;
     uint64_t deduction = htlc_penalty_fee + (has_anchor ? anchor_amount : 0);
     uint64_t penalty_amount = htlc_amount > deduction ? htlc_amount - deduction : 0;

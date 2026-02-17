@@ -464,9 +464,14 @@ int main(int argc, char *argv[]) {
                 return 1;
             }
         }
-    } else {
-        /* Deterministic default key for regtest */
+    } else if (is_regtest) {
+        /* Deterministic default key — regtest only */
         memset(lsp_seckey, 0x10, 32);
+    } else {
+        fprintf(stderr, "Error: --seckey or --keyfile required on %s\n", network);
+        fprintf(stderr, "  (deterministic default key is only allowed on regtest)\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
     }
 
     secp256k1_keypair lsp_kp;

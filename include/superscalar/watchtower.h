@@ -47,7 +47,7 @@ typedef struct {
 
 #define WATCHTOWER_MAX_CHANNELS 8
 #define WATCHTOWER_MAX_PENDING 16
-#define WATCHTOWER_ANCHOR_AMOUNT 330  /* sats */
+#define WATCHTOWER_ANCHOR_AMOUNT ANCHOR_OUTPUT_AMOUNT
 
 /* Pending penalty tx awaiting confirmation (for CPFP bump) */
 typedef struct {

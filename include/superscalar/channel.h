@@ -13,6 +13,7 @@
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 #define CHANNEL_MAX_SECRETS      256   /* max per-commitment secrets stored */
+#define ANCHOR_OUTPUT_AMOUNT     330   /* P2TR anchor for CPFP fee bumping (sats) */
 
 typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
 typedef enum { HTLC_STATE_ACTIVE, HTLC_STATE_FULFILLED, HTLC_STATE_FAILED } htlc_state_t;

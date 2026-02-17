@@ -1419,7 +1419,13 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
 
     tx_output_t rot_outputs[FACTORY_MAX_SIGNERS];
     uint64_t close_fee = fee_estimate(fe, 200);
-    if (close_fee == 0) close_fee = 500;
+    if (close_fee == 0) {
+        /* Floor: 1 sat/vB for 200 vB close tx */
+        close_fee = 200;
+        fprintf(stderr, "LSP rotate: WARNING: fee estimation returned 0, "
+                "using 1 sat/vB floor (%llu sats)\n",
+                (unsigned long long)close_fee);
+    }
     size_t n_close = lsp_channels_build_close_outputs(mgr, &lsp->factory,
                                                         rot_outputs, close_fee);
     if (n_close == 0) {
