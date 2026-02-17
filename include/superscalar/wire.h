@@ -66,6 +66,16 @@
 #define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
 #define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
 
+/* Cooperative Epoch Reset */
+#define MSG_EPOCH_RESET_PROPOSE 0x55  /* LSP -> All: propose epoch reset + nonces */
+#define MSG_EPOCH_RESET_PSIG    0x56  /* Client -> LSP: partial sigs for reset */
+#define MSG_EPOCH_RESET_DONE    0x57  /* LSP -> All: reset complete, new signed txs */
+
+/* Per-Leaf Advance */
+#define MSG_LEAF_ADVANCE_PROPOSE 0x58 /* LSP -> Subtree clients: advance leaf */
+#define MSG_LEAF_ADVANCE_PSIG    0x59 /* Client -> LSP: partial sig for leaf node */
+#define MSG_LEAF_ADVANCE_DONE    0x5A /* LSP -> Subtree clients: leaf advance complete */
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */

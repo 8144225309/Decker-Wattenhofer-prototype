@@ -91,10 +91,19 @@ static int build_single_p2tr_spk(
     return 1;
 }
 
-/* Get nSequence for a node based on its type and DW layer. */
+/* Get nSequence for a node based on its type and DW layer.
+   When per-leaf mode is enabled, leaf state nodes (dw_layer_index==1)
+   use their independent per-leaf DW layer instead of the global counter. */
 static uint32_t node_nsequence(const factory_t *f, const factory_node_t *node) {
     if (node->type == NODE_KICKOFF)
         return NSEQUENCE_DISABLE_BIP68;
+    if (f->per_leaf_enabled && node->dw_layer_index == 1) {
+        /* Node 4 = left (side 0), Node 5 = right (side 1) */
+        int node_idx = (int)(node - f->nodes);
+        int side = node_idx - 4;
+        if (side >= 0 && side < 2)
+            return dw_current_nsequence(&f->leaf_layers[side]);
+    }
     return dw_current_nsequence(&f->counter.layers[node->dw_layer_index]);
 }
 
@@ -365,6 +374,11 @@ void factory_init(factory_t *f, secp256k1_context *ctx,
 
     /* 2 DW layers: root state = layer 0, leaf states = layer 1 */
     dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
+
+    /* Per-leaf layers mirror global layer 1 initially */
+    dw_layer_init(&f->leaf_layers[0], step_blocks, states_per_layer);
+    dw_layer_init(&f->leaf_layers[1], step_blocks, states_per_layer);
+    f->per_leaf_enabled = 0;
 }
 
 void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
@@ -382,6 +396,10 @@ void factory_init_from_pubkeys(factory_t *f, secp256k1_context *ctx,
     /* keypairs left zeroed — signing requires split-round API */
 
     dw_counter_init(&f->counter, 2, step_blocks, states_per_layer);
+
+    dw_layer_init(&f->leaf_layers[0], step_blocks, states_per_layer);
+    dw_layer_init(&f->leaf_layers[1], step_blocks, states_per_layer);
+    f->per_leaf_enabled = 0;
 }
 
 void factory_set_funding(factory_t *f,
@@ -652,6 +670,184 @@ int factory_advance(factory_t *f) {
         return 0;
 
     return factory_sign_all(f);
+}
+
+int factory_reset_epoch(factory_t *f) {
+    dw_counter_reset(&f->counter);
+
+    /* Reset per-leaf layers too */
+    dw_layer_init(&f->leaf_layers[0], f->step_blocks, f->states_per_layer);
+    dw_layer_init(&f->leaf_layers[1], f->step_blocks, f->states_per_layer);
+    f->per_leaf_enabled = 0;
+
+    if (!update_l_stock_outputs(f))
+        return 0;
+    if (!build_all_unsigned_txs(f))
+        return 0;
+    return factory_sign_all(f);
+}
+
+/* Rebuild unsigned tx for a single node. */
+static int rebuild_node_tx(factory_t *f, size_t node_idx) {
+    if (node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    unsigned char display_txid[32];
+
+    const unsigned char *input_txid;
+    uint32_t input_vout;
+
+    if (node->parent_index < 0) {
+        input_txid = f->funding_txid;
+        input_vout = f->funding_vout;
+    } else {
+        factory_node_t *parent = &f->nodes[node->parent_index];
+        input_txid = parent->txid;
+        input_vout = node->parent_vout;
+    }
+
+    node->nsequence = node_nsequence(f, node);
+
+    if (!build_unsigned_tx(&node->unsigned_tx, display_txid,
+                           input_txid, input_vout,
+                           node->nsequence,
+                           node->outputs, node->n_outputs))
+        return 0;
+
+    memcpy(node->txid, display_txid, 32);
+    reverse_bytes(node->txid, 32);
+
+    node->is_built = 1;
+    node->is_signed = 0;
+    return 1;
+}
+
+/* Sign a single node (local-only, all keypairs available). */
+int factory_sign_node(factory_t *f, size_t node_idx) {
+    if (node_idx >= f->n_nodes) return 0;
+    factory_node_t *node = &f->nodes[node_idx];
+    if (!node->is_built) return 0;
+
+    /* Init session */
+    musig_session_init(&node->signing_session, &node->keyagg, node->n_signers);
+    node->partial_sigs_received = 0;
+
+    /* Allocate secnonces */
+    secp256k1_musig_secnonce *secnonces =
+        (secp256k1_musig_secnonce *)calloc(node->n_signers,
+                                            sizeof(secp256k1_musig_secnonce));
+    if (!secnonces) return 0;
+
+    /* Generate nonces */
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        unsigned char seckey[32];
+        secp256k1_pubkey pk;
+
+        if (!secp256k1_keypair_sec(f->ctx, seckey, &f->keypairs[participant]))
+            goto fail;
+        if (!secp256k1_keypair_pub(f->ctx, &pk, &f->keypairs[participant]))
+            goto fail;
+
+        secp256k1_musig_pubnonce pubnonce;
+        if (!musig_generate_nonce(f->ctx, &secnonces[j], &pubnonce,
+                                   seckey, &pk, &node->keyagg.cache))
+            goto fail;
+
+        memset(seckey, 0, 32);
+
+        if (!musig_session_set_pubnonce(&node->signing_session, j, &pubnonce))
+            goto fail;
+    }
+
+    /* Finalize nonces (sighash + aggregate + tweak) */
+    {
+        unsigned char sighash[32];
+        if (!compute_node_sighash(f, node, sighash))
+            goto fail;
+
+        const unsigned char *mr = node->has_taptree ? node->merkle_root : NULL;
+        if (!musig_session_finalize_nonces(f->ctx, &node->signing_session,
+                                            sighash, mr, NULL))
+            goto fail;
+    }
+
+    /* Create partial sigs */
+    for (size_t j = 0; j < node->n_signers; j++) {
+        uint32_t participant = node->signer_indices[j];
+        secp256k1_musig_partial_sig psig;
+
+        if (!musig_create_partial_sig(f->ctx, &psig,
+                                       &secnonces[j],
+                                       &f->keypairs[participant],
+                                       &node->signing_session))
+            goto fail;
+
+        node->partial_sigs[j] = psig;
+        node->partial_sigs_received++;
+    }
+
+    /* Aggregate + finalize */
+    {
+        unsigned char sig[64];
+        if (!musig_aggregate_partial_sigs(f->ctx, sig, &node->signing_session,
+                                           node->partial_sigs, node->n_signers))
+            goto fail;
+
+        if (!finalize_signed_tx(&node->signed_tx,
+                                 node->unsigned_tx.data, node->unsigned_tx.len,
+                                 sig))
+            goto fail;
+    }
+
+    node->is_signed = 1;
+    memset(secnonces, 0, node->n_signers * sizeof(secp256k1_musig_secnonce));
+    free(secnonces);
+    return 1;
+
+fail:
+    memset(secnonces, 0, node->n_signers * sizeof(secp256k1_musig_secnonce));
+    free(secnonces);
+    return 0;
+}
+
+/* Update L-stock output for a specific leaf node after per-leaf advance. */
+static int update_l_stock_for_leaf(factory_t *f, size_t node_idx) {
+    if (!f->has_shachain)
+        return 1;  /* nothing to update */
+
+    factory_node_t *node = &f->nodes[node_idx];
+    if (node->type != NODE_STATE || node->n_children > 0)
+        return 1;  /* not a leaf */
+    if (node->n_outputs < 3)
+        return 1;
+
+    return build_l_stock_spk(f, node->outputs[2].script_pubkey);
+}
+
+int factory_advance_leaf(factory_t *f, int leaf_side) {
+    if (leaf_side < 0 || leaf_side > 1) return 0;
+
+    f->per_leaf_enabled = 1;
+
+    /* Advance per-leaf counter */
+    if (!dw_advance(&f->leaf_layers[leaf_side])) {
+        /* Leaf exhausted — advance root, reset both leaves */
+        if (!dw_advance(&f->counter.layers[0]))
+            return 0;  /* fully exhausted */
+        f->counter.current_epoch++;
+        dw_layer_init(&f->leaf_layers[0], f->step_blocks, f->states_per_layer);
+        dw_layer_init(&f->leaf_layers[1], f->step_blocks, f->states_per_layer);
+        /* Full rebuild needed when root advances */
+        if (!update_l_stock_outputs(f)) return 0;
+        if (!build_all_unsigned_txs(f)) return 0;
+        return factory_sign_all(f);
+    }
+
+    /* Only rebuild + re-sign the leaf node */
+    size_t node_idx = (leaf_side == 0) ? 4 : 5;
+    if (!update_l_stock_for_leaf(f, node_idx)) return 0;
+    if (!rebuild_node_tx(f, node_idx)) return 0;
+    return factory_sign_node(f, node_idx);
 }
 
 void factory_set_shachain_seed(factory_t *f, const unsigned char *seed32) {

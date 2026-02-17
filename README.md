@@ -36,7 +36,7 @@ cmake .. && make -j$(nproc)
 
 ## Tests
 
-161 unit + 20 regtest integration tests.
+220 unit + 21 regtest integration tests.
 
 ```bash
 cd build
@@ -296,6 +296,8 @@ State 3 (newest): nSequence = 0 blocks    <- confirms immediately
 
 Multi-layer counter works like an odometer: 2 layers x 4 states = 16 epochs.
 
+**Per-leaf advance**: Left and right subtrees can advance independently (only 3 signers needed per leaf instead of all 5). When a leaf exhausts its states, the root layer advances and both leaves reset. A cooperative epoch reset reclaims all states back to zero.
+
 ### Timeout-Sig-Trees
 
 ```
@@ -322,7 +324,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-40 message types over TCP with length-prefixed JSON framing:
+50 message types over TCP with length-prefixed JSON framing:
 
 | Category | Messages |
 |----------|----------|
@@ -335,6 +337,8 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 | Reconnect | RECONNECT, RECONNECT_ACK |
 | Invoice | CREATE_INVOICE, INVOICE_CREATED, REGISTER_INVOICE |
 | PTLC | PTLC_PRESIG, PTLC_ADAPTED_SIG, PTLC_COMPLETE |
+| Epoch/Leaf | EPOCH_RESET_PROPOSE/PSIG/DONE, LEAF_ADVANCE_PROPOSE/PSIG/DONE |
+| JIT | JIT_OFFER, JIT_ACCEPT, JIT_READY, JIT_MIGRATE |
 
 ### Connection Topology (with CLN Bridge)
 
@@ -359,12 +363,12 @@ CLN (lightningd)
 | `musig` | musig.c | MuSig2 key aggregation, 2-round signing, split-round protocol, nonce pools |
 | `tx_builder` | tx_builder.c | Raw tx serialization, BIP-341 key-path sighash, witness finalization |
 | `tapscript` | tapscript.c | TapLeaf/TapBranch hashing, CLTV timeout scripts, control blocks |
-| `factory` | factory.c | Factory tree: build, sign, advance, timeout-sig-tree outputs, cooperative close |
+| `factory` | factory.c | Factory tree: build, sign, advance, epoch reset, per-leaf advance, timeout-sig-tree outputs, cooperative close |
 | `shachain` | shachain.c | BOLT #3 shachain, compact storage, epoch-to-index mapping |
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, migration |
-| `wire` | wire.c | TCP transport, JSON framing, 40 message types |
+| `wire` | wire.c | TCP transport, JSON framing, 50 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
 | `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, watchtower, multi-factory |

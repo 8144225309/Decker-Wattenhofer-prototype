@@ -1887,3 +1887,322 @@ int test_factory_distribution_tx_default(void) {
     secp256k1_context_destroy(ctx);
     return 1;
 }
+
+/* ---- Cooperative Epoch Reset + Per-Leaf Advance tests ---- */
+
+int test_dw_counter_reset(void) {
+    dw_counter_t ctr;
+    dw_counter_init(&ctr, 2, 2, 4);  /* 2 layers, step=2, 4 states each = 16 total */
+
+    /* Advance 5 times */
+    for (int i = 0; i < 5; i++)
+        TEST_ASSERT(dw_counter_advance(&ctr), "advance");
+
+    TEST_ASSERT_EQ(ctr.current_epoch, 5, "epoch 5 after 5 advances");
+
+    /* Reset */
+    dw_counter_reset(&ctr);
+    TEST_ASSERT_EQ(ctr.current_epoch, 0, "epoch 0 after reset");
+    TEST_ASSERT_EQ(ctr.layers[0].current_state, 0, "layer 0 state 0");
+    TEST_ASSERT_EQ(ctr.layers[1].current_state, 0, "layer 1 state 0");
+
+    /* Verify we can advance again from 0 */
+    TEST_ASSERT(dw_counter_advance(&ctr), "advance after reset");
+    TEST_ASSERT_EQ(ctr.current_epoch, 1, "epoch 1 after re-advance");
+
+    return 1;
+}
+
+int test_factory_reset_epoch(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Advance 3 times */
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(factory_advance(&f), "advance");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 3, "epoch 3");
+
+    /* Reset epoch */
+    TEST_ASSERT(factory_reset_epoch(&f), "reset epoch");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 0, "epoch 0 after reset");
+    TEST_ASSERT_EQ(f.per_leaf_enabled, 0, "per_leaf disabled after reset");
+
+    /* Verify all nodes re-signed with epoch 0 nSequences */
+    /* At epoch 0: leaf nseq = step * (max-1) = 2*3 = 6 */
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "leaf nseq 6 after reset");
+    TEST_ASSERT_EQ(f.nodes[5].nsequence, 6, "right leaf nseq 6 after reset");
+    /* Root nseq = 2*3 = 6 */
+    TEST_ASSERT_EQ(f.nodes[1].nsequence, 6, "root nseq 6 after reset");
+
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "node signed after reset");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_advance_leaf_left(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Save initial state */
+    uint32_t initial_left_nseq = f.nodes[4].nsequence;
+    uint32_t initial_right_nseq = f.nodes[5].nsequence;
+    unsigned char right_txid_before[32];
+    memcpy(right_txid_before, f.nodes[5].txid, 32);
+
+    /* Advance left leaf only */
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance leaf left");
+
+    /* Left leaf (node 4) should have changed nSequence */
+    TEST_ASSERT(f.nodes[4].nsequence != initial_left_nseq, "left nseq changed");
+    /* step=2, advanced from state 0 to 1: delay = 2*(4-1-1) = 4 */
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 4, "left nseq = 4");
+    TEST_ASSERT(f.nodes[4].is_signed, "left node signed");
+
+    /* Right leaf (node 5) should be unchanged */
+    TEST_ASSERT_EQ(f.nodes[5].nsequence, initial_right_nseq, "right nseq unchanged");
+    TEST_ASSERT(memcmp(f.nodes[5].txid, right_txid_before, 32) == 0,
+                "right txid unchanged");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_advance_leaf_right(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    uint32_t initial_left_nseq = f.nodes[4].nsequence;
+    unsigned char left_txid_before[32];
+    memcpy(left_txid_before, f.nodes[4].txid, 32);
+
+    /* Advance right leaf only */
+    TEST_ASSERT(factory_advance_leaf(&f, 1), "advance leaf right");
+
+    /* Right leaf (node 5) should have changed */
+    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right nseq = 4");
+    TEST_ASSERT(f.nodes[5].is_signed, "right node signed");
+
+    /* Left leaf (node 4) should be unchanged */
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, initial_left_nseq, "left nseq unchanged");
+    TEST_ASSERT(memcmp(f.nodes[4].txid, left_txid_before, 32) == 0,
+                "left txid unchanged");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_advance_leaf_independence(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Advance left 3 times */
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left");
+
+    /* Advance right 1 time */
+    TEST_ASSERT(factory_advance_leaf(&f, 1), "advance right");
+
+    /* Left at state 3: delay = 2*(4-1-3) = 0 */
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 0, "left nseq = 0 (state 3)");
+    /* Right at state 1: delay = 2*(4-1-1) = 4 */
+    TEST_ASSERT_EQ(f.nodes[5].nsequence, 4, "right nseq = 4 (state 1)");
+
+    /* Different nSequences confirms independence */
+    TEST_ASSERT(f.nodes[4].nsequence != f.nodes[5].nsequence,
+                "left and right have different nsequences");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_advance_leaf_exhaustion(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Exhaust the left leaf counter (4 states, advance 3 times to reach max) */
+    for (int i = 0; i < 3; i++)
+        TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left to exhaust");
+
+    /* Left leaf is at state 3 (max-1), next advance should trigger root advance */
+    uint32_t root_nseq_before = f.nodes[1].nsequence;
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left past exhaustion");
+
+    /* Root should have advanced (state 0 -> 1, nseq decreases) */
+    TEST_ASSERT(f.nodes[1].nsequence < root_nseq_before,
+                "root nseq decreased (root advanced)");
+
+    /* Both leaves should be reset to state 0 */
+    TEST_ASSERT_EQ(f.leaf_layers[0].current_state, 0, "left leaf reset to 0");
+    TEST_ASSERT_EQ(f.leaf_layers[1].current_state, 0, "right leaf reset to 0");
+
+    /* All nodes should be signed (full rebuild happened) */
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "all nodes signed after exhaustion");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_advance_leaf_preserves_parent_txids(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Save parent txids (nodes 0-3) */
+    unsigned char parent_txids[4][32];
+    for (int i = 0; i < 4; i++)
+        memcpy(parent_txids[i], f.nodes[i].txid, 32);
+
+    /* Advance left leaf */
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left leaf");
+
+    /* Verify parent txids unchanged (nodes 0-3) */
+    for (int i = 0; i < 4; i++)
+        TEST_ASSERT(memcmp(f.nodes[i].txid, parent_txids[i], 32) == 0,
+                    "parent txid preserved");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+int test_factory_epoch_reset_after_leaf_mode(void) {
+    secp256k1_context *ctx = test_ctx();
+    secp256k1_keypair kps[5];
+    make_keypairs(ctx, kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    TEST_ASSERT(compute_funding_spk(ctx, kps, fund_spk, &fund_tweaked),
+                "compute funding spk");
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    factory_t f;
+    factory_init(&f, ctx, kps, 5, 2, 4);
+    factory_set_funding(&f, fake_txid, 0, 100000, fund_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+    TEST_ASSERT(factory_sign_all(&f), "sign all");
+
+    /* Enable per-leaf mode and advance independently */
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left");
+    TEST_ASSERT(factory_advance_leaf(&f, 0), "advance left again");
+    TEST_ASSERT(factory_advance_leaf(&f, 1), "advance right");
+    TEST_ASSERT_EQ(f.per_leaf_enabled, 1, "per_leaf enabled");
+
+    /* Now reset epoch */
+    TEST_ASSERT(factory_reset_epoch(&f), "epoch reset");
+    TEST_ASSERT_EQ(f.counter.current_epoch, 0, "epoch 0");
+    TEST_ASSERT_EQ(f.per_leaf_enabled, 0, "per_leaf disabled after reset");
+    TEST_ASSERT_EQ(f.leaf_layers[0].current_state, 0, "left leaf reset");
+    TEST_ASSERT_EQ(f.leaf_layers[1].current_state, 0, "right leaf reset");
+
+    /* Both leaves should have epoch-0 nSequences */
+    TEST_ASSERT_EQ(f.nodes[4].nsequence, 6, "left nseq 6 after reset");
+    TEST_ASSERT_EQ(f.nodes[5].nsequence, 6, "right nseq 6 after reset");
+
+    /* Verify all nodes signed */
+    for (size_t i = 0; i < f.n_nodes; i++)
+        TEST_ASSERT(f.nodes[i].is_signed, "node signed after reset");
+
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}

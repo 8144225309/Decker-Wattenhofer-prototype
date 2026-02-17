@@ -335,6 +335,16 @@ extern int test_jit_multiple_channels(void);
 extern int test_jit_multiple_watchtower_indices(void);
 extern int test_jit_funding_confirmation_transition(void);
 
+/* Cooperative Epoch Reset + Per-Leaf Advance */
+extern int test_dw_counter_reset(void);
+extern int test_factory_reset_epoch(void);
+extern int test_factory_advance_leaf_left(void);
+extern int test_factory_advance_leaf_right(void);
+extern int test_factory_advance_leaf_independence(void);
+extern int test_factory_advance_leaf_exhaustion(void);
+extern int test_factory_advance_leaf_preserves_parent_txids(void);
+extern int test_factory_epoch_reset_after_leaf_mode(void);
+
 /* Edge Cases + Failure Modes */
 extern int test_dw_counter_single_state(void);
 extern int test_dw_delay_invariants(void);
@@ -635,6 +645,16 @@ static void run_unit_tests(void) {
     RUN_TEST(test_jit_multiple_channels);
     RUN_TEST(test_jit_multiple_watchtower_indices);
     RUN_TEST(test_jit_funding_confirmation_transition);
+
+    printf("\n=== Cooperative Epoch Reset + Per-Leaf Advance ===\n");
+    RUN_TEST(test_dw_counter_reset);
+    RUN_TEST(test_factory_reset_epoch);
+    RUN_TEST(test_factory_advance_leaf_left);
+    RUN_TEST(test_factory_advance_leaf_right);
+    RUN_TEST(test_factory_advance_leaf_independence);
+    RUN_TEST(test_factory_advance_leaf_exhaustion);
+    RUN_TEST(test_factory_advance_leaf_preserves_parent_txids);
+    RUN_TEST(test_factory_epoch_reset_after_leaf_mode);
 
     printf("\n=== Edge Cases + Failure Modes ===\n");
     RUN_TEST(test_dw_counter_single_state);

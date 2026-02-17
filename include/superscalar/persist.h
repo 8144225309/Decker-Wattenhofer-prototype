@@ -185,6 +185,20 @@ int persist_load_dw_counter(persist_t *p, uint32_t factory_id,
                              uint32_t *epoch_out, uint32_t *n_layers_out,
                              uint32_t *layer_states_out, size_t max_layers);
 
+/* Extended versions with per-leaf DW state */
+int persist_save_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
+                                         uint32_t current_epoch, uint32_t n_layers,
+                                         const uint32_t *layer_states,
+                                         int per_leaf_enabled,
+                                         uint32_t leaf_left_state,
+                                         uint32_t leaf_right_state);
+int persist_load_dw_counter_with_leaves(persist_t *p, uint32_t factory_id,
+                                         uint32_t *epoch_out, uint32_t *n_layers_out,
+                                         uint32_t *layer_states_out, size_t max_layers,
+                                         int *per_leaf_enabled_out,
+                                         uint32_t *leaf_left_state_out,
+                                         uint32_t *leaf_right_state_out);
+
 /* --- Departed clients (Phase 23) --- */
 
 int persist_save_departed_client(persist_t *p, uint32_t factory_id,

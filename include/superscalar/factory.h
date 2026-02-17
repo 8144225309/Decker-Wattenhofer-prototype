@@ -111,6 +111,10 @@ typedef struct {
     unsigned char shachain_seed[32];
     int has_shachain;
 
+    /* Per-leaf DW layers (for independent leaf advance) */
+    dw_layer_t leaf_layers[2];    /* [0]=left, [1]=right */
+    int per_leaf_enabled;          /* activated after first leaf advance */
+
     /* Lifecycle (Phase 8) */
     uint32_t created_block;        /* block height when funding confirmed */
     uint32_t active_blocks;        /* duration of active period (default: 4320 = 30*144) */
@@ -136,6 +140,19 @@ void factory_set_funding(factory_t *f,
 int factory_build_tree(factory_t *f);
 int factory_sign_all(factory_t *f);
 int factory_advance(factory_t *f);
+
+/* Reset DW counter to epoch 0, rebuild all unsigned txs, re-sign.
+   Reclaims all N^2 states. Requires all signers to participate. */
+int factory_reset_epoch(factory_t *f);
+
+/* Advance only one leaf subtree. leaf_side: 0=left, 1=right.
+   Rebuilds + re-signs only the affected state node (node 4 or 5).
+   Returns 0 if fully exhausted (need cooperative epoch reset). */
+int factory_advance_leaf(factory_t *f, int leaf_side);
+
+/* Sign a single node (local-only, all keypairs available). */
+int factory_sign_node(factory_t *f, size_t node_idx);
+
 void factory_free(factory_t *f);
 
 /* Shachain L-output invalidation API */

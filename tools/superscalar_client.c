@@ -798,6 +798,36 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             break;
         }
 
+        case MSG_EPOCH_RESET_PROPOSE:
+            /* LSP proposes epoch reset — reset local counter + rebuild.
+               In distributed mode, client would generate partial sigs and send
+               MSG_EPOCH_RESET_PSIG. For PoC, just reset locally. */
+            printf("Client %u: received EPOCH_RESET_PROPOSE\n", my_index);
+            dw_counter_reset(&factory->counter);
+            printf("Client %u: epoch reset to 0\n", my_index);
+            cJSON_Delete(msg.json);
+            break;
+
+        case MSG_EPOCH_RESET_DONE:
+            /* LSP confirms epoch reset complete with new signed txs. */
+            printf("Client %u: epoch reset confirmed by LSP\n", my_index);
+            cJSON_Delete(msg.json);
+            break;
+
+        case MSG_LEAF_ADVANCE_PROPOSE:
+            /* LSP proposes leaf advance for our subtree.
+               In distributed mode, client would generate partial sig for the
+               affected leaf node and send MSG_LEAF_ADVANCE_PSIG. */
+            printf("Client %u: received LEAF_ADVANCE_PROPOSE\n", my_index);
+            cJSON_Delete(msg.json);
+            break;
+
+        case MSG_LEAF_ADVANCE_DONE:
+            /* LSP confirms leaf advance complete. */
+            printf("Client %u: leaf advance confirmed by LSP\n", my_index);
+            cJSON_Delete(msg.json);
+            break;
+
         default:
             fprintf(stderr, "Client %u: daemon got unexpected msg 0x%02x\n",
                     my_index, msg.msg_type);

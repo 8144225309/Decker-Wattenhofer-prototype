@@ -757,6 +757,20 @@ int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         printf("LSP: client %zu requested close\n", client_idx);
         return 1;  /* handled by caller */
 
+    case MSG_EPOCH_RESET_PSIG:
+        /* Client sent partial sigs for epoch reset — collect and aggregate.
+           In the PoC, epoch reset is done locally with factory_reset_epoch().
+           This handler acknowledges receipt for future distributed mode. */
+        printf("LSP: received EPOCH_RESET_PSIG from client %zu\n", client_idx);
+        return 1;
+
+    case MSG_LEAF_ADVANCE_PSIG:
+        /* Client sent partial sig for leaf advance.
+           In the PoC, leaf advance is done locally with factory_advance_leaf().
+           This handler acknowledges receipt for future distributed mode. */
+        printf("LSP: received LEAF_ADVANCE_PSIG from client %zu\n", client_idx);
+        return 1;
+
     default:
         fprintf(stderr, "LSP: unexpected msg 0x%02x from client %zu\n",
                 msg->msg_type, client_idx);
@@ -1847,6 +1861,23 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                             }
                         }
                     }
+                }
+            }
+
+            /* Check if DW counter is near exhaustion — trigger epoch reset */
+            if (!dw_counter_is_exhausted(&lsp->factory.counter)) {
+                uint32_t epoch = dw_counter_epoch(&lsp->factory.counter);
+                uint32_t total = lsp->factory.counter.total_states;
+                if (total > 0 && epoch >= (total * 3) / 4) {
+                    printf("LSP: DW counter at %u/%u (>75%%) — epoch reset needed\n",
+                           epoch, total);
+                    /* In distributed mode, this would orchestrate a 3-round
+                       signing ceremony via MSG_EPOCH_RESET_PROPOSE/PSIG/DONE.
+                       For local signing (PoC), call factory_reset_epoch directly. */
+                    if (factory_reset_epoch(&lsp->factory))
+                        printf("LSP: epoch reset complete — counter back to 0\n");
+                    else
+                        fprintf(stderr, "LSP: epoch reset FAILED\n");
                 }
             }
 

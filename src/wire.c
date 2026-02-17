@@ -99,6 +99,12 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x52: return "JIT_ACCEPT";
     case 0x53: return "JIT_READY";
     case 0x54: return "JIT_MIGRATE";
+    case 0x55: return "EPOCH_RESET_PROPOSE";
+    case 0x56: return "EPOCH_RESET_PSIG";
+    case 0x57: return "EPOCH_RESET_DONE";
+    case 0x58: return "LEAF_ADVANCE_PROPOSE";
+    case 0x59: return "LEAF_ADVANCE_PSIG";
+    case 0x5A: return "LEAF_ADVANCE_DONE";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
