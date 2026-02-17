@@ -361,8 +361,8 @@ int watchtower_check(watchtower_t *wt) {
         printf("BREACH DETECTED on channel %u, commitment %llu (txid: %s)!\n",
                e->channel_id, (unsigned long long)e->commit_num, txid_hex);
 
-        /* If in mempool but not confirmed, mine a block first */
-        if (in_mempool && conf < 0) {
+        /* If in mempool but not confirmed, mine a block (regtest only) */
+        if (in_mempool && conf < 0 && strcmp(wt->rt->network, "regtest") == 0) {
             char mine_addr[128];
             if (regtest_get_new_address(wt->rt, mine_addr, sizeof(mine_addr)))
                 regtest_mine_blocks(wt->rt, 1, mine_addr);

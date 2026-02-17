@@ -476,6 +476,9 @@ int main(int argc, char *argv[]) {
                (unsigned long long)fee_est.fee_rate_sat_per_kvb);
     } else {
         printf("LSP: fee rate (static): %llu sat/kvB\n", (unsigned long long)fee_rate);
+        if (!is_regtest)
+            fprintf(stderr, "WARNING: estimatesmartfee failed on %s; using static --fee-rate %llu sat/kvB\n",
+                    network, (unsigned long long)fee_rate);
     }
 
     /* === Phase 1: Accept clients === */
@@ -601,7 +604,8 @@ int main(int argc, char *argv[]) {
         regtest_mine_blocks(&rt, 1, mine_addr);
     } else {
         printf("LSP: waiting for funding tx confirmation on %s...\n", network);
-        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex, 3600);
+        int timeout_secs = (strcmp(network, "regtest") == 0) ? 3600 : 7200;
+        int conf = regtest_wait_for_confirmation(&rt, funding_txid_hex, timeout_secs);
         if (conf < 1) {
             fprintf(stderr, "LSP: funding tx not confirmed within timeout\n");
             lsp_cleanup(&lsp);
