@@ -58,6 +58,20 @@ typedef struct {
 
     /* Ladder manager (Tier 2) */
     void *ladder;   /* ladder_t* or NULL — avoids header dependency */
+
+    /* Continuous ladder rotation (set once at daemon startup) */
+    unsigned char rot_lsp_seckey[32];
+    void *rot_fee_est;              /* fee_estimator_t* — avoids header dependency */
+    unsigned char rot_fund_spk[34];
+    size_t rot_fund_spk_len;
+    char rot_fund_addr[128];
+    char rot_mine_addr[128];
+    uint16_t rot_step_blocks;
+    uint32_t rot_states_per_layer;
+    int rot_is_regtest;
+    uint64_t rot_funding_sats;
+    int rot_auto_rotate;           /* 1 = auto-rotate enabled */
+    uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.
@@ -107,6 +121,14 @@ int lsp_channels_run_event_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
    Returns 1 on clean shutdown. */
 int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                    volatile sig_atomic_t *shutdown_flag);
+
+/* --- Continuous Ladder Rotation (Gap #3) --- */
+
+/* Perform a full factory rotation: PTLC turnover → cooperative close →
+   fund new factory → create new factory → reinitialize channels.
+   All parameters come from mgr->rot_* fields.
+   Returns 1 on success, 0 on failure. */
+int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp);
 
 /* --- Reconnection (Phase 16) --- */
 

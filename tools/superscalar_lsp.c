@@ -63,6 +63,8 @@ static void usage(const char *prog) {
         "  --test-distrib      After demo: mine past CLTV, broadcast distribution TX\n"
         "  --test-turnover     After demo: PTLC key turnover for all clients, close\n"
         "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
+        "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
+        "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -325,6 +327,8 @@ int main(int argc, char *argv[]) {
     int test_distrib = 0;
     int test_turnover = 0;
     int test_rotation = 0;
+    int32_t active_blocks_arg = -1;  /* -1 = auto */
+    int32_t dying_blocks_arg = -1;   /* -1 = auto */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -377,6 +381,10 @@ int main(int argc, char *argv[]) {
             test_rotation = 1;
         else if (strcmp(argv[i], "--cheat-daemon") == 0)
             breach_test = 2;  /* 2 = cheat-daemon mode (no LSP watchtower, sleep after breach) */
+        else if (strcmp(argv[i], "--active-blocks") == 0 && i + 1 < argc)
+            active_blocks_arg = (int32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--dying-blocks") == 0 && i + 1 < argc)
+            dying_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -386,6 +394,13 @@ int main(int argc, char *argv[]) {
     if (!network)
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
+
+    /* Resolve active/dying block defaults */
+    uint32_t active_blocks = (active_blocks_arg > 0) ? (uint32_t)active_blocks_arg
+                             : (is_regtest ? 20 : 4320);
+    uint32_t dying_blocks = (dying_blocks_arg > 0) ? (uint32_t)dying_blocks_arg
+                            : (is_regtest ? 10 : 432);
+
     if (n_clients < 1 || n_clients > LSP_MAX_CLIENTS) {
         fprintf(stderr, "Error: --clients must be 1..%d\n", LSP_MAX_CLIENTS);
         return 1;
@@ -692,10 +707,12 @@ int main(int argc, char *argv[]) {
     {
         int cur_height = regtest_get_block_height(&rt);
         if (cur_height > 0) {
-            factory_set_lifecycle(&lsp.factory, (uint32_t)cur_height, 20, 10);
+            factory_set_lifecycle(&lsp.factory, (uint32_t)cur_height,
+                                  active_blocks, dying_blocks);
             printf("LSP: factory lifecycle set at height %d "
-                   "(active=20, dying=10, CLTV=%u)\n",
-                   cur_height, lsp.factory.cltv_timeout);
+                   "(active=%u, dying=%u, CLTV=%u)\n",
+                   cur_height, active_blocks, dying_blocks,
+                   lsp.factory.cltv_timeout);
         }
     }
 
@@ -717,7 +734,7 @@ int main(int argc, char *argv[]) {
 
     /* === Ladder manager initialization (Tier 2) === */
     ladder_t lad;
-    ladder_init(&lad, ctx, &lsp_kp, 20, 10);
+    ladder_init(&lad, ctx, &lsp_kp, active_blocks, dying_blocks);
     {
         int cur_h = regtest_get_block_height(&rt);
         if (cur_h > 0) lad.current_block = (uint32_t)cur_h;
@@ -863,6 +880,20 @@ int main(int argc, char *argv[]) {
 
         /* Wire ladder into channel manager (Tier 2) */
         mgr.ladder = &lad;
+
+        /* Wire rotation parameters for continuous ladder (Gap #3) */
+        memcpy(mgr.rot_lsp_seckey, lsp_seckey, 32);
+        mgr.rot_fee_est = &fee_est;
+        memcpy(mgr.rot_fund_spk, fund_spk, 34);
+        mgr.rot_fund_spk_len = 34;
+        strncpy(mgr.rot_fund_addr, fund_addr, sizeof(mgr.rot_fund_addr) - 1);
+        strncpy(mgr.rot_mine_addr, mine_addr, sizeof(mgr.rot_mine_addr) - 1);
+        mgr.rot_step_blocks = step_blocks;
+        mgr.rot_states_per_layer = 4;
+        mgr.rot_is_regtest = is_regtest;
+        mgr.rot_funding_sats = funding_sats;
+        mgr.rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
+        mgr.rot_attempted_mask = 0;
 
         if (n_payments > 0) {
             printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",

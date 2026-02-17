@@ -1,6 +1,7 @@
 #include "superscalar/ladder.h"
 #include "superscalar/adaptor.h"
 #include "superscalar/regtest.h"
+#include "superscalar/lsp_channels.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -839,6 +840,226 @@ int test_regtest_ladder_distribution_fallback(void) {
     printf("  Distribution tx confirmed! Clients receive fallback funds.\n");
 
     tx_buf_free(&dist_tx);
+    factory_free(&f);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* --- Continuous Ladder Daemon (Gap #3) tests --- */
+
+/* Test: ladder_evict_expired removes EXPIRED factories and compacts array */
+int test_ladder_evict_expired(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    /* Create 3 factories at blocks 0, 100, 200 */
+    for (int i = 0; i < 3; i++) {
+        fake_txid[0] = (unsigned char)i;
+        ladder_advance_block(&lad, (uint32_t)(i * 100));
+        TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                           fake_txid, 0, fund_spk, 34),
+                    "create factory");
+    }
+    TEST_ASSERT_EQ(lad.n_factories, 3, "3 factories");
+
+    /* Advance to block 310: factory 0 EXPIRED (0+100+30=130), factory 1 EXPIRED (100+100+30=230),
+       factory 2 DYING (200+100=300..330) */
+    ladder_advance_block(&lad, 310);
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_EXPIRED, "f0 expired");
+    TEST_ASSERT_EQ(lad.factories[1].cached_state, FACTORY_EXPIRED, "f1 expired");
+    TEST_ASSERT_EQ(lad.factories[2].cached_state, FACTORY_DYING, "f2 dying");
+
+    /* Evict expired */
+    size_t freed = ladder_evict_expired(&lad);
+    TEST_ASSERT_EQ(freed, 2, "freed 2 slots");
+    TEST_ASSERT_EQ(lad.n_factories, 1, "1 factory remaining");
+    TEST_ASSERT_EQ(lad.factories[0].factory_id, 2, "remaining is factory 2");
+    TEST_ASSERT_EQ(lad.factories[0].cached_state, FACTORY_DYING, "still dying");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: auto-rotation trigger fires only on ACTIVE→DYING transition,
+   and rot_attempted_mask prevents double-trigger */
+int test_rotation_trigger_condition(void) {
+    secp256k1_context *ctx = test_ctx();
+
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec);
+
+    secp256k1_keypair client_kps[4];
+    make_client_keypairs(ctx, client_kps);
+
+    unsigned char fund_spk[34];
+    secp256k1_xonly_pubkey fund_tweaked;
+    compute_funding_spk(ctx, &lsp_kp, client_kps, fund_spk, &fund_tweaked);
+
+    ladder_t lad;
+    ladder_init(&lad, ctx, &lsp_kp, 100, 30);
+
+    unsigned char fake_txid[32];
+    memset(fake_txid, 0xAA, 32);
+
+    TEST_ASSERT(ladder_create_factory(&lad, client_kps, 4, 100000,
+                                       fake_txid, 0, fund_spk, 34),
+                "create factory");
+
+    /* Save old state */
+    factory_state_t old_state = lad.factories[0].cached_state;
+    TEST_ASSERT_EQ(old_state, FACTORY_ACTIVE, "starts active");
+
+    /* Advance to DYING */
+    ladder_advance_block(&lad, 100);
+    factory_state_t new_state = lad.factories[0].cached_state;
+    TEST_ASSERT_EQ(new_state, FACTORY_DYING, "now dying");
+
+    /* Simulate trigger condition check */
+    uint32_t attempted_mask = 0;
+    int should_trigger = (new_state == FACTORY_DYING &&
+                          old_state == FACTORY_ACTIVE &&
+                          !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    TEST_ASSERT(should_trigger, "trigger fires on ACTIVE->DYING");
+
+    /* Mark as attempted */
+    attempted_mask |= (1u << lad.factories[0].factory_id);
+
+    /* Same transition again (e.g. re-checking same height) — should NOT trigger */
+    old_state = new_state;
+    ladder_advance_block(&lad, 101);
+    new_state = lad.factories[0].cached_state;
+    should_trigger = (new_state == FACTORY_DYING &&
+                      old_state == FACTORY_ACTIVE &&
+                      !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    TEST_ASSERT(!should_trigger, "no double trigger (state same)");
+
+    /* Factory 0 already attempted, so even with forced condition it's masked */
+    should_trigger = (1 && !(attempted_mask & (1u << lad.factories[0].factory_id)));
+    TEST_ASSERT(!should_trigger, "masked by attempted_mask");
+
+    ladder_free(&lad);
+    secp256k1_context_destroy(ctx);
+    return 1;
+}
+
+/* Test: rotation context fields survive the save/restore pattern
+   used in lsp_channels_rotate_factory */
+int test_rotation_context_save_restore(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+
+    /* Build a minimal factory for lsp_channels_init */
+    unsigned char lsp_sec_local[32];
+    memset(lsp_sec_local, 0x10, 32);
+    secp256k1_keypair lsp_kp;
+    secp256k1_keypair_create(ctx, &lsp_kp, lsp_sec_local);
+
+    secp256k1_keypair all_kps[5];
+    all_kps[0] = lsp_kp;
+    for (int i = 0; i < 4; i++) {
+        unsigned char s[32];
+        memset(s, 0x21 + i * 0x11, 32);
+        secp256k1_keypair_create(ctx, &all_kps[i + 1], s);
+    }
+
+    factory_t f;
+    factory_init(&f, ctx, all_kps, 5, 1, 4);
+
+    unsigned char fake_txid[32], fake_spk[34];
+    memset(fake_txid, 0xBB, 32);
+    memset(fake_spk, 0xCC, 34);
+    factory_set_funding(&f, fake_txid, 0, 100000, fake_spk, 34);
+    TEST_ASSERT(factory_build_tree(&f), "build tree");
+
+    /* Init mgr with rot fields set */
+    lsp_channel_mgr_t mgr;
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "init mgr");
+
+    /* Set rot fields */
+    memset(mgr.rot_lsp_seckey, 0xAA, 32);
+    mgr.rot_fee_est = (void *)0xDEADBEEF;
+    memset(mgr.rot_fund_spk, 0xBB, 34);
+    mgr.rot_fund_spk_len = 34;
+    strncpy(mgr.rot_fund_addr, "tb1qtest123", sizeof(mgr.rot_fund_addr));
+    strncpy(mgr.rot_mine_addr, "tb1qmine456", sizeof(mgr.rot_mine_addr));
+    mgr.rot_step_blocks = 10;
+    mgr.rot_states_per_layer = 4;
+    mgr.rot_is_regtest = 1;
+    mgr.rot_funding_sats = 100000;
+    mgr.rot_auto_rotate = 1;
+    mgr.rot_attempted_mask = 0x05;
+    mgr.bridge_fd = 42;
+    mgr.persist = (void *)0xCAFEBABE;
+    mgr.ladder = (void *)0x12345678;
+
+    /* Save state (same pattern as lsp_channels_rotate_factory) */
+    int saved_bridge_fd = mgr.bridge_fd;
+    void *saved_persist = mgr.persist;
+    void *saved_ladder = mgr.ladder;
+    unsigned char saved_seckey[32];
+    memcpy(saved_seckey, mgr.rot_lsp_seckey, 32);
+    void *saved_fee_est = mgr.rot_fee_est;
+    uint16_t saved_step_blocks = mgr.rot_step_blocks;
+    uint32_t saved_spl = mgr.rot_states_per_layer;
+    int saved_is_regtest = mgr.rot_is_regtest;
+    uint64_t saved_funding_sats = mgr.rot_funding_sats;
+    int saved_auto_rotate = mgr.rot_auto_rotate;
+    uint32_t saved_attempted_mask = mgr.rot_attempted_mask;
+
+    /* Re-init (memsets mgr to 0) */
+    TEST_ASSERT(lsp_channels_init(&mgr, ctx, &f, lsp_sec_local, 4), "reinit mgr");
+
+    /* Verify fields are zeroed */
+    TEST_ASSERT_EQ(mgr.bridge_fd, -1, "bridge_fd reset to -1");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.persist, 0, "persist zeroed");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.ladder, 0, "ladder zeroed");
+    TEST_ASSERT_EQ(mgr.rot_auto_rotate, 0, "rot_auto_rotate zeroed");
+
+    /* Restore */
+    mgr.bridge_fd = saved_bridge_fd;
+    mgr.persist = saved_persist;
+    mgr.ladder = saved_ladder;
+    memcpy(mgr.rot_lsp_seckey, saved_seckey, 32);
+    mgr.rot_fee_est = saved_fee_est;
+    mgr.rot_step_blocks = saved_step_blocks;
+    mgr.rot_states_per_layer = saved_spl;
+    mgr.rot_is_regtest = saved_is_regtest;
+    mgr.rot_funding_sats = saved_funding_sats;
+    mgr.rot_auto_rotate = saved_auto_rotate;
+    mgr.rot_attempted_mask = saved_attempted_mask;
+
+    /* Verify restored values */
+    TEST_ASSERT_EQ(mgr.bridge_fd, 42, "bridge_fd restored");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.persist, (long)(uintptr_t)0xCAFEBABE, "persist restored");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.ladder, (long)(uintptr_t)0x12345678, "ladder restored");
+    unsigned char expected_seckey[32];
+    memset(expected_seckey, 0xAA, 32);
+    TEST_ASSERT(memcmp(mgr.rot_lsp_seckey, expected_seckey, 32) == 0, "seckey restored");
+    TEST_ASSERT_EQ((long)(uintptr_t)mgr.rot_fee_est, (long)(uintptr_t)0xDEADBEEF, "fee_est restored");
+    TEST_ASSERT_EQ(mgr.rot_step_blocks, 10, "step_blocks restored");
+    TEST_ASSERT_EQ(mgr.rot_states_per_layer, 4, "spl restored");
+    TEST_ASSERT_EQ(mgr.rot_is_regtest, 1, "is_regtest restored");
+    TEST_ASSERT_EQ((long)mgr.rot_funding_sats, 100000, "funding_sats restored");
+    TEST_ASSERT_EQ(mgr.rot_auto_rotate, 1, "auto_rotate restored");
+    TEST_ASSERT_EQ(mgr.rot_attempted_mask, 0x05, "attempted_mask restored");
+
+    memset(saved_seckey, 0, 32);
     factory_free(&f);
     secp256k1_context_destroy(ctx);
     return 1;

@@ -299,6 +299,11 @@ extern int test_cpfp_retry_bump(void);
 extern int test_anchor_key_persistence(void);
 extern int test_pending_persistence(void);
 
+/* Continuous Ladder Daemon (Gap #3) */
+extern int test_ladder_evict_expired(void);
+extern int test_rotation_trigger_condition(void);
+extern int test_rotation_context_save_restore(void);
+
 /* Edge Cases + Failure Modes */
 extern int test_dw_counter_single_state(void);
 extern int test_dw_delay_invariants(void);
@@ -563,6 +568,11 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cpfp_retry_bump);
     RUN_TEST(test_anchor_key_persistence);
     RUN_TEST(test_pending_persistence);
+
+    printf("\n=== Continuous Ladder Daemon (Gap #3) ===\n");
+    RUN_TEST(test_ladder_evict_expired);
+    RUN_TEST(test_rotation_trigger_condition);
+    RUN_TEST(test_rotation_context_save_restore);
 
     printf("\n=== Edge Cases + Failure Modes ===\n");
     RUN_TEST(test_dw_counter_single_state);

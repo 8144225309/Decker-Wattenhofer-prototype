@@ -78,6 +78,10 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
                        tx_buf_t *close_tx_out,
                        const tx_output_t *outputs, size_t n_outputs);
 
+/* Remove all EXPIRED factories from the ladder array, compacting slots.
+   Returns number of slots freed. */
+size_t ladder_evict_expired(ladder_t *lad);
+
 void ladder_free(ladder_t *lad);
 
 #endif /* SUPERSCALAR_LADDER_H */

@@ -570,6 +570,10 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             }
             cJSON_Delete(msg.json);
 
+            /* Re-register watchtower channel pointer after rotation */
+            if (cbd && cbd->wt)
+                watchtower_set_channel(cbd->wt, 0, ch);
+
             /* Persist new factory + channel if DB available */
             if (cbd && cbd->db) {
                 persist_save_factory(cbd->db, factory, ctx, 0);

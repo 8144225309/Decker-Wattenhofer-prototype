@@ -204,6 +204,28 @@ int ladder_build_close(ladder_t *lad, uint32_t factory_id,
     return ok;
 }
 
+size_t ladder_evict_expired(ladder_t *lad)
+{
+    if (!lad) return 0;
+    size_t freed = 0;
+    size_t write = 0;
+    for (size_t read = 0; read < lad->n_factories; read++) {
+        ladder_factory_t *lf = &lad->factories[read];
+        if (lf->cached_state == FACTORY_EXPIRED) {
+            /* Free resources for evicted entry */
+            factory_free(&lf->factory);
+            tx_buf_free(&lf->distribution_tx);
+            freed++;
+        } else {
+            if (write != read)
+                lad->factories[write] = lad->factories[read];
+            write++;
+        }
+    }
+    lad->n_factories = write;
+    return freed;
+}
+
 void ladder_free(ladder_t *lad)
 {
     for (size_t i = 0; i < lad->n_factories; i++) {
