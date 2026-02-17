@@ -1,4 +1,5 @@
 #include "superscalar/lsp_channels.h"
+#include "superscalar/jit_channel.h"
 #include "superscalar/fee.h"
 #include "superscalar/persist.h"
 #include "superscalar/factory.h"
@@ -8,6 +9,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include <sys/select.h>
 #include <sys/time.h>
 #include <unistd.h>
@@ -95,6 +97,8 @@ int lsp_channels_init(lsp_channel_mgr_t *mgr,
         lsp_channel_entry_t *entry = &mgr->entries[c];
         entry->channel_id = (uint32_t)c;
         entry->ready = 0;
+        entry->last_message_time = time(NULL);
+        entry->offline_detected = 0;
 
         /* Find leaf output for this client */
         size_t node_idx;
@@ -428,7 +432,25 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
         return 0;
     }
 
-    channel_t *dest_ch = &mgr->entries[dest_idx].channel;
+    /* Smart channel dispatch: prefer factory channel, fall back to JIT */
+    channel_t *dest_ch;
+    uint32_t dest_chan_id;
+    int dest_is_jit = 0;
+
+    if (mgr->entries[dest_idx].ready) {
+        dest_ch = &mgr->entries[dest_idx].channel;
+        dest_chan_id = mgr->entries[dest_idx].channel_id;
+    } else {
+        jit_channel_t *jit = jit_channel_find(mgr, dest_idx);
+        if (jit && jit->state == JIT_STATE_OPEN) {
+            dest_ch = &jit->channel;
+            dest_chan_id = jit->jit_channel_id;
+            dest_is_jit = 1;
+        } else {
+            fprintf(stderr, "LSP: no channel for client %zu\n", dest_idx);
+            return 0;
+        }
+    }
 
     /* Capture amounts and HTLC state before add_htlc changes them (for watchtower) */
     uint64_t old_dest_local = dest_ch->local_amount;
@@ -466,7 +488,7 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
             return 0;
         }
         cJSON *cs = wire_build_commitment_signed(
-            mgr->entries[dest_idx].channel_id,
+            dest_chan_id,
             dest_ch->commitment_number, psig32, nonce_idx);
         if (!wire_send(lsp->client_fds[dest_idx], MSG_COMMITMENT_SIGNED, cs)) {
             cJSON_Delete(cs);
@@ -490,8 +512,10 @@ static int handle_add_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                                         rev_secret, next_point)) {
             uint64_t old_cn = dest_ch->commitment_number - 1;
             channel_receive_revocation(dest_ch, old_cn, rev_secret);
+            uint32_t wt_chan_id = dest_is_jit ?
+                (uint32_t)(mgr->n_channels + dest_idx) : (uint32_t)dest_idx;
             watchtower_watch_revoked_commitment(mgr->watchtower, dest_ch,
-                (uint32_t)dest_idx, old_cn,
+                wt_chan_id, old_cn,
                 old_dest_local, old_dest_remote,
                 old_dest_htlcs, old_dest_n_htlcs);
             secp256k1_pubkey next_pcp;
@@ -681,6 +705,10 @@ static int handle_fulfill_htlc(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 int lsp_channels_handle_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                               size_t client_idx, const wire_msg_t *msg) {
     if (!mgr || !lsp || !msg || client_idx >= mgr->n_channels) return 0;
+
+    /* Update activity tracking (Step 1: offline detection) */
+    mgr->entries[client_idx].last_message_time = time(NULL);
+    mgr->entries[client_idx].offline_detected = 0;
 
     switch (msg->msg_type) {
     case MSG_UPDATE_ADD_HTLC:
@@ -1036,6 +1064,10 @@ static int handle_reconnect_with_msg(lsp_channel_mgr_t *mgr, lsp_t *lsp,
 
     /* 6. Set new fd */
     lsp->client_fds[c] = new_fd;
+
+    /* Reset offline detection on reconnect */
+    mgr->entries[c].last_message_time = time(NULL);
+    mgr->entries[c].offline_detected = 0;
 
     /* 7. Re-init nonce pool */
     if (!channel_init_nonce_pool(ch, MUSIG_NONCE_POOL_MAX)) {
@@ -1573,6 +1605,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     watchtower_t *saved_wt = mgr->watchtower;
     void *saved_persist = mgr->persist;
     void *saved_ladder = mgr->ladder;
+    /* JIT channel state preserved across reinit */
+    void *saved_jit = mgr->jit_channels;
+    size_t saved_n_jit = mgr->n_jit_channels;
+    int saved_jit_enabled = mgr->jit_enabled;
+    uint64_t saved_jit_funding = mgr->jit_funding_sats;
     unsigned char saved_seckey[32];
     memcpy(saved_seckey, mgr->rot_lsp_seckey, 32);
     void *saved_fee_est = mgr->rot_fee_est;
@@ -1615,6 +1652,10 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
     mgr->rot_funding_sats = saved_funding_sats;
     mgr->rot_auto_rotate = saved_auto_rotate;
     mgr->rot_attempted_mask = saved_attempted_mask;
+    mgr->jit_channels = saved_jit;
+    mgr->n_jit_channels = saved_n_jit;
+    mgr->jit_enabled = saved_jit_enabled;
+    mgr->jit_funding_sats = saved_jit_funding;
 
     if (!lsp_channels_exchange_basepoints(mgr, lsp)) {
         fprintf(stderr, "LSP rotate: basepoint exchange failed\n");
@@ -1643,6 +1684,14 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         for (size_t c = 0; c < mgr->n_channels; c++)
             persist_save_channel((persist_t *)mgr->persist,
                                   &mgr->entries[c].channel, 0, (uint32_t)c);
+    }
+
+    /* Migrate any active JIT channels into the new factory */
+    for (size_t c = 0; c < mgr->n_channels; c++) {
+        if (jit_channel_is_active(mgr, c)) {
+            printf("LSP rotate: migrating JIT channel for client %zu\n", c);
+            jit_channel_migrate(mgr, lsp, c, 0);
+        }
     }
 
     printf("LSP rotate: rotation complete — new factory active with %zu channels\n",
@@ -1794,6 +1843,69 @@ int lsp_channels_run_daemon_loop(lsp_channel_mgr_t *mgr, lsp_t *lsp,
                     }
                 }
             }
+
+            /* Offline detection: mark clients with no message for 120s */
+            {
+                time_t now = time(NULL);
+                for (size_t c = 0; c < mgr->n_channels; c++) {
+                    if (lsp->client_fds[c] < 0) continue;
+                    if (mgr->entries[c].offline_detected) continue;
+                    if (now - mgr->entries[c].last_message_time >=
+                        JIT_OFFLINE_TIMEOUT_SEC) {
+                        fprintf(stderr, "LSP: client %zu offline (no message for %ds)\n",
+                                c, JIT_OFFLINE_TIMEOUT_SEC);
+                        wire_close(lsp->client_fds[c]);
+                        lsp->client_fds[c] = -1;
+                        mgr->entries[c].offline_detected = 1;
+                    }
+                }
+            }
+
+            /* JIT channel trigger: factory expired + client online + no JIT */
+            if (mgr->jit_enabled) {
+                int all_expired = 1;
+                if (mgr->ladder) {
+                    ladder_t *lad = (ladder_t *)mgr->ladder;
+                    for (size_t fi = 0; fi < lad->n_factories; fi++) {
+                        if (lad->factories[fi].cached_state != FACTORY_EXPIRED) {
+                            all_expired = 0;
+                            break;
+                        }
+                    }
+                    if (lad->n_factories == 0)
+                        all_expired = 0; /* no factories at all != expired */
+                } else {
+                    /* Single-factory mode: check main factory */
+                    if (mgr->watchtower && mgr->watchtower->rt) {
+                        int h = regtest_get_block_height(mgr->watchtower->rt);
+                        factory_state_t fs = factory_get_state(&lsp->factory, (uint32_t)h);
+                        all_expired = (fs == FACTORY_EXPIRED) ? 1 : 0;
+                    } else {
+                        all_expired = 0;
+                    }
+                }
+
+                if (all_expired) {
+                    for (size_t c = 0; c < mgr->n_channels; c++) {
+                        if (lsp->client_fds[c] >= 0 &&
+                            !jit_channel_is_active(mgr, c)) {
+                            uint64_t jit_amt = mgr->jit_funding_sats;
+                            if (jit_amt == 0)
+                                jit_amt = mgr->rot_funding_sats / mgr->n_channels;
+                            if (jit_amt > 0) {
+                                printf("LSP: opening JIT channel for client %zu "
+                                       "(factory expired)\n", c);
+                                jit_channel_create(mgr, lsp, c, jit_amt,
+                                                    "factory_expired");
+                            }
+                        }
+                    }
+                }
+            }
+
+            /* Check JIT funding confirmation (FUNDING → OPEN) */
+            jit_channels_check_funding(mgr);
+
             continue;
         }
 

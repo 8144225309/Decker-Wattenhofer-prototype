@@ -206,6 +206,20 @@ static const char *SCHEMA_SQL =
     "  anchor_amount INTEGER NOT NULL,"
     "  cycles_in_mempool INTEGER NOT NULL DEFAULT 0,"
     "  bump_count INTEGER NOT NULL DEFAULT 0"
+    ");"
+    "CREATE TABLE IF NOT EXISTS jit_channels ("
+    "  jit_channel_id INTEGER PRIMARY KEY,"
+    "  client_idx INTEGER NOT NULL,"
+    "  state TEXT NOT NULL,"
+    "  funding_txid TEXT,"
+    "  funding_vout INTEGER,"
+    "  funding_amount INTEGER,"
+    "  local_amount INTEGER,"
+    "  remote_amount INTEGER,"
+    "  commitment_number INTEGER DEFAULT 0,"
+    "  created_at INTEGER,"
+    "  created_block INTEGER,"
+    "  target_factory_id INTEGER DEFAULT 0"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -1872,6 +1886,146 @@ int persist_delete_pending(persist_t *p, const char *txid) {
         return 0;
 
     sqlite3_bind_text(stmt, 1, txid, -1, SQLITE_TRANSIENT);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* --- JIT Channel persistence (Gap #2) --- */
+
+#include "superscalar/jit_channel.h"
+
+int persist_save_jit_channel(persist_t *p, const void *jit_ptr) {
+    if (!p || !p->db || !jit_ptr) return 0;
+    const jit_channel_t *jit = (const jit_channel_t *)jit_ptr;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO jit_channels "
+        "(jit_channel_id, client_idx, state, funding_txid, funding_vout, "
+        "funding_amount, local_amount, remote_amount, commitment_number, "
+        "created_at, created_block, target_factory_id) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)jit->jit_channel_id);
+    sqlite3_bind_int(stmt, 2, (int)jit->client_idx);
+    sqlite3_bind_text(stmt, 3, jit_state_to_str(jit->state), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 4, jit->funding_txid_hex, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 5, (int)jit->funding_vout);
+    sqlite3_bind_int64(stmt, 6, (sqlite3_int64)jit->funding_amount);
+    sqlite3_bind_int64(stmt, 7, (sqlite3_int64)jit->channel.local_amount);
+    sqlite3_bind_int64(stmt, 8, (sqlite3_int64)jit->channel.remote_amount);
+    sqlite3_bind_int64(stmt, 9, (sqlite3_int64)jit->channel.commitment_number);
+    sqlite3_bind_int64(stmt, 10, (sqlite3_int64)jit->created_at);
+    sqlite3_bind_int(stmt, 11, (int)jit->created_block);
+    sqlite3_bind_int(stmt, 12, (int)jit->target_factory_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+size_t persist_load_jit_channels(persist_t *p, void *out_ptr, size_t max,
+                                   size_t *count_out) {
+    if (!p || !p->db || !out_ptr || !count_out) return 0;
+    jit_channel_t *out = (jit_channel_t *)out_ptr;
+
+    const char *sql =
+        "SELECT jit_channel_id, client_idx, state, funding_txid, funding_vout, "
+        "funding_amount, local_amount, remote_amount, commitment_number, "
+        "created_at, created_block, target_factory_id "
+        "FROM jit_channels ORDER BY jit_channel_id;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK) {
+        *count_out = 0;
+        return 0;
+    }
+
+    size_t count = 0;
+    while (sqlite3_step(stmt) == SQLITE_ROW && count < max) {
+        jit_channel_t *jit = &out[count];
+        memset(jit, 0, sizeof(*jit));
+        jit->jit_channel_id = (uint32_t)sqlite3_column_int(stmt, 0);
+        jit->client_idx = (size_t)sqlite3_column_int(stmt, 1);
+        const char *state_str = (const char *)sqlite3_column_text(stmt, 2);
+        jit->state = jit_state_from_str(state_str);
+        const char *txid = (const char *)sqlite3_column_text(stmt, 3);
+        if (txid) {
+            strncpy(jit->funding_txid_hex, txid, 64);
+            jit->funding_txid_hex[64] = '\0';
+        }
+        jit->funding_vout = (uint32_t)sqlite3_column_int(stmt, 4);
+        jit->funding_amount = (uint64_t)sqlite3_column_int64(stmt, 5);
+        jit->channel.local_amount = (uint64_t)sqlite3_column_int64(stmt, 6);
+        jit->channel.remote_amount = (uint64_t)sqlite3_column_int64(stmt, 7);
+        jit->channel.commitment_number = (uint64_t)sqlite3_column_int64(stmt, 8);
+        jit->created_at = (time_t)sqlite3_column_int64(stmt, 9);
+        jit->created_block = (uint32_t)sqlite3_column_int(stmt, 10);
+        jit->target_factory_id = (uint32_t)sqlite3_column_int(stmt, 11);
+        count++;
+    }
+
+    sqlite3_finalize(stmt);
+    *count_out = count;
+    return count;
+}
+
+int persist_update_jit_state(persist_t *p, uint32_t jit_id, const char *state) {
+    if (!p || !p->db || !state) return 0;
+
+    const char *sql =
+        "UPDATE jit_channels SET state = ? WHERE jit_channel_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, state, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(stmt, 2, (int)jit_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_update_jit_balance(persist_t *p, uint32_t jit_id,
+                                 uint64_t local, uint64_t remote, uint64_t cn) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "UPDATE jit_channels SET local_amount = ?, remote_amount = ?, "
+        "commitment_number = ? WHERE jit_channel_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int64(stmt, 1, (sqlite3_int64)local);
+    sqlite3_bind_int64(stmt, 2, (sqlite3_int64)remote);
+    sqlite3_bind_int64(stmt, 3, (sqlite3_int64)cn);
+    sqlite3_bind_int(stmt, 4, (int)jit_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_delete_jit_channel(persist_t *p, uint32_t jit_id) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "DELETE FROM jit_channels WHERE jit_channel_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)jit_id);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);

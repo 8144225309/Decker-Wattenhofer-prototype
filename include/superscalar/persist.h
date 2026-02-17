@@ -282,4 +282,27 @@ size_t persist_load_pending(persist_t *p, char (*txids_out)[65],
 /* Delete a pending entry by txid (e.g., after confirmation). */
 int persist_delete_pending(persist_t *p, const char *txid);
 
+/* --- JIT Channel persistence (Gap #2) --- */
+
+/* Forward declaration */
+struct jit_channel;
+typedef struct jit_channel jit_channel_t;
+
+/* Save a JIT channel entry to the database. */
+int persist_save_jit_channel(persist_t *p, const void *jit_ptr);
+
+/* Load all JIT channels. Returns count loaded. */
+size_t persist_load_jit_channels(persist_t *p, void *out_ptr, size_t max,
+                                   size_t *count_out);
+
+/* Update JIT channel state. */
+int persist_update_jit_state(persist_t *p, uint32_t jit_id, const char *state);
+
+/* Update JIT channel balance. */
+int persist_update_jit_balance(persist_t *p, uint32_t jit_id,
+                                 uint64_t local, uint64_t remote, uint64_t cn);
+
+/* Delete a JIT channel by ID. */
+int persist_delete_jit_channel(persist_t *p, uint32_t jit_id);
+
 #endif /* SUPERSCALAR_PERSIST_H */

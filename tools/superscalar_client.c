@@ -9,6 +9,7 @@
 #include "superscalar/regtest.h"
 #include "superscalar/watchtower.h"
 #include "superscalar/fee.h"
+#include "superscalar/jit_channel.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -213,6 +214,7 @@ typedef struct {
     watchtower_t *wt;
     fee_estimator_t *fee;
     regtest_t *rt;
+    jit_channel_t *jit_ch;  /* JIT channel, or NULL */
 } daemon_cb_data_t;
 
 /* Receive and process LSP's own revocation (bidirectional revocation).
@@ -548,6 +550,219 @@ static int daemon_channel_cb(int fd, channel_t *ch, uint32_t my_index,
             break;
         }
 
+        case MSG_JIT_OFFER: {
+            /* LSP offers a JIT channel */
+            size_t jit_cidx;
+            uint64_t jit_amount;
+            char jit_reason[64];
+            secp256k1_pubkey jit_lsp_pk;
+            if (!wire_parse_jit_offer(msg.json, ctx, &jit_cidx, &jit_amount,
+                                        jit_reason, sizeof(jit_reason), &jit_lsp_pk)) {
+                fprintf(stderr, "Client %u: bad JIT_OFFER\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
+
+            printf("Client %u: JIT offer received (%llu sats, reason: %s)\n",
+                   my_index, (unsigned long long)jit_amount, jit_reason);
+
+            /* Auto-accept (PoC) */
+            secp256k1_pubkey my_pk;
+            secp256k1_keypair_pub(ctx, &my_pk, keypair);
+            cJSON *accept = wire_build_jit_accept(jit_cidx, ctx, &my_pk);
+            wire_send(fd, MSG_JIT_ACCEPT, accept);
+            cJSON_Delete(accept);
+
+            /* Wait for basepoints exchange */
+            wire_msg_t bp_msg;
+            if (!wire_recv(fd, &bp_msg) ||
+                bp_msg.msg_type != MSG_CHANNEL_BASEPOINTS) {
+                if (bp_msg.json) cJSON_Delete(bp_msg.json);
+                fprintf(stderr, "Client %u: expected CHANNEL_BASEPOINTS for JIT\n", my_index);
+                break;
+            }
+
+            /* Allocate JIT channel if not yet present */
+            if (!cbd->jit_ch) {
+                cbd->jit_ch = calloc(1, sizeof(jit_channel_t));
+                if (!cbd->jit_ch) {
+                    cJSON_Delete(bp_msg.json);
+                    break;
+                }
+            }
+            jit_channel_t *jit = cbd->jit_ch;
+
+            /* Parse LSP's basepoints */
+            uint32_t bp_ch_id;
+            secp256k1_pubkey pay_bp, delay_bp, revoc_bp, htlc_bp, first_pcp, second_pcp;
+            if (!wire_parse_channel_basepoints(bp_msg.json, &bp_ch_id, ctx,
+                                                 &pay_bp, &delay_bp, &revoc_bp, &htlc_bp,
+                                                 &first_pcp, &second_pcp)) {
+                cJSON_Delete(bp_msg.json);
+                break;
+            }
+            cJSON_Delete(bp_msg.json);
+
+            jit->jit_channel_id = bp_ch_id;
+            jit->client_idx = jit_cidx;
+
+            /* For the client, "local" = client, "remote" = LSP.
+               We'll init the channel_t when we get JIT_READY with funding info.
+               For now, store the LSP's basepoints temporarily. */
+
+            /* Send client's basepoints back */
+            {
+                /* We need a temporary channel_t context to generate basepoints.
+                   Use a stack-local secp ctx. */
+                channel_t *jch = &jit->channel;
+                jch->ctx = ctx;
+
+                /* Generate client basepoints */
+                channel_generate_random_basepoints(jch);
+
+                secp256k1_pubkey c_first_pcp, c_second_pcp;
+                /* Generate per-commitment secrets */
+                channel_generate_local_pcs(jch, 0);
+                channel_generate_local_pcs(jch, 1);
+                channel_get_per_commitment_point(jch, 0, &c_first_pcp);
+                channel_get_per_commitment_point(jch, 1, &c_second_pcp);
+
+                cJSON *client_bp = wire_build_channel_basepoints(
+                    bp_ch_id, ctx,
+                    &jch->local_payment_basepoint,
+                    &jch->local_delayed_payment_basepoint,
+                    &jch->local_revocation_basepoint,
+                    &jch->local_htlc_basepoint,
+                    &c_first_pcp, &c_second_pcp);
+                wire_send(fd, MSG_CHANNEL_BASEPOINTS, client_bp);
+                cJSON_Delete(client_bp);
+
+                /* Store LSP's basepoints as remote */
+                channel_set_remote_basepoints(jch, &pay_bp, &delay_bp, &revoc_bp);
+                channel_set_remote_htlc_basepoint(jch, &htlc_bp);
+                channel_set_remote_pcp(jch, 0, &first_pcp);
+                channel_set_remote_pcp(jch, 1, &second_pcp);
+            }
+
+            /* Exchange nonces */
+            {
+                wire_msg_t nm;
+                if (!wire_recv(fd, &nm) || nm.msg_type != MSG_CHANNEL_NONCES) {
+                    if (nm.json) cJSON_Delete(nm.json);
+                    break;
+                }
+                uint32_t nm_ch_id;
+                unsigned char lsp_nonces[MUSIG_NONCE_POOL_MAX][66];
+                size_t lsp_nc;
+                wire_parse_channel_nonces(nm.json, &nm_ch_id, lsp_nonces,
+                                            MUSIG_NONCE_POOL_MAX, &lsp_nc);
+                cJSON_Delete(nm.json);
+
+                /* Init nonce pool and send client's nonces */
+                channel_init_nonce_pool(&jit->channel, MUSIG_NONCE_POOL_MAX);
+                channel_set_remote_pubnonces(&jit->channel,
+                    (const unsigned char (*)[66])lsp_nonces, lsp_nc);
+
+                size_t nc = jit->channel.local_nonce_pool.count;
+                unsigned char (*pn_ser)[66] = calloc(nc, 66);
+                if (pn_ser) {
+                    for (size_t i = 0; i < nc; i++)
+                        musig_pubnonce_serialize(ctx, pn_ser[i],
+                            &jit->channel.local_nonce_pool.nonces[i].pubnonce);
+                    cJSON *cnm = wire_build_channel_nonces(bp_ch_id,
+                        (const unsigned char (*)[66])pn_ser, nc);
+                    wire_send(fd, MSG_CHANNEL_NONCES, cnm);
+                    cJSON_Delete(cnm);
+                    free(pn_ser);
+                }
+            }
+
+            /* Wait for JIT_READY */
+            {
+                wire_msg_t ready_msg;
+                if (!wire_recv(fd, &ready_msg) ||
+                    ready_msg.msg_type != MSG_JIT_READY) {
+                    if (ready_msg.json) cJSON_Delete(ready_msg.json);
+                    fprintf(stderr, "Client %u: expected JIT_READY\n", my_index);
+                    break;
+                }
+
+                uint32_t jit_ch_id;
+                char fund_txid_hex[65];
+                uint32_t fund_vout;
+                uint64_t fund_amount, local_amt, remote_amt;
+                if (!wire_parse_jit_ready(ready_msg.json, &jit_ch_id,
+                                            fund_txid_hex, sizeof(fund_txid_hex),
+                                            &fund_vout, &fund_amount,
+                                            &local_amt, &remote_amt)) {
+                    cJSON_Delete(ready_msg.json);
+                    break;
+                }
+                cJSON_Delete(ready_msg.json);
+
+                /* Finalize JIT channel init — for client, swap local/remote
+                   since LSP's local is client's remote */
+                jit->jit_channel_id = jit_ch_id;
+                strncpy(jit->funding_txid_hex, fund_txid_hex, 64);
+                jit->funding_amount = fund_amount;
+                jit->funding_vout = fund_vout;
+                jit->funding_confirmed = 1;
+
+                /* Set balances: from client perspective, local_amt is LSP's local
+                   (= our remote), remote_amt is LSP's remote (= our local) */
+                jit->channel.local_amount = remote_amt;
+                jit->channel.remote_amount = local_amt;
+                jit->channel.funding_amount = fund_amount;
+                jit->channel.funder_is_local = 0;
+
+                jit->state = JIT_STATE_OPEN;
+
+                /* Register JIT channel with client watchtower */
+                if (cbd && cbd->wt)
+                    watchtower_set_channel(cbd->wt, 0, &jit->channel);
+
+                /* Persist JIT channel */
+                if (cbd && cbd->db) {
+                    persist_save_jit_channel(cbd->db, jit);
+                    persist_save_basepoints(cbd->db, jit->jit_channel_id,
+                                              &jit->channel);
+                }
+
+                printf("Client %u: JIT channel %08x open (%llu sats)\n",
+                       my_index, jit_ch_id, (unsigned long long)fund_amount);
+            }
+            break;
+        }
+
+        case MSG_JIT_MIGRATE: {
+            /* LSP requests migration of JIT channel to factory */
+            uint32_t mig_jit_id, mig_factory_id;
+            uint64_t mig_local, mig_remote;
+            if (!wire_parse_jit_migrate(msg.json, &mig_jit_id, &mig_factory_id,
+                                          &mig_local, &mig_remote)) {
+                fprintf(stderr, "Client %u: bad JIT_MIGRATE\n", my_index);
+                cJSON_Delete(msg.json);
+                break;
+            }
+            cJSON_Delete(msg.json);
+
+            printf("Client %u: JIT channel %08x migrating to factory %u\n",
+                   my_index, mig_jit_id, mig_factory_id);
+
+            if (cbd->jit_ch && cbd->jit_ch->jit_channel_id == mig_jit_id) {
+                cbd->jit_ch->state = JIT_STATE_CLOSED;
+                /* Remove watchtower entries for JIT channel */
+                if (cbd->wt)
+                    watchtower_remove_channel(cbd->wt, 0);
+                /* Remove from persistence */
+                if (cbd->db)
+                    persist_delete_jit_channel(cbd->db, mig_jit_id);
+                printf("Client %u: JIT channel closed (migrated)\n", my_index);
+            }
+            break;
+        }
+
         case MSG_FACTORY_PROPOSE: {
             /* LSP initiates factory rotation — create new factory */
             printf("Client %u: received FACTORY_PROPOSE (rotation)\n", my_index);
@@ -865,6 +1080,48 @@ int main(int argc, char *argv[]) {
             }
             if (n_ci > 0)
                 printf("Client: loaded %zu invoices from DB\n", n_ci);
+
+            /* Load active JIT channel from DB */
+            {
+                jit_channel_t jit_loaded[JIT_MAX_CHANNELS];
+                size_t jit_count = 0;
+                persist_load_jit_channels(&db, jit_loaded, JIT_MAX_CHANNELS,
+                                            &jit_count);
+                for (size_t ji = 0; ji < jit_count; ji++) {
+                    if (jit_loaded[ji].state == JIT_STATE_OPEN) {
+                        cbd.jit_ch = calloc(1, sizeof(jit_channel_t));
+                        if (cbd.jit_ch) {
+                            memcpy(cbd.jit_ch, &jit_loaded[ji],
+                                   sizeof(jit_channel_t));
+                            cbd.jit_ch->channel.ctx = ctx;
+                            /* Reload basepoints from DB */
+                            unsigned char ls[4][32], rb[4][33];
+                            if (persist_load_basepoints(&db,
+                                    jit_loaded[ji].jit_channel_id, ls, rb)) {
+                                memcpy(cbd.jit_ch->channel.local_payment_basepoint_secret, ls[0], 32);
+                                memcpy(cbd.jit_ch->channel.local_delayed_payment_basepoint_secret, ls[1], 32);
+                                memcpy(cbd.jit_ch->channel.local_revocation_basepoint_secret, ls[2], 32);
+                                memcpy(cbd.jit_ch->channel.local_htlc_basepoint_secret, ls[3], 32);
+                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_payment_basepoint, ls[0]);
+                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_delayed_payment_basepoint, ls[1]);
+                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_revocation_basepoint, ls[2]);
+                                secp256k1_ec_pubkey_create(ctx, &cbd.jit_ch->channel.local_htlc_basepoint, ls[3]);
+                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_payment_basepoint, rb[0], 33);
+                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_delayed_payment_basepoint, rb[1], 33);
+                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_revocation_basepoint, rb[2], 33);
+                                secp256k1_ec_pubkey_parse(ctx, &cbd.jit_ch->channel.remote_htlc_basepoint, rb[3], 33);
+                            }
+                            /* Register with watchtower */
+                            if (cbd.wt)
+                                watchtower_set_channel(cbd.wt, 0,
+                                    &cbd.jit_ch->channel);
+                            printf("Client: loaded JIT channel %08x from DB\n",
+                                   cbd.jit_ch->jit_channel_id);
+                        }
+                        break;  /* Only one JIT per client */
+                    }
+                }
+            }
         }
 
         int first_run = 1;

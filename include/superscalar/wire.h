@@ -60,6 +60,12 @@
 /* Basepoint exchange (Gap #1) */
 #define MSG_CHANNEL_BASEPOINTS  0x4F  /* Both: exchange channel basepoint pubkeys */
 
+/* JIT Channel Fallback (Gap #2) */
+#define MSG_JIT_OFFER           0x51  /* LSP -> Client: offer JIT channel */
+#define MSG_JIT_ACCEPT          0x52  /* Client -> LSP: accept JIT channel */
+#define MSG_JIT_READY           0x53  /* LSP -> Client: JIT channel funded + ready */
+#define MSG_JIT_MIGRATE         0x54  /* LSP -> Client: migrate JIT to factory */
+
 #define MSG_ERROR              0xFF
 
 /* --- Protocol limits --- */
@@ -371,6 +377,50 @@ int wire_parse_channel_basepoints(
     secp256k1_pubkey *htlc_bp_out,
     secp256k1_pubkey *first_pcp_out,
     secp256k1_pubkey *second_pcp_out);
+
+/* --- JIT Channel messages (Gap #2) --- */
+
+/* LSP -> Client: JIT_OFFER {client_idx, funding_amount, reason, lsp_pubkey} */
+cJSON *wire_build_jit_offer(size_t client_idx, uint64_t funding_amount,
+                              const char *reason,
+                              const secp256k1_context *ctx,
+                              const secp256k1_pubkey *lsp_pubkey);
+
+int wire_parse_jit_offer(const cJSON *json, const secp256k1_context *ctx,
+                           size_t *client_idx, uint64_t *funding_amount,
+                           char *reason, size_t reason_len,
+                           secp256k1_pubkey *lsp_pubkey);
+
+/* Client -> LSP: JIT_ACCEPT {client_idx, client_pubkey} */
+cJSON *wire_build_jit_accept(size_t client_idx,
+                               const secp256k1_context *ctx,
+                               const secp256k1_pubkey *client_pubkey);
+
+int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
+                            size_t *client_idx,
+                            secp256k1_pubkey *client_pubkey);
+
+/* LSP -> Client: JIT_READY {jit_channel_id, funding_txid, vout, amount,
+                              local_amount, remote_amount} */
+cJSON *wire_build_jit_ready(uint32_t jit_channel_id,
+                              const char *funding_txid_hex,
+                              uint32_t vout, uint64_t amount,
+                              uint64_t local_amount, uint64_t remote_amount);
+
+int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
+                           char *funding_txid_hex, size_t hex_len,
+                           uint32_t *vout, uint64_t *amount,
+                           uint64_t *local_amount, uint64_t *remote_amount);
+
+/* LSP -> Client: JIT_MIGRATE {jit_channel_id, target_factory_id,
+                                local_balance, remote_balance} */
+cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
+                                uint32_t target_factory_id,
+                                uint64_t local_balance, uint64_t remote_balance);
+
+int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
+                             uint32_t *target_factory_id,
+                             uint64_t *local_balance, uint64_t *remote_balance);
 
 /* --- Bundle parsing --- */
 

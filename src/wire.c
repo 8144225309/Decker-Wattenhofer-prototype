@@ -95,6 +95,10 @@ const char *wire_msg_type_name(uint8_t type) {
     case 0x4E: return "PTLC_COMPLETE";
     case 0x4F: return "CHANNEL_BASEPOINTS";
     case 0x50: return "LSP_REVOKE_AND_ACK";
+    case 0x51: return "JIT_OFFER";
+    case 0x52: return "JIT_ACCEPT";
+    case 0x53: return "JIT_READY";
+    case 0x54: return "JIT_MIGRATE";
     case 0xFF: return "ERROR";
     default:   return "UNKNOWN";
     }
@@ -1131,6 +1135,143 @@ int wire_parse_channel_basepoints(
             memset(second_pcp_out, 0, sizeof(secp256k1_pubkey));
         }
     }
+    return 1;
+}
+
+/* --- JIT Channel messages (Gap #2) --- */
+
+cJSON *wire_build_jit_offer(size_t client_idx, uint64_t funding_amount,
+                              const char *reason,
+                              const secp256k1_context *ctx,
+                              const secp256k1_pubkey *lsp_pubkey) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "client_idx", (double)client_idx);
+    cJSON_AddNumberToObject(j, "funding_amount", (double)funding_amount);
+    cJSON_AddStringToObject(j, "reason", reason ? reason : "unknown");
+    if (ctx && lsp_pubkey) {
+        char hex[67];
+        pubkey_to_hex(ctx, lsp_pubkey, hex);
+        cJSON_AddStringToObject(j, "lsp_pubkey", hex);
+    }
+    return j;
+}
+
+int wire_parse_jit_offer(const cJSON *json, const secp256k1_context *ctx,
+                           size_t *client_idx, uint64_t *funding_amount,
+                           char *reason, size_t reason_len,
+                           secp256k1_pubkey *lsp_pubkey) {
+    cJSON *ci = cJSON_GetObjectItem(json, "client_idx");
+    cJSON *fa = cJSON_GetObjectItem(json, "funding_amount");
+    cJSON *re = cJSON_GetObjectItem(json, "reason");
+    cJSON *pk = cJSON_GetObjectItem(json, "lsp_pubkey");
+    if (!ci || !cJSON_IsNumber(ci) || !fa || !cJSON_IsNumber(fa))
+        return 0;
+    *client_idx = (size_t)ci->valuedouble;
+    *funding_amount = (uint64_t)fa->valuedouble;
+    if (reason && reason_len > 0 && re && cJSON_IsString(re)) {
+        strncpy(reason, re->valuestring, reason_len - 1);
+        reason[reason_len - 1] = '\0';
+    }
+    if (lsp_pubkey && pk && cJSON_IsString(pk) && ctx) {
+        if (!hex_to_pubkey(ctx, lsp_pubkey, pk->valuestring))
+            return 0;
+    }
+    return 1;
+}
+
+cJSON *wire_build_jit_accept(size_t client_idx,
+                               const secp256k1_context *ctx,
+                               const secp256k1_pubkey *client_pubkey) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "client_idx", (double)client_idx);
+    if (ctx && client_pubkey) {
+        char hex[67];
+        pubkey_to_hex(ctx, client_pubkey, hex);
+        cJSON_AddStringToObject(j, "client_pubkey", hex);
+    }
+    return j;
+}
+
+int wire_parse_jit_accept(const cJSON *json, const secp256k1_context *ctx,
+                            size_t *client_idx,
+                            secp256k1_pubkey *client_pubkey) {
+    cJSON *ci = cJSON_GetObjectItem(json, "client_idx");
+    cJSON *pk = cJSON_GetObjectItem(json, "client_pubkey");
+    if (!ci || !cJSON_IsNumber(ci))
+        return 0;
+    *client_idx = (size_t)ci->valuedouble;
+    if (client_pubkey && pk && cJSON_IsString(pk) && ctx) {
+        if (!hex_to_pubkey(ctx, client_pubkey, pk->valuestring))
+            return 0;
+    }
+    return 1;
+}
+
+cJSON *wire_build_jit_ready(uint32_t jit_channel_id,
+                              const char *funding_txid_hex,
+                              uint32_t vout, uint64_t amount,
+                              uint64_t local_amount, uint64_t remote_amount) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "jit_channel_id", jit_channel_id);
+    cJSON_AddStringToObject(j, "funding_txid", funding_txid_hex ? funding_txid_hex : "");
+    cJSON_AddNumberToObject(j, "vout", vout);
+    cJSON_AddNumberToObject(j, "amount", (double)amount);
+    cJSON_AddNumberToObject(j, "local_amount", (double)local_amount);
+    cJSON_AddNumberToObject(j, "remote_amount", (double)remote_amount);
+    return j;
+}
+
+int wire_parse_jit_ready(const cJSON *json, uint32_t *jit_channel_id,
+                           char *funding_txid_hex, size_t hex_len,
+                           uint32_t *vout, uint64_t *amount,
+                           uint64_t *local_amount, uint64_t *remote_amount) {
+    cJSON *ji = cJSON_GetObjectItem(json, "jit_channel_id");
+    cJSON *tx = cJSON_GetObjectItem(json, "funding_txid");
+    cJSON *vo = cJSON_GetObjectItem(json, "vout");
+    cJSON *am = cJSON_GetObjectItem(json, "amount");
+    cJSON *la = cJSON_GetObjectItem(json, "local_amount");
+    cJSON *ra = cJSON_GetObjectItem(json, "remote_amount");
+    if (!ji || !cJSON_IsNumber(ji) || !tx || !cJSON_IsString(tx) ||
+        !vo || !cJSON_IsNumber(vo) || !am || !cJSON_IsNumber(am) ||
+        !la || !cJSON_IsNumber(la) || !ra || !cJSON_IsNumber(ra))
+        return 0;
+    *jit_channel_id = (uint32_t)ji->valuedouble;
+    if (funding_txid_hex && hex_len > 0) {
+        strncpy(funding_txid_hex, tx->valuestring, hex_len - 1);
+        funding_txid_hex[hex_len - 1] = '\0';
+    }
+    *vout = (uint32_t)vo->valuedouble;
+    *amount = (uint64_t)am->valuedouble;
+    *local_amount = (uint64_t)la->valuedouble;
+    *remote_amount = (uint64_t)ra->valuedouble;
+    return 1;
+}
+
+cJSON *wire_build_jit_migrate(uint32_t jit_channel_id,
+                                uint32_t target_factory_id,
+                                uint64_t local_balance, uint64_t remote_balance) {
+    cJSON *j = cJSON_CreateObject();
+    cJSON_AddNumberToObject(j, "jit_channel_id", jit_channel_id);
+    cJSON_AddNumberToObject(j, "target_factory_id", target_factory_id);
+    cJSON_AddNumberToObject(j, "local_balance", (double)local_balance);
+    cJSON_AddNumberToObject(j, "remote_balance", (double)remote_balance);
+    return j;
+}
+
+int wire_parse_jit_migrate(const cJSON *json, uint32_t *jit_channel_id,
+                             uint32_t *target_factory_id,
+                             uint64_t *local_balance, uint64_t *remote_balance) {
+    cJSON *ji = cJSON_GetObjectItem(json, "jit_channel_id");
+    cJSON *tf = cJSON_GetObjectItem(json, "target_factory_id");
+    cJSON *lb = cJSON_GetObjectItem(json, "local_balance");
+    cJSON *rb = cJSON_GetObjectItem(json, "remote_balance");
+    if (!ji || !cJSON_IsNumber(ji) || !tf || !cJSON_IsNumber(tf) ||
+        !lb || !cJSON_IsNumber(lb) || !rb || !cJSON_IsNumber(rb))
+        return 0;
+    *jit_channel_id = (uint32_t)ji->valuedouble;
+    *target_factory_id = (uint32_t)tf->valuedouble;
+    *local_balance = (uint64_t)lb->valuedouble;
+    *remote_balance = (uint64_t)rb->valuedouble;
     return 1;
 }
 

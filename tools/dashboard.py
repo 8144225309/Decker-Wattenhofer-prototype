@@ -143,6 +143,13 @@ def collect_databases(cfg):
         rows, err = query_db(path,
             "SELECT * FROM id_counters ORDER BY name")
         data[label]["id_counters"] = rows if not err else []
+        # JIT Channels (Gap #2 hardening)
+        rows, err = query_db(path,
+            "SELECT jit_channel_id, client_idx, state, funding_txid, "
+            "funding_vout, funding_amount, local_amount, remote_amount, "
+            "commitment_number, created_at, target_factory_id "
+            "FROM jit_channels ORDER BY jit_channel_id")
+        data[label]["jit_channels"] = rows if not err else []
     return data
 
 def collect_cln(cfg):
@@ -544,6 +551,15 @@ function rOverview(D){
    h+=`<tr><td>${c.id}</td><td>${c.slot??'\u2014'}</td><td class="r">${fs(l)}</td><td class="r">${fs(r)}</td><td>${bar(l,r)}</td><td class="r">${c.commitment_number??'?'}</td><td>${sb(c.state)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
+ // JIT Channels summary
+ const jits=lsp.jit_channels||[];
+ h+=`<div class="s"><div class="st"><span>JIT Channels</span><span class="c">${jits.length}</span></div>`;
+ if(!jits.length)h+=`<p class="mu">No active JIT channels</p>`;
+ else{h+=`<table><tr><th>JIT ID</th><th>Client</th><th>State</th><th>Funding TXID</th><th class="r">Amount</th><th class="r">Local</th><th class="r">Remote</th><th>Created</th></tr>`;
+  for(const j of jits){
+   h+=`<tr><td>0x${(j.jit_channel_id||0).toString(16)}</td><td>${j.client_idx}</td><td>${sb(j.state)}</td><td class="h">${th(j.funding_txid)}</td><td class="r">${fs(j.funding_amount)}</td><td class="r">${fs(j.local_amount)}</td><td class="r">${fs(j.remote_amount)}</td><td>${ta(j.created_at)}</td></tr>`;}
+  h+=`</table>`;}
+ h+=`</div>`;
  // CLN summary
  h+=`<div class="g2">`;
  for(const[k,lb]of[['a','CLN Node A'],['b','CLN Node B']]){
@@ -639,6 +655,15 @@ function rChannels(D){
  else{h+=`<table><tr><th>CH</th><th>Slot</th><th class="r">Local</th><th class="r">Remote</th><th class="r">Cap</th><th style="min-width:70px">Balance</th><th class="r">Commits</th><th class="r">Revoked</th><th>Nonces (L/R)</th><th>State</th></tr>`;
   for(const c of chs){const l=c.local_amount||0,rm=c.remote_amount||0,np=nMap[c.id]||{};
    h+=`<tr><td>${c.id}</td><td>${c.slot??'\u2014'}</td><td class="r">${fs(l)}</td><td class="r">${fs(rm)}</td><td class="r">${fs(c.funding_amount)}</td><td>${bar(l,rm)}</td><td class="r">${c.commitment_number??'?'}</td><td class="r">${revMap[c.id]??0}</td><td>${np.local??'?'} / ${np.remote??'?'}</td><td>${sb(c.state)}</td></tr>`;}
+  h+=`</table>`;}
+ h+=`</div>`;
+ // JIT Channels detail
+ const jits=lsp.jit_channels||[];
+ h+=`<div class="s"><div class="st"><span>JIT Channels (Standalone 2-of-2)</span><span class="c">${jits.length}</span></div>`;
+ if(!jits.length)h+=`<p class="mu">No JIT channels</p>`;
+ else{h+=`<table><tr><th>JIT ID</th><th>Client</th><th>State</th><th>Funding TXID</th><th class="r">Amount</th><th class="r">Local</th><th class="r">Remote</th><th style="min-width:60px">Balance</th><th class="r">Commits</th><th>Target</th><th>Created</th></tr>`;
+  for(const j of jits){const jl=j.local_amount||0,jr=j.remote_amount||0;
+   h+=`<tr><td>0x${(j.jit_channel_id||0).toString(16)}</td><td>${j.client_idx}</td><td>${sb(j.state)}</td><td class="h">${th(j.funding_txid)}</td><td class="r">${fs(j.funding_amount)}</td><td class="r">${fs(jl)}</td><td class="r">${fs(jr)}</td><td>${bar(jl,jr)}</td><td class="r">${j.commitment_number??'?'}</td><td>${j.target_factory_id||'\u2014'}</td><td>${ta(j.created_at)}</td></tr>`;}
   h+=`</table>`;}
  h+=`</div>`;
  // HTLCs
@@ -755,7 +780,8 @@ function rWatchtower(D){
  const oc=lsp.old_commitments||[];
  if(oc.length){h+=`<div class="st" style="margin-top:8px"><span>Old Commitments (breach detection)</span><span class="c">${oc.length}</span></div>`;
   h+=`<table><tr><th>CH</th><th>Commit#</th><th>TXID</th><th>Vout</th><th class="r">To-Local</th></tr>`;
-  for(const o of oc.slice(0,15))h+=`<tr><td>${o.channel_id}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;
+  for(const o of oc.slice(0,15)){const jitBadge=o.channel_id>=4?' <span class="b i">JIT</span>':'';
+   h+=`<tr><td>${o.channel_id}${jitBadge}</td><td>${o.commit_num}</td><td class="h">${th(o.txid)}</td><td>${o.to_local_vout??'\u2014'}</td><td class="r">${fs(o.to_local_amount)}</td></tr>`;}
   if(oc.length>15)h+=`<tr><td colspan="5" class="mu">\u2026 and ${oc.length-15} more</td></tr>`;
   h+=`</table>`;}
  h+=`</div>`;

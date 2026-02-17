@@ -6,12 +6,15 @@
 #include "wire.h"
 #include "watchtower.h"
 #include <signal.h>
+#include <time.h>
 
 /* Per-client channel entry managed by the LSP */
 typedef struct {
     channel_t channel;          /* Poon-Dryja channel (LSP=local, client=remote) */
     uint32_t channel_id;        /* channel_id sent over wire (= client index) */
     int ready;                  /* 1 after CHANNEL_READY sent */
+    time_t last_message_time;   /* epoch timestamp of last wire message */
+    int offline_detected;        /* 1 if declared offline */
 } lsp_channel_entry_t;
 
 /* Invoice registry entry for bridge inbound payments (Phase 14) */
@@ -72,6 +75,12 @@ typedef struct {
     uint64_t rot_funding_sats;
     int rot_auto_rotate;           /* 1 = auto-rotate enabled */
     uint32_t rot_attempted_mask;   /* bitmask: bit i = factory i already attempted */
+
+    /* JIT Channel Fallback (Gap #2) */
+    void *jit_channels;            /* jit_channel_t* array or NULL — avoids header dependency */
+    size_t n_jit_channels;
+    int jit_enabled;               /* 1 = JIT enabled (default), 0 = --no-jit */
+    uint64_t jit_funding_sats;     /* per-client JIT funding amount */
 } lsp_channel_mgr_t;
 
 /* Initialize channels from factory leaf outputs.

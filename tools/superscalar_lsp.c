@@ -1,5 +1,6 @@
 #include "superscalar/lsp.h"
 #include "superscalar/lsp_channels.h"
+#include "superscalar/jit_channel.h"
 #include "superscalar/tx_builder.h"
 #include "superscalar/regtest.h"
 #include "superscalar/report.h"
@@ -65,6 +66,8 @@ static void usage(const char *prog) {
         "  --test-rotation     After demo: full factory rotation (PTLC over wire + new factory)\n"
         "  --active-blocks N   Factory active period in blocks (default: 20 regtest, 4320 non-regtest)\n"
         "  --dying-blocks N    Factory dying period in blocks (default: 10 regtest, 432 non-regtest)\n"
+        "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
+        "  --no-jit            Disable JIT channel fallback\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -329,6 +332,8 @@ int main(int argc, char *argv[]) {
     int test_rotation = 0;
     int32_t active_blocks_arg = -1;  /* -1 = auto */
     int32_t dying_blocks_arg = -1;   /* -1 = auto */
+    int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
+    int no_jit = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -385,6 +390,10 @@ int main(int argc, char *argv[]) {
             active_blocks_arg = (int32_t)atoi(argv[++i]);
         else if (strcmp(argv[i], "--dying-blocks") == 0 && i + 1 < argc)
             dying_blocks_arg = (int32_t)atoi(argv[++i]);
+        else if (strcmp(argv[i], "--jit-amount") == 0 && i + 1 < argc)
+            jit_amount_arg = (int64_t)strtoll(argv[++i], NULL, 10);
+        else if (strcmp(argv[i], "--no-jit") == 0)
+            no_jit = 1;
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -894,6 +903,44 @@ int main(int argc, char *argv[]) {
         mgr.rot_funding_sats = funding_sats;
         mgr.rot_auto_rotate = daemon_mode;  /* auto-rotate when in daemon mode */
         mgr.rot_attempted_mask = 0;
+
+        /* JIT Channel Fallback (Gap #2) */
+        jit_channels_init(&mgr);
+        if (no_jit) mgr.jit_enabled = 0;
+        mgr.jit_funding_sats = (jit_amount_arg > 0) ?
+            (uint64_t)jit_amount_arg : (funding_sats / (uint64_t)n_clients);
+
+        /* Load persisted JIT channels from DB */
+        if (use_db) {
+            jit_channel_t *jits = (jit_channel_t *)mgr.jit_channels;
+            size_t jit_count = 0;
+            persist_load_jit_channels(&db, jits, JIT_MAX_CHANNELS, &jit_count);
+            mgr.n_jit_channels = jit_count;
+            for (size_t ji = 0; ji < jit_count; ji++) {
+                if (jits[ji].state == JIT_STATE_OPEN) {
+                    unsigned char ls[4][32], rb[4][33];
+                    if (persist_load_basepoints(&db, jits[ji].jit_channel_id,
+                                                  ls, rb)) {
+                        memcpy(jits[ji].channel.local_payment_basepoint_secret, ls[0], 32);
+                        memcpy(jits[ji].channel.local_delayed_payment_basepoint_secret, ls[1], 32);
+                        memcpy(jits[ji].channel.local_revocation_basepoint_secret, ls[2], 32);
+                        memcpy(jits[ji].channel.local_htlc_basepoint_secret, ls[3], 32);
+                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_payment_basepoint, ls[0]);
+                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_delayed_payment_basepoint, ls[1]);
+                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_revocation_basepoint, ls[2]);
+                        secp256k1_ec_pubkey_create(ctx, &jits[ji].channel.local_htlc_basepoint, ls[3]);
+                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_payment_basepoint, rb[0], 33);
+                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_delayed_payment_basepoint, rb[1], 33);
+                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_revocation_basepoint, rb[2], 33);
+                        secp256k1_ec_pubkey_parse(ctx, &jits[ji].channel.remote_htlc_basepoint, rb[3], 33);
+                    }
+                    size_t wt_idx = mgr.n_channels + jits[ji].client_idx;
+                    watchtower_set_channel(&wt, wt_idx, &jits[ji].channel);
+                }
+            }
+            if (jit_count > 0)
+                printf("LSP: loaded %zu JIT channels from DB\n", jit_count);
+        }
 
         if (n_payments > 0) {
             printf("LSP: channels ready, waiting for %d payments (%d messages)...\n",
@@ -2003,6 +2050,7 @@ int main(int argc, char *argv[]) {
     report_add_string(&rpt, "result", "success");
     report_close(&rpt);
 
+    jit_channels_cleanup(&mgr);
     if (use_db)
         persist_close(&db);
     lsp_cleanup(&lsp);

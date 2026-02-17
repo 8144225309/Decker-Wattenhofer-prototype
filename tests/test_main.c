@@ -304,6 +304,37 @@ extern int test_ladder_evict_expired(void);
 extern int test_rotation_trigger_condition(void);
 extern int test_rotation_context_save_restore(void);
 
+/* JIT Channel Fallback (Gap #2) */
+extern int test_last_message_time_update(void);
+extern int test_offline_detection_flag(void);
+extern int test_jit_offer_round_trip(void);
+extern int test_jit_accept_round_trip(void);
+extern int test_jit_ready_round_trip(void);
+extern int test_jit_migrate_round_trip(void);
+extern int test_jit_channel_init_and_find(void);
+extern int test_jit_channel_id_no_collision(void);
+extern int test_jit_routing_prefers_factory(void);
+extern int test_jit_routing_fallback(void);
+extern int test_client_jit_accept_flow(void);
+extern int test_client_jit_channel_dispatch(void);
+extern int test_persist_jit_save_load(void);
+extern int test_persist_jit_update(void);
+extern int test_persist_jit_delete(void);
+extern int test_jit_migrate_lifecycle(void);
+extern int test_jit_migrate_balance(void);
+extern int test_jit_state_conversion(void);
+extern int test_jit_msg_type_names(void);
+
+/* JIT Hardening */
+extern int test_jit_watchtower_registration(void);
+extern int test_jit_watchtower_revocation(void);
+extern int test_jit_watchtower_cleanup_on_close(void);
+extern int test_jit_persist_reload_active(void);
+extern int test_jit_persist_skip_closed(void);
+extern int test_jit_multiple_channels(void);
+extern int test_jit_multiple_watchtower_indices(void);
+extern int test_jit_funding_confirmation_transition(void);
+
 /* Edge Cases + Failure Modes */
 extern int test_dw_counter_single_state(void);
 extern int test_dw_delay_invariants(void);
@@ -573,6 +604,37 @@ static void run_unit_tests(void) {
     RUN_TEST(test_ladder_evict_expired);
     RUN_TEST(test_rotation_trigger_condition);
     RUN_TEST(test_rotation_context_save_restore);
+
+    printf("\n=== JIT Channel Fallback (Gap #2) ===\n");
+    RUN_TEST(test_last_message_time_update);
+    RUN_TEST(test_offline_detection_flag);
+    RUN_TEST(test_jit_offer_round_trip);
+    RUN_TEST(test_jit_accept_round_trip);
+    RUN_TEST(test_jit_ready_round_trip);
+    RUN_TEST(test_jit_migrate_round_trip);
+    RUN_TEST(test_jit_channel_init_and_find);
+    RUN_TEST(test_jit_channel_id_no_collision);
+    RUN_TEST(test_jit_routing_prefers_factory);
+    RUN_TEST(test_jit_routing_fallback);
+    RUN_TEST(test_client_jit_accept_flow);
+    RUN_TEST(test_client_jit_channel_dispatch);
+    RUN_TEST(test_persist_jit_save_load);
+    RUN_TEST(test_persist_jit_update);
+    RUN_TEST(test_persist_jit_delete);
+    RUN_TEST(test_jit_migrate_lifecycle);
+    RUN_TEST(test_jit_migrate_balance);
+    RUN_TEST(test_jit_state_conversion);
+    RUN_TEST(test_jit_msg_type_names);
+
+    printf("\n=== JIT Hardening ===\n");
+    RUN_TEST(test_jit_watchtower_registration);
+    RUN_TEST(test_jit_watchtower_revocation);
+    RUN_TEST(test_jit_watchtower_cleanup_on_close);
+    RUN_TEST(test_jit_persist_reload_active);
+    RUN_TEST(test_jit_persist_skip_closed);
+    RUN_TEST(test_jit_multiple_channels);
+    RUN_TEST(test_jit_multiple_watchtower_indices);
+    RUN_TEST(test_jit_funding_confirmation_transition);
 
     printf("\n=== Edge Cases + Failure Modes ===\n");
     RUN_TEST(test_dw_counter_single_state);
