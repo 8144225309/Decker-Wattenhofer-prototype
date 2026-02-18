@@ -35,14 +35,20 @@ static const unsigned char client_seckey[32] = {
     0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20, 0x20,
 };
 
-/* Set up a 2-of-2 MuSig factory UTXO on regtest. */
+/* Set up a 2-of-2 MuSig factory UTXO on regtest.
+   Returns the correct vout, amount, and scriptpubkey by matching
+   against the computed P2TR key (not just any P2TR output). */
 static int setup_factory(
     regtest_t *rt,
     secp256k1_context *ctx,
     secp256k1_keypair *kps,
     musig_keyagg_t *keyagg,
     char *factory_addr,
-    char *funding_txid
+    char *funding_txid,
+    int *found_vout_out,
+    uint64_t *fund_amount_out,
+    unsigned char *fund_spk_out,
+    size_t *fund_spk_len_out
 ) {
     if (!secp256k1_keypair_create(ctx, &kps[0], lsp_seckey)) return 0;
     if (!secp256k1_keypair_create(ctx, &kps[1], client_seckey)) return 0;
@@ -123,6 +129,26 @@ static int setup_factory(
     char mine_addr[128];
     if (!regtest_get_new_address(rt, mine_addr, sizeof(mine_addr))) return 0;
     if (!regtest_mine_blocks(rt, 1, mine_addr)) return 0;
+
+    /* Find the vout matching our computed SPK (not just any P2TR output).
+       Bitcoin Core v28+ uses P2TR change addresses, so both outputs may be P2TR. */
+    *found_vout_out = -1;
+    for (int v = 0; v < 4; v++) {
+        uint64_t amt;
+        unsigned char out_spk[64];
+        size_t out_spk_len = 0;
+        if (regtest_get_tx_output(rt, funding_txid, (uint32_t)v,
+                                   &amt, out_spk, &out_spk_len)) {
+            if (out_spk_len == 34 && memcmp(out_spk, spk, 34) == 0) {
+                *found_vout_out = v;
+                *fund_amount_out = amt;
+                memcpy(fund_spk_out, out_spk, 34);
+                *fund_spk_len_out = 34;
+                break;
+            }
+        }
+    }
+    if (*found_vout_out < 0) return 0;
 
     return 1;
 }
@@ -212,31 +238,20 @@ int test_regtest_basic_dw(void) {
     musig_keyagg_t keyagg;
     char factory_addr[128];
     char funding_txid[65];
-
-    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
-                "factory setup");
-
-    printf("  Factory funded: %s\n", funding_txid);
-
+    int found_vout = -1;
     uint64_t fund_amount;
     unsigned char fund_spk[34];
     size_t fund_spk_len;
 
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid,
+                              &found_vout, &fund_amount, fund_spk, &fund_spk_len),
+                "factory setup");
+
+    printf("  Factory funded: %s (vout %d)\n", funding_txid, found_vout);
+
     unsigned char fund_txid_bytes[32];
     hex_decode(funding_txid, fund_txid_bytes, 32);
     reverse_bytes(fund_txid_bytes, 32); /* display order -> internal order */
-
-    int found_vout = -1;
-    for (int v = 0; v < 2; v++) {
-        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
-                                   &fund_amount, fund_spk, &fund_spk_len)) {
-            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
-                found_vout = v;
-                break;
-            }
-        }
-    }
-    TEST_ASSERT(found_vout >= 0, "find factory vout");
 
     /* small step for test: 2 blocks instead of 144 */
     dw_layer_t layer;
@@ -262,16 +277,13 @@ int test_regtest_basic_dw(void) {
         fund_amount, fund_spk, fund_spk_len,
         nseq, &out_xpk, output_amount, state_txid);
 
-    if (sent) {
-        printf("  State tx in mempool: %s\n", state_txid);
-        regtest_mine_blocks(&rt, (int)nseq + 1, mine_addr);
+    TEST_ASSERT(sent, "broadcast state tx");
+    printf("  State tx in mempool: %s\n", state_txid);
+    regtest_mine_blocks(&rt, (int)nseq + 1, mine_addr);
 
-        int conf = regtest_get_confirmations(&rt, state_txid);
-        printf("  State tx confirmations: %d\n", conf);
-        TEST_ASSERT(conf > 0, "state tx should be confirmed");
-    } else {
-        printf("  State tx broadcast failed (sighash/sig debugging needed)\n");
-    }
+    int conf = regtest_get_confirmations(&rt, state_txid);
+    printf("  State tx confirmations: %d\n", conf);
+    TEST_ASSERT(conf > 0, "state tx should be confirmed");
 
     secp256k1_context_destroy(ctx);
     return 1;
@@ -298,28 +310,18 @@ int test_regtest_old_first_attack(void) {
     musig_keyagg_t keyagg;
     char factory_addr[128];
     char funding_txid[65];
-
-    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
-                "factory setup");
-
+    int found_vout = -1;
     uint64_t fund_amount;
     unsigned char fund_spk[34];
     size_t fund_spk_len;
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid,
+                              &found_vout, &fund_amount, fund_spk, &fund_spk_len),
+                "factory setup");
+
     unsigned char fund_txid_bytes[32];
     hex_decode(funding_txid, fund_txid_bytes, 32);
     reverse_bytes(fund_txid_bytes, 32);
-
-    int found_vout = -1;
-    for (int v = 0; v < 2; v++) {
-        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
-                                   &fund_amount, fund_spk, &fund_spk_len)) {
-            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
-                found_vout = v;
-                break;
-            }
-        }
-    }
-    TEST_ASSERT(found_vout >= 0, "find factory vout");
 
     /* DW layer: step=1, max_states=4 */
     dw_layer_t layer;
@@ -396,28 +398,18 @@ int test_regtest_musig_onchain(void) {
     musig_keyagg_t keyagg;
     char factory_addr[128];
     char funding_txid[65];
-
-    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
-                "factory setup");
-
+    int found_vout = -1;
     uint64_t fund_amount;
     unsigned char fund_spk[34];
     size_t fund_spk_len;
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid,
+                              &found_vout, &fund_amount, fund_spk, &fund_spk_len),
+                "factory setup");
+
     unsigned char fund_txid_bytes[32];
     hex_decode(funding_txid, fund_txid_bytes, 32);
     reverse_bytes(fund_txid_bytes, 32);
-
-    int found_vout = -1;
-    for (int v = 0; v < 2; v++) {
-        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
-                                   &fund_amount, fund_spk, &fund_spk_len)) {
-            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
-                found_vout = v;
-                break;
-            }
-        }
-    }
-    TEST_ASSERT(found_vout >= 0, "find factory vout");
 
     /* Build unsigned spending tx (nSequence=0) */
     unsigned char out_seckey[32];
@@ -534,28 +526,18 @@ int test_regtest_nsequence_edge(void) {
     musig_keyagg_t keyagg;
     char factory_addr[128];
     char funding_txid[65];
-
-    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid),
-                "factory setup");
-
+    int found_vout = -1;
     uint64_t fund_amount;
     unsigned char fund_spk[34];
     size_t fund_spk_len;
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr, funding_txid,
+                              &found_vout, &fund_amount, fund_spk, &fund_spk_len),
+                "factory setup");
+
     unsigned char fund_txid_bytes[32];
     hex_decode(funding_txid, fund_txid_bytes, 32);
     reverse_bytes(fund_txid_bytes, 32);
-
-    int found_vout = -1;
-    for (int v = 0; v < 2; v++) {
-        if (regtest_get_tx_output(&rt, funding_txid, (uint32_t)v,
-                                   &fund_amount, fund_spk, &fund_spk_len)) {
-            if (fund_spk_len == 34 && fund_spk[0] == 0x51) {
-                found_vout = v;
-                break;
-            }
-        }
-    }
-    TEST_ASSERT(found_vout >= 0, "find factory vout");
 
     /* DW layer: step=1, max_states=4, advance to state 1 */
     dw_layer_t layer;

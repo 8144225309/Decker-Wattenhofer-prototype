@@ -28,7 +28,10 @@ CLNA_DIR="$DATADIR/cln-a"
 CLNB_DIR="$DATADIR/cln-b"
 LOGDIR="$DATADIR/logs"
 LSPDB="$DATADIR/lsp.db"
-CLIENTDB="$DATADIR/client.db"
+CLIENTDB="$DATADIR/client1.db"
+CLIENT2DB="$DATADIR/client2.db"
+CLIENT3DB="$DATADIR/client3.db"
+CLIENT4DB="$DATADIR/client4.db"
 SCDIR="$(cd "$(dirname "$0")/.." 2>/dev/null && pwd)"
 LD_LIBRARY_PATH_SC="$SCBIN/_deps/secp256k1-zkp-build/src:$SCBIN/_deps/cjson-build"
 
@@ -504,7 +507,8 @@ cmd_start_lsp() {
     if pgrep -f "superscalar_lsp" &>/dev/null; then
         info "LSP is already running"
     else
-        step "Starting LSP (1 client, 50k sats, signet)..."
+        step "Starting LSP (4 clients, 200k sats, arity-1, signet)..."
+        # step-blocks=1 for fast demo, arity-1 for per-client leaves
         LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
             "$SCBIN/superscalar_lsp" \
                 --network signet \
@@ -512,9 +516,10 @@ cmd_start_lsp() {
                 --rpcuser "$RPCUSER" \
                 --rpcpassword "$RPCPASS" \
                 --port 9735 \
-                --clients 1 \
-                --amount 50000 \
+                --clients 4 \
+                --amount 200000 \
                 --arity 1 \
+                --step-blocks 1 \
                 --daemon \
                 --db "$LSPDB" \
                 --keyfile "$DATADIR/lsp.key" \
@@ -572,6 +577,201 @@ cmd_start_client() {
     fi
 
     nextstep "status"
+}
+
+# ==========================================================================
+# 11b. start-client2 (second client for 2-client factory)
+# ==========================================================================
+
+cmd_start_client2() {
+    header "Start SuperScalar Client 2"
+
+    mkdir -p "$LOGDIR"
+
+    if pgrep -f "superscalar_client.*client2.key" &>/dev/null; then
+        info "Client 2 is already running"
+    else
+        step "Starting client 2 (daemon mode)..."
+        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
+            "$SCBIN/superscalar_client" \
+                --keyfile "$DATADIR/client2.key" \
+                --passphrase superscalar \
+                --network signet \
+                --port 9735 \
+                --daemon \
+                --db "$CLIENT2DB" \
+            > "$LOGDIR/client2.log" 2>&1 &
+        CLIENT2_PID=$!
+        sleep 2
+
+        if kill -0 "$CLIENT2_PID" 2>/dev/null; then
+            info "Client 2 started (PID=$CLIENT2_PID)"
+            detail "DB:  $CLIENT2DB"
+            detail "Log: $LOGDIR/client2.log"
+        else
+            fail "Client 2 failed to start. Check $LOGDIR/client2.log"
+            exit 1
+        fi
+    fi
+
+    nextstep "status"
+}
+
+# ==========================================================================
+# Helper: start N clients in background
+# ==========================================================================
+
+_start_demo_clients() {
+    local NET="$1"        # signet or regtest
+    local PORT="$2"
+    local LOGPFX="$3"     # log filename prefix
+    local EXTRA_ARGS="${4:-}"
+
+    for i in 1 2 3 4; do
+        local KEYFILE="$DATADIR/client${i}.key"
+        local DBFILE="$DATADIR/client${i}.db"
+        local LOGFILE="$LOGDIR/${LOGPFX}_client${i}.log"
+
+        LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
+            "$SCBIN/superscalar_client" \
+                --keyfile "$KEYFILE" \
+                --passphrase superscalar \
+                --network "$NET" \
+                --port "$PORT" \
+                --db "$DBFILE" \
+                $EXTRA_ARGS \
+            > "$LOGFILE" 2>&1 &
+        eval "CLIENT${i}_PID=$!"
+        sleep 0.5
+    done
+    info "4 clients started"
+}
+
+# ==========================================================================
+# Demo: cooperative close (LSP + 4 clients, --demo, coop close)
+# ==========================================================================
+
+cmd_demo_coop() {
+    header "Demo: Factory + Payments + Cooperative Close"
+
+    mkdir -p "$LOGDIR"
+
+    step "Stopping any running SuperScalar processes..."
+    pkill -f "superscalar_lsp" 2>/dev/null || true
+    pkill -f "superscalar_client" 2>/dev/null || true
+    sleep 2
+
+    # Clean DBs for fresh demo
+    rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
+
+    step "Starting cooperative close demo (4 clients, arity-1)..."
+    detail "This will: connect 4 clients → create factory → run payments → cooperative close"
+    detail "On signet, factory creation waits for funding tx confirmation (~10 min)."
+
+    # Start LSP in background first (needs to listen before clients connect)
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
+        "$SCBIN/superscalar_lsp" \
+            --network signet \
+            --cli-path "$BTCBIN/bitcoin-cli" \
+            --rpcuser "$RPCUSER" \
+            --rpcpassword "$RPCPASS" \
+            --port 9735 \
+            --clients 4 \
+            --amount 200000 \
+            --arity 1 \
+            --step-blocks 1 \
+            --demo \
+            --db "$LSPDB" \
+            --keyfile "$DATADIR/lsp.key" \
+            --passphrase superscalar \
+        > "$LOGDIR/demo_coop.log" 2>&1 &
+    LSP_PID=$!
+    sleep 2
+
+    _start_demo_clients signet 9735 demo_coop "--daemon"
+
+    # Wait for LSP to finish
+    wait "$LSP_PID"
+    LSP_EXIT=$?
+
+    for i in 1 2 3 4; do
+        eval "wait \$CLIENT${i}_PID 2>/dev/null || true"
+    done
+
+    echo ""
+    echo "=== LSP Output ==="
+    cat "$LOGDIR/demo_coop.log"
+
+    if [ "$LSP_EXIT" -eq 0 ]; then
+        info "Cooperative close demo completed successfully!"
+    else
+        fail "Demo failed (exit=$LSP_EXIT). Check logs in $LOGDIR/"
+    fi
+}
+
+# ==========================================================================
+# Demo: force close (LSP + 4 clients, --demo --force-close)
+# ==========================================================================
+
+cmd_demo_force_close() {
+    header "Demo: Factory + Payments + Force Close (Tree Broadcast)"
+
+    mkdir -p "$LOGDIR"
+
+    step "Stopping any running SuperScalar processes..."
+    pkill -f "superscalar_lsp" 2>/dev/null || true
+    pkill -f "superscalar_client" 2>/dev/null || true
+    sleep 2
+
+    # Clean DBs for fresh demo
+    rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
+
+    step "Starting force-close demo (4 clients, arity-1)..."
+    detail "This will: connect 4 clients → create factory → run payments → broadcast tree → wait for confirmations"
+    detail "On signet with step-blocks=1, each node needs ~10 min per block of relative timelock."
+    detail "Arity-1 tree has 14 nodes with 3 DW layers. Most nSequence values are 0-3 blocks."
+
+    # Start LSP in background first
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
+        "$SCBIN/superscalar_lsp" \
+            --network signet \
+            --cli-path "$BTCBIN/bitcoin-cli" \
+            --rpcuser "$RPCUSER" \
+            --rpcpassword "$RPCPASS" \
+            --port 9735 \
+            --clients 4 \
+            --amount 200000 \
+            --arity 1 \
+            --step-blocks 1 \
+            --demo \
+            --force-close \
+            --db "$LSPDB" \
+            --keyfile "$DATADIR/lsp.key" \
+            --passphrase superscalar \
+        > "$LOGDIR/demo_force_close.log" 2>&1 &
+    LSP_PID=$!
+    sleep 2
+
+    _start_demo_clients signet 9735 demo_fc "--daemon"
+
+    # Wait for LSP to finish
+    wait "$LSP_PID"
+    LSP_EXIT=$?
+
+    for i in 1 2 3 4; do
+        eval "wait \$CLIENT${i}_PID 2>/dev/null || true"
+    done
+
+    echo ""
+    echo "=== LSP Output ==="
+    cat "$LOGDIR/demo_force_close.log"
+
+    if [ "$LSP_EXIT" -eq 0 ]; then
+        info "Force-close demo completed successfully!"
+        info "All tree nodes confirmed on-chain."
+    else
+        fail "Demo failed (exit=$LSP_EXIT). Check logs in $LOGDIR/"
+    fi
 }
 
 # ==========================================================================
@@ -783,7 +983,12 @@ cmd_help() {
     echo "   7.  bash $0 open-channel       Fund + open A→B channel (500k sat)"
     echo "   8.  bash $0 start-bridge       Start SuperScalar bridge"
     echo "   9.  bash $0 start-lsp          Start SuperScalar LSP"
-    echo "  10.  bash $0 start-client       Start SuperScalar client"
+    echo "  10.  bash $0 start-client       Start SuperScalar client 1 (daemon)"
+    echo "  11.  bash $0 start-client2      Start SuperScalar client 2 (daemon)"
+    echo ""
+    echo -e "${BOLD}Demo (standalone, no CLN needed):${NC}"
+    echo "       bash $0 demo-coop          Factory + payments + cooperative close"
+    echo "       bash $0 demo-force-close   Factory + payments + force close (tree broadcast)"
     echo ""
     echo -e "${BOLD}Diagnostics:${NC}"
     echo "       bash $0 status             Full system status dump"
@@ -804,20 +1009,23 @@ cmd_help() {
 # ==========================================================================
 
 case "${1:-}" in
-    start-bitcoind)   cmd_start_bitcoind ;;
-    sync-status)      cmd_sync_status ;;
-    create-wallet)    cmd_create_wallet ;;
-    check-balance)    cmd_check_balance ;;
-    start-cln-b)      cmd_start_cln_b ;;
-    start-cln-a)      cmd_start_cln_a ;;
-    open-channel)     cmd_open_channel ;;
-    channel-status)   cmd_channel_status ;;
-    start-bridge)     cmd_start_bridge ;;
-    start-lsp)        cmd_start_lsp ;;
-    start-client)     cmd_start_client ;;
-    status)           cmd_status ;;
-    test-payment)     cmd_test_payment ;;
-    stop-all)         cmd_stop_all ;;
-    help|--help|-h)   cmd_help ;;
-    *)                cmd_help ;;
+    start-bitcoind)      cmd_start_bitcoind ;;
+    sync-status)         cmd_sync_status ;;
+    create-wallet)       cmd_create_wallet ;;
+    check-balance)       cmd_check_balance ;;
+    start-cln-b)         cmd_start_cln_b ;;
+    start-cln-a)         cmd_start_cln_a ;;
+    open-channel)        cmd_open_channel ;;
+    channel-status)      cmd_channel_status ;;
+    start-bridge)        cmd_start_bridge ;;
+    start-lsp)           cmd_start_lsp ;;
+    start-client)        cmd_start_client ;;
+    start-client2)       cmd_start_client2 ;;
+    demo-coop)           cmd_demo_coop ;;
+    demo-force-close)    cmd_demo_force_close ;;
+    status)              cmd_status ;;
+    test-payment)        cmd_test_payment ;;
+    stop-all)            cmd_stop_all ;;
+    help|--help|-h)      cmd_help ;;
+    *)                   cmd_help ;;
 esac

@@ -16,6 +16,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <signal.h>
+#include <unistd.h>
 #include <secp256k1_extrakeys.h>
 #include <secp256k1_schnorrsig.h>
 
@@ -69,6 +70,7 @@ static void usage(const char *prog) {
         "  --jit-amount SATS   Per-client JIT channel funding amount (default: funding/clients)\n"
         "  --no-jit            Disable JIT channel fallback\n"
         "  --arity N           Leaf arity: 1 (per-client leaves) or 2 (default, paired leaves)\n"
+        "  --force-close       After factory creation (+ demo), broadcast tree and wait for confirmations\n"
         "  --help              Show this help\n",
         prog, LSP_MAX_CLIENTS);
 }
@@ -307,6 +309,88 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
     return 1;
 }
 
+/* Broadcast all signed factory tree nodes, waiting for real block confirmations.
+   On regtest: mines blocks. On signet/testnet: polls getblockcount.
+   Handles nSequence relative timelocks by waiting for the required depth.
+   Returns 1 on success. */
+static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
+                                                const char *mine_addr,
+                                                int is_regtest) {
+    for (size_t i = 0; i < f->n_nodes; i++) {
+        factory_node_t *node = &f->nodes[i];
+        if (!node->is_signed) {
+            fprintf(stderr, "force-close: node %zu not signed\n", i);
+            return 0;
+        }
+
+        char *tx_hex = malloc(node->signed_tx.len * 2 + 1);
+        if (!tx_hex) return 0;
+        hex_encode(node->signed_tx.data, node->signed_tx.len, tx_hex);
+
+        char txid_out[65];
+
+        /* For nodes with nSequence > 0, we may need to wait for the parent
+           to reach sufficient depth before this tx is valid */
+        if (node->nsequence != NSEQUENCE_DISABLE_BIP68 && node->nsequence > 0) {
+            uint32_t required_depth = (node->nsequence & 0xFFFF);
+            printf("  node[%zu] requires %u-block relative timelock, waiting...\n",
+                   i, required_depth);
+
+            if (is_regtest) {
+                /* Mine the required blocks */
+                regtest_mine_blocks(rt, (int)required_depth, mine_addr);
+            } else {
+                /* Poll for blocks on signet/testnet */
+                int start_height = regtest_get_block_height(rt);
+                int target_height = start_height + (int)required_depth;
+                while (regtest_get_block_height(rt) < target_height) {
+                    sleep(10);
+                    printf("    height: %d / %d\n",
+                           regtest_get_block_height(rt), target_height);
+                }
+            }
+        }
+
+        /* Try to broadcast — may need retries if BIP68 not yet satisfied */
+        int ok = 0;
+        for (int attempt = 0; attempt < 60; attempt++) {
+            ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+            if (ok) break;
+            if (attempt == 0)
+                printf("  node[%zu] broadcast pending (waiting for BIP68)...\n", i);
+            if (is_regtest) {
+                regtest_mine_blocks(rt, 1, mine_addr);
+            } else {
+                sleep(15);
+            }
+        }
+        free(tx_hex);
+
+        if (!ok) {
+            fprintf(stderr, "force-close: node %zu broadcast failed after retries\n", i);
+            return 0;
+        }
+
+        /* Confirm it: mine 1 block on regtest, wait on signet */
+        if (is_regtest) {
+            regtest_mine_blocks(rt, 1, mine_addr);
+        } else {
+            printf("  node[%zu] broadcast OK, waiting for confirmation...\n", i);
+            regtest_wait_for_confirmation(rt, txid_out, 3600);
+        }
+
+        unsigned char display_txid[32];
+        memcpy(display_txid, node->txid, 32);
+        reverse_bytes(display_txid, 32);
+        char display_hex[65];
+        hex_encode(display_txid, 32, display_hex);
+
+        int conf = regtest_get_confirmations(rt, txid_out);
+        printf("  node[%zu] confirmed: %s (%d confs)\n", i, display_hex, conf);
+    }
+    return 1;
+}
+
 int main(int argc, char *argv[]) {
     int port = 9735;
     int n_clients = 4;
@@ -336,6 +420,7 @@ int main(int argc, char *argv[]) {
     int64_t jit_amount_arg = -1;     /* -1 = auto (funding_sats / n_clients) */
     int no_jit = 0;
     int leaf_arity = 2;              /* 1 or 2, default arity-2 */
+    int force_close = 0;
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--port") == 0 && i + 1 < argc)
@@ -398,6 +483,8 @@ int main(int argc, char *argv[]) {
             no_jit = 1;
         else if (strcmp(argv[i], "--arity") == 0 && i + 1 < argc)
             leaf_arity = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--force-close") == 0)
+            force_close = 1;
         else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -816,7 +903,7 @@ int main(int argc, char *argv[]) {
     int channels_active = 0;
     uint64_t init_local = 0, init_remote = 0;
     if (n_payments > 0 || daemon_mode || demo_mode || breach_test || test_expiry ||
-        test_distrib || test_turnover || test_rotation) {
+        test_distrib || test_turnover || test_rotation || force_close) {
         if (!lsp_channels_init(&mgr, ctx, &lsp.factory, lsp_seckey, (size_t)n_clients)) {
             fprintf(stderr, "LSP: channel init failed\n");
             lsp_cleanup(&lsp);
@@ -1013,6 +1100,35 @@ int main(int argc, char *argv[]) {
                                              layer_states);
                 }
             }
+        }
+
+        /* === Force-close: broadcast entire factory tree === */
+        if (force_close) {
+            printf("\n=== FORCE CLOSE ===\n");
+            printf("Broadcasting factory tree (%zu nodes) on %s...\n",
+                   lsp.factory.n_nodes, network);
+
+            if (!broadcast_factory_tree_any_network(&lsp.factory, &rt,
+                                                      mine_addr, is_regtest)) {
+                fprintf(stderr, "FORCE CLOSE: tree broadcast failed\n");
+                lsp_cleanup(&lsp);
+                memset(lsp_seckey, 0, 32);
+                secp256k1_context_destroy(ctx);
+                return 1;
+            }
+
+            printf("\n=== FORCE CLOSE COMPLETE ===\n");
+            printf("All %zu nodes confirmed on-chain.\n", lsp.factory.n_nodes);
+
+            /* Skip cooperative close — factory already spent */
+            report_add_string(&rpt, "result", "force_close_complete");
+            report_close(&rpt);
+            jit_channels_cleanup(&mgr);
+            if (use_db) persist_close(&db);
+            lsp_cleanup(&lsp);
+            memset(lsp_seckey, 0, 32);
+            secp256k1_context_destroy(ctx);
+            return 0;
         }
 
         if (daemon_mode) {
