@@ -821,18 +821,20 @@ int test_regtest_breach_penalty_cpfp(void) {
            wt.pending[0].txid, wt.pending[0].anchor_vout);
 
     /* --- Simulate CPFP bumping --- */
-    /* Cycle 1: penalty in mempool, not yet bumped */
+    /* Cycle 1 (second watchtower_check call): cycles_in_mempool goes 1→2,
+       triggering the first CPFP bump (policy: bump at cycles_in_mempool >= 2) */
     int check1 = watchtower_check(&wt);
     TEST_ASSERT(wt.n_pending > 0, "still pending after cycle 1");
-    TEST_ASSERT(wt.pending[0].bump_count == 0, "no bump yet at cycle 1");
+    printf("  After cycle 1: bump_count=%d\n", wt.pending[0].bump_count);
+    TEST_ASSERT(wt.pending[0].bump_count == 1, "first CPFP bump at cycle 1");
     (void)check1;
 
-    /* Cycle 2: should trigger first CPFP bump */
+    /* Cycle 2: should NOT bump again (cycles_since_bump < 6) */
     int check2 = watchtower_check(&wt);
     (void)check2;
-    printf("  After 2 CPFP cycles: bump_count=%d\n", wt.pending[0].bump_count);
-    /* Bump may or may not succeed depending on wallet UTXO availability,
-       but the pending tracking should be working */
+    TEST_ASSERT(wt.pending[0].bump_count == 1, "no re-bump at cycle 2 (too soon)");
+    printf("  After cycle 2: bump_count=%d (no re-bump, cooldown active)\n",
+           wt.pending[0].bump_count);
 
     /* --- Mine and verify penalty confirms --- */
     regtest_mine_blocks(&rt, 1, mine_addr);

@@ -13,3 +13,5 @@ compile_commands.json
 .cache/
 *.swp
 *~
+tools/.env
+__pycache__/

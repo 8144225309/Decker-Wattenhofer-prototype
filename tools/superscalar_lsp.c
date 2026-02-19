@@ -495,13 +495,20 @@ int main(int argc, char *argv[]) {
         network = "regtest";  /* default to regtest */
     int is_regtest = (strcmp(network, "regtest") == 0);
 
-    /* Test flags require regtest (they mine blocks for nSequence/CLTV) */
-    if (!is_regtest && (breach_test || test_expiry || test_distrib ||
+    /* Test flags that mine blocks require regtest */
+    if (!is_regtest && (test_expiry || test_distrib ||
                         test_turnover || test_rotation)) {
-        fprintf(stderr, "Error: --cheat-daemon, --test-expiry, --test-distrib, "
+        fprintf(stderr, "Error: --test-expiry, --test-distrib, "
                 "--test-turnover, and --test-rotation require --network regtest\n");
         return 1;
     }
+    /* --breach-test (mode 1) mines for tree broadcast — regtest only */
+    if (!is_regtest && breach_test == 1) {
+        fprintf(stderr, "Error: --breach-test requires --network regtest "
+                "(it mines blocks for tree broadcast)\n");
+        return 1;
+    }
+    /* --cheat-daemon (mode 2) only broadcasts + sleeps — allowed on any network */
 
     /* Resolve active/dying block defaults */
     uint32_t active_blocks = (active_blocks_arg > 0) ? (uint32_t)active_blocks_arg
@@ -1161,7 +1168,14 @@ int main(int argc, char *argv[]) {
         printf("\n=== BREACH TEST ===\n");
         printf("Broadcasting factory tree (all %zu nodes)...\n", lsp.factory.n_nodes);
 
-        if (!broadcast_factory_tree(&lsp.factory, &rt, mine_addr)) {
+        int tree_ok;
+        if (is_regtest) {
+            tree_ok = broadcast_factory_tree(&lsp.factory, &rt, mine_addr);
+        } else {
+            tree_ok = broadcast_factory_tree_any_network(&lsp.factory, &rt,
+                                                          mine_addr, 0);
+        }
+        if (!tree_ok) {
             fprintf(stderr, "BREACH TEST: factory tree broadcast failed\n");
             lsp_cleanup(&lsp);
             memset(lsp_seckey, 0, 32);
@@ -1241,14 +1255,36 @@ int main(int argc, char *argv[]) {
         }
         printf("Revoked commitment broadcast: %s\n", old_txid_str);
 
-        /* Mine 1 block so watchtower can detect it */
-        regtest_mine_blocks(&rt, 1, mine_addr);
+        /* Confirm the revoked commitment so watchtower can detect it */
+        if (is_regtest) {
+            regtest_mine_blocks(&rt, 1, mine_addr);
+        } else {
+            /* On signet/testnet, wait for natural block confirmation */
+            printf("Waiting for revoked commitment to confirm...\n");
+            regtest_wait_for_confirmation(&rt, old_txid_str, 1800);
+        }
 
         if (breach_test == 2) {
             /* --cheat-daemon: LSP does NOT run watchtower — sleep so clients can detect */
             printf("CHEAT DAEMON: revoked commitment broadcast, sleeping for clients...\n");
-            for (int s = 0; s < 30 && !g_shutdown; s++)
-                sleep(1);
+            if (is_regtest) {
+                for (int s = 0; s < 30 && !g_shutdown; s++)
+                    sleep(1);
+            } else {
+                /* On signet: wait for 2 blocks via height polling (up to 30 min),
+                   then give clients time to detect */
+                int start_h = regtest_get_block_height(&rt);
+                int target_h = start_h + 2;
+                printf("CHEAT DAEMON: waiting for height %d (current %d)...\n",
+                       target_h, start_h);
+                for (int w = 0; w < 1800 && !g_shutdown; w++) {
+                    if (regtest_get_block_height(&rt) >= target_h) break;
+                    sleep(1);
+                }
+                /* Extra time for clients to process */
+                for (int s = 0; s < 60 && !g_shutdown; s++)
+                    sleep(1);
+            }
             printf("=== CHEAT DAEMON COMPLETE ===\n");
             report_add_string(&rpt, "result", "cheat_daemon_complete");
             report_close(&rpt);

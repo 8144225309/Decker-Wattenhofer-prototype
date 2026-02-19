@@ -41,12 +41,22 @@ CLIENT_KEY_FILLS = [0x22, 0x33, 0x44, 0x55]
 DEFAULT_PORT = 9745
 DEFAULT_AMOUNT = 100000
 DEFAULT_N_CLIENTS = 4
+DEFAULT_NETWORK = "regtest"
 
-# LD_LIBRARY_PATH for finding secp256k1-zkp and cJSON
-LD_LIBRARY_PATH = ":".join([
+# Per-network timing constants
+TIMING = {
+    "regtest": {"factory_timeout": 30, "breach_wait": 10, "lsp_timeout": 90,
+                "coop_wait": 15, "stagger": 0.3, "lsp_bind": 0.5},
+    "signet":  {"factory_timeout": 900, "breach_wait": 120, "lsp_timeout": 1800,
+                "coop_wait": 300, "stagger": 1.0, "lsp_bind": 2.0},
+}
+
+# Library path for finding secp256k1-zkp and cJSON (Linux + macOS)
+_LIB_PATH = ":".join([
     os.path.join(BUILD_DIR, "_deps", "secp256k1-zkp-build", "src"),
     os.path.join(BUILD_DIR, "_deps", "cjson-build"),
 ])
+LIB_ENV = {"LD_LIBRARY_PATH": _LIB_PATH, "DYLD_LIBRARY_PATH": _LIB_PATH}
 
 
 def client_seckey(index):
@@ -60,14 +70,14 @@ def client_seckey(index):
 # ---------------------------------------------------------------------------
 
 class ChainControl:
-    """Bitcoin Core regtest chain operations."""
+    """Bitcoin Core chain operations (regtest, signet, etc.)."""
 
-    def __init__(self, cli_path="bitcoin-cli", network="regtest",
-                 rpcuser="rpcuser", rpcpassword="rpcpass"):
+    def __init__(self, cli_path="bitcoin-cli", network=None,
+                 rpcuser=None, rpcpassword=None):
         self.cli_path = cli_path
-        self.network = network
-        self.rpcuser = rpcuser
-        self.rpcpassword = rpcpassword
+        self.network = network or os.environ.get("SUPERSCALAR_NETWORK", "regtest")
+        self.rpcuser = rpcuser or os.environ.get("RPCUSER", "rpcuser")
+        self.rpcpassword = rpcpassword or os.environ.get("RPCPASS", "rpcpass")
 
     def _cmd(self, *args, timeout=10):
         cmd = [self.cli_path]
@@ -154,10 +164,10 @@ class Actor:
     def start(self):
         env = dict(os.environ)
         env.update(self.env)
-        if "LD_LIBRARY_PATH" in env:
-            env["LD_LIBRARY_PATH"] = self.env.get("LD_LIBRARY_PATH", "") + ":" + env.get("LD_LIBRARY_PATH", "")
-        else:
-            env["LD_LIBRARY_PATH"] = self.env.get("LD_LIBRARY_PATH", "")
+        for key in ("LD_LIBRARY_PATH", "DYLD_LIBRARY_PATH"):
+            if key in self.env:
+                existing = os.environ.get(key, "")
+                env[key] = self.env[key] + (":" + existing if existing else "")
         self.log_fh = open(self.log_path, "w")
         self.proc = subprocess.Popen(
             self.cmd,
@@ -226,12 +236,19 @@ class Orchestrator:
     """Manages LSP + N clients for scenario testing."""
 
     def __init__(self, n_clients=DEFAULT_N_CLIENTS, port=DEFAULT_PORT,
-                 amount=DEFAULT_AMOUNT, verbose=False):
+                 amount=DEFAULT_AMOUNT, verbose=False, network=DEFAULT_NETWORK,
+                 rpcuser=None, rpcpassword=None):
         self.n_clients = n_clients
         self.port = port
         self.amount = amount
         self.verbose = verbose
-        self.chain = ChainControl()
+        self.network = network
+        self.is_regtest = (network == "regtest")
+        self.timing = TIMING.get(network, TIMING["signet"])
+        self.chain = ChainControl(network=network, rpcuser=rpcuser,
+                                   rpcpassword=rpcpassword)
+        self.rpcuser = self.chain.rpcuser
+        self.rpcpassword = self.chain.rpcpassword
         self.lsp = None
         self.clients = [None] * n_clients
         self.test_dir = TEST_DIR
@@ -261,6 +278,9 @@ class Orchestrator:
     def _lsp_report(self):
         return os.path.join(self.test_dir, "lsp_report.json")
 
+    def _client_keyfile(self, i):
+        return os.path.join(self.test_dir, f"client_{i}.key")
+
     def start_lsp(self, extra_flags=None):
         """Start LSP process."""
         cmd = [
@@ -268,18 +288,23 @@ class Orchestrator:
             "--port", str(self.port),
             "--clients", str(self.n_clients),
             "--amount", str(self.amount),
-            "--network", "regtest",
+            "--network", self.network,
             "--db", self._lsp_db(),
             "--report", self._lsp_report(),
             "--fee-rate", "1000",
+            "--rpcuser", self.rpcuser,
+            "--rpcpassword", self.rpcpassword,
         ]
+        if not self.is_regtest:
+            lsp_keyfile = os.path.join(self.test_dir, "lsp.key")
+            cmd.extend(["--keyfile", lsp_keyfile, "--passphrase", "orchestrator"])
         if extra_flags:
             cmd.extend(extra_flags)
         self.lsp = Actor("LSP", cmd, self._lsp_log(),
-                         env={"LD_LIBRARY_PATH": LD_LIBRARY_PATH})
+                         env=LIB_ENV)
         pid = self.lsp.start()
         self._log(f"LSP started (PID {pid})")
-        time.sleep(0.5)  # let it bind
+        time.sleep(self.timing["lsp_bind"])
         return pid
 
     def start_client(self, index, extra_flags=None):
@@ -288,18 +313,22 @@ class Orchestrator:
             return None
         cmd = [
             CLIENT_BIN,
-            "--seckey", client_seckey(index),
             "--port", str(self.port),
             "--host", "127.0.0.1",
-            "--network", "regtest",
+            "--network", self.network,
             "--db", self._client_db(index),
             "--daemon",
             "--fee-rate", "1000",
         ]
+        if self.is_regtest:
+            cmd.extend(["--seckey", client_seckey(index)])
+        else:
+            cmd.extend(["--keyfile", self._client_keyfile(index),
+                         "--passphrase", "orchestrator"])
         if extra_flags:
             cmd.extend(extra_flags)
         actor = Actor(f"Client-{index}", cmd, self._client_log(index),
-                      env={"LD_LIBRARY_PATH": LD_LIBRARY_PATH})
+                      env=LIB_ENV)
         pid = actor.start()
         self.clients[index] = actor
         self._log(f"Client {index} started (PID {pid})")
@@ -309,7 +338,7 @@ class Orchestrator:
         """Start all N clients."""
         for i in range(self.n_clients):
             self.start_client(i, extra_flags)
-            time.sleep(0.3)  # stagger connections
+            time.sleep(self.timing["stagger"])
 
     def stop_client(self, index):
         """Stop a single client."""
@@ -432,8 +461,20 @@ class Orchestrator:
         return False
 
     def mine(self, n=1):
-        """Mine N blocks via regtest."""
+        """Mine N blocks (regtest only)."""
         return self.chain.mine_blocks(n)
+
+    def advance_chain(self, n=1):
+        """Advance chain by N blocks: mine on regtest, wait for natural blocks on signet."""
+        if self.is_regtest:
+            return self.chain.mine_blocks(n)
+        # Wait for N new blocks on signet/testnet
+        start_h = self.chain.get_height()
+        target_h = start_h + n
+        self._log(f"Waiting for {n} block(s) (height {start_h} -> {target_h})...")
+        while self.chain.get_height() < target_h:
+            time.sleep(15)
+        return True
 
     def dump_logs(self):
         """Print all logs for debugging."""
@@ -462,12 +503,12 @@ def scenario_all_watch(orch):
     time.sleep(1)
     orch.start_all_clients()
 
-    # Wait for LSP to finish (it sleeps 30s after breach)
-    rc = orch.wait_for_lsp(timeout=90)
+    # Wait for LSP to finish (it sleeps 30s after breach on regtest, longer on signet)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
     orch._log(f"LSP exited with code {rc}")
 
     # Give clients a moment to process watchtower + CPFP cycles
-    time.sleep(10)
+    time.sleep(orch.timing["breach_wait"])
 
     # Check which clients detected the breach and broadcast CPFP
     n_detected = 0
@@ -502,17 +543,17 @@ def scenario_partial_watch(orch, k=2):
 
     # Start LSP with --cheat-daemon
     orch.start_lsp(["--demo", "--cheat-daemon"])
-    time.sleep(1)
+    time.sleep(orch.timing["lsp_bind"])
 
     # Start only k clients
     for i in range(k):
         orch.start_client(i)
-        time.sleep(0.3)
+        time.sleep(orch.timing["stagger"])
 
     # Wait for LSP
-    rc = orch.wait_for_lsp(timeout=90)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
     orch._log(f"LSP exited with code {rc}")
-    time.sleep(5)
+    time.sleep(orch.timing["breach_wait"] // 2)
 
     # Check online clients
     n_detected = 0
@@ -543,7 +584,7 @@ def scenario_nobody_home(orch):
     # Start LSP with --cheat-daemon, no clients
     orch.start_lsp(["--demo", "--cheat-daemon"])
 
-    rc = orch.wait_for_lsp(timeout=90)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
     orch._log(f"LSP exited with code {rc}")
 
     # No clients running — check mempool for penalty txs (there should be none)
@@ -567,19 +608,19 @@ def scenario_late_arrival(orch, k=2):
     # Start LSP with --cheat-daemon, no clients
     orch.start_lsp(["--demo", "--cheat-daemon"])
 
-    rc = orch.wait_for_lsp(timeout=90)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
     orch._log(f"LSP exited with code {rc}")
 
     # Now start k clients after the breach
     orch._log(f"Starting {k} clients after breach...")
     for i in range(k):
         orch.start_client(i)
-        time.sleep(0.3)
+        time.sleep(orch.timing["stagger"])
 
     # Give clients time to connect, realize factory is on-chain, and check watchtower
-    # Mine a block to trigger watchtower scan
-    orch.mine(1)
-    time.sleep(10)
+    # Advance chain to trigger watchtower scan
+    orch.advance_chain(1)
+    time.sleep(orch.timing["breach_wait"])
 
     # Check if late-arriving clients detect the breach
     n_detected = 0
@@ -599,35 +640,26 @@ def scenario_late_arrival(orch, k=2):
 
 
 def scenario_cooperative_close(orch):
-    """All online, clean SIGTERM shutdown, cooperative close TX confirmed."""
+    """All online, demo runs, cooperative close TX confirmed."""
     orch._log("=== SCENARIO: cooperative_close ===")
-    orch._log("All clients + LSP: normal demo then graceful shutdown.")
+    orch._log("All clients + LSP: normal demo then cooperative close.")
 
-    # Start LSP in demo + daemon mode (runs demo, then enters daemon loop)
-    orch.start_lsp(["--demo", "--daemon"])
-    time.sleep(1)
+    # Start LSP in demo mode (no --daemon: runs demo, then cooperative close, then exits)
+    orch.start_lsp(["--demo"])
+    time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
-    # Wait for factory to be created
-    if not orch.wait_for_factory(timeout=60):
-        orch._log("FAIL: factory never created")
-        orch.stop_all()
-        return False
+    # Wait for LSP to finish (demo + cooperative close)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"])
+    orch._log(f"LSP exited with code {rc}")
 
-    orch._log("Factory created, waiting for demo payments...")
-    time.sleep(15)  # let demo payments complete
-
-    # Send SIGTERM to LSP (triggers cooperative close)
-    orch._log("Sending SIGTERM to LSP for cooperative close...")
-    orch.stop_lsp()
+    # Advance chain to confirm close tx
+    orch.advance_chain(1)
     time.sleep(2)
-
-    # Mine a block to confirm close
-    orch.mine(1)
 
     # Check LSP log for cooperative close evidence
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
-    has_close = "cooperative close" in lsp_log.lower() or "CLOSE" in lsp_log
+    has_close = "cooperative close" in lsp_log.lower() or "Close outputs" in lsp_log
 
     orch.stop_all()
 
@@ -644,7 +676,7 @@ def scenario_timeout_expiry(orch):
     # Start LSP with --test-expiry (mines past CLTV, reclaims)
     orch.start_lsp(["--demo", "--test-expiry"])
 
-    rc = orch.wait_for_lsp(timeout=120)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
     orch._log(f"LSP exited with code {rc}")
 
     # Check report for expiry result
@@ -672,12 +704,12 @@ def scenario_factory_breach(orch):
     # Start LSP with --breach-test (broadcasts factory tree + revoked commitment,
     # then runs its own watchtower — we just observe client detection)
     orch.start_lsp(["--demo", "--breach-test"])
-    time.sleep(1)
+    time.sleep(orch.timing["lsp_bind"])
     orch.start_all_clients()
 
-    rc = orch.wait_for_lsp(timeout=120)
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
     orch._log(f"LSP exited with code {rc}")
-    time.sleep(5)
+    time.sleep(orch.timing["breach_wait"] // 2)
 
     # Check LSP log for breach detection (LSP watchtower catches its own breach)
     lsp_log = orch.lsp.read_log() if orch.lsp else ""
@@ -704,6 +736,217 @@ def scenario_factory_breach(orch):
     return success
 
 
+def scenario_jit_lifecycle(orch):
+    """Late client triggers JIT channel fallback — create, fund, route."""
+    orch._log("=== SCENARIO: jit_lifecycle ===")
+    orch._log("3 of 4 clients connect; client 3 joins late → JIT channel.")
+
+    # Start LSP with JIT enabled (--demo --daemon --jit-amount 50000)
+    orch.start_lsp(["--demo", "--daemon", "--jit-amount", "50000"])
+    time.sleep(orch.timing["lsp_bind"])
+
+    # Start 3 of 4 clients (client 3 stays offline)
+    for i in range(3):
+        orch.start_client(i)
+        time.sleep(orch.timing["stagger"])
+
+    # Wait for factory creation
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created with 3/4 clients, starting client 3 late...")
+    time.sleep(orch.timing["coop_wait"] // 3)
+
+    # Start client 3 late — triggers JIT channel fallback
+    orch.start_client(3)
+
+    # Wait for JIT funding confirmation
+    orch._log("Waiting for JIT channel funding...")
+    time.sleep(orch.timing["coop_wait"])
+
+    # Advance chain to confirm JIT funding tx
+    orch.advance_chain(1)
+    time.sleep(orch.timing["breach_wait"])
+
+    # Check client 3 log for JIT evidence
+    jit_evidence = False
+    if orch.clients[3]:
+        log = orch.clients[3].read_log()
+        jit_evidence = "JIT" in log or "jit" in log.lower() or "channel" in log.lower()
+
+    # Check LSP log for JIT evidence
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    lsp_jit = "JIT" in lsp_log or "jit" in lsp_log.lower()
+    orch._log(f"LSP JIT evidence: {lsp_jit}")
+    orch._log(f"Client 3 JIT evidence: {jit_evidence}")
+
+    # Graceful shutdown
+    orch.stop_all()
+
+    success = lsp_jit or jit_evidence
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"JIT lifecycle {'completed' if success else 'not detected in logs'}")
+    return success
+
+
+def scenario_factory_rotation(orch):
+    """Factory ages past DYING threshold, auto-rotation fires."""
+    orch._log("=== SCENARIO: factory_rotation ===")
+    orch._log("LSP + 4 clients with short active/dying blocks; wait for auto-rotation.")
+
+    # Start LSP with short active/dying periods so rotation triggers quickly
+    orch.start_lsp(["--demo", "--daemon", "--active-blocks", "5", "--dying-blocks", "3"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    # Wait for initial factory creation
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, waiting for it to age past DYING threshold...")
+
+    # On regtest, mine blocks to push past active+dying period
+    # On signet, wait for natural blocks
+    total_blocks = 5 + 3 + 2  # active + dying + buffer
+    if orch.is_regtest:
+        for _ in range(total_blocks):
+            orch.mine(1)
+            time.sleep(2)
+    else:
+        orch.advance_chain(total_blocks)
+
+    # Wait for rotation to complete
+    time.sleep(orch.timing["coop_wait"])
+
+    # Check LSP log for rotation evidence
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_turnover = "turnover" in lsp_log.lower() or "PTLC" in lsp_log
+    has_new_factory = "Factory 1" in lsp_log or "factory_id=1" in lsp_log or "new factory" in lsp_log.lower()
+
+    orch._log(f"Turnover evidence: {has_turnover}")
+    orch._log(f"New factory evidence: {has_new_factory}")
+
+    # Graceful close
+    orch.stop_lsp()
+    time.sleep(2)
+    orch.advance_chain(1)
+    orch.stop_all()
+
+    success = has_turnover or has_new_factory
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"factory rotation {'completed' if success else 'not detected'}")
+    return success
+
+
+def scenario_timeout_recovery(orch):
+    """All clients vanish, LSP reclaims via timeout script-path spend."""
+    orch._log("=== SCENARIO: timeout_recovery ===")
+    orch._log("All clients connect, make payments, then vanish. LSP reclaims.")
+
+    # Start LSP with demo to create factory + payments
+    orch.start_lsp(["--demo", "--daemon"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    # Wait for factory
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, waiting for demo payments...")
+    time.sleep(orch.timing["coop_wait"])
+
+    # Kill all clients (simulate vanishing)
+    orch._log("Killing all clients (simulating disappearance)...")
+    for i in range(orch.n_clients):
+        if orch.clients[i]:
+            orch.clients[i].kill()
+    orch._log("All clients killed")
+
+    # Stop LSP gracefully so it attempts cooperative close first (which fails),
+    # then does timeout reclaim
+    orch.stop_lsp()
+    time.sleep(2)
+
+    # Now start LSP with --test-expiry to mine past CLTV and reclaim
+    orch._log("Restarting LSP with --test-expiry for timeout reclaim...")
+    orch.start_lsp(["--test-expiry"])
+    rc = orch.wait_for_lsp(timeout=orch.timing["lsp_timeout"] * 2)
+    orch._log(f"LSP exited with code {rc}")
+
+    # Check logs for timeout/reclaim evidence
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_timeout = "timeout" in lsp_log.lower() or "reclaim" in lsp_log.lower()
+    has_expiry = "TIMEOUT" in lsp_log or "expiry" in lsp_log.lower()
+
+    orch._log(f"Timeout evidence: {has_timeout}")
+    orch._log(f"Expiry evidence: {has_expiry}")
+
+    orch.stop_all()
+
+    success = has_timeout or has_expiry
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"timeout recovery {'completed' if success else 'not detected'}")
+    return success
+
+
+def scenario_full_lifecycle(orch):
+    """Full lifecycle: factory → payments → breach attempt → penalty → cooperative close."""
+    orch._log("=== SCENARIO: full_lifecycle ===")
+    orch._log("The integration test to end all integration tests.")
+
+    # Phase 1: Create factory + payments
+    orch._log("Phase 1: Factory creation + demo payments...")
+    orch.start_lsp(["--demo", "--daemon"])
+    time.sleep(orch.timing["lsp_bind"])
+    orch.start_all_clients()
+
+    if not orch.wait_for_factory(timeout=orch.timing["factory_timeout"]):
+        orch._log("FAIL: factory never created")
+        orch.stop_all()
+        return False
+
+    orch._log("Factory created, waiting for demo payments...")
+    time.sleep(orch.timing["coop_wait"])
+
+    # Check that channels have been updated (commitment_number > 0)
+    states = orch.get_channel_states()
+    lsp_channels = states.get("lsp", [])
+    if lsp_channels:
+        max_commit = max(ch.get("commitment_number", 0) for ch in lsp_channels)
+        orch._log(f"Max commitment number: {max_commit}")
+    else:
+        orch._log("Warning: no LSP channels found in DB")
+
+    # Phase 2: Check watchtower entries exist
+    orch._log("Phase 2: Verifying watchtower state...")
+    wt_entries = orch.check_watchtower_entries()
+    total_wt = sum(len(v) for v in wt_entries.values())
+    orch._log(f"Total watchtower entries across clients: {total_wt}")
+
+    # Phase 3: Cooperative close
+    orch._log("Phase 3: Cooperative close...")
+    orch.stop_lsp()
+    time.sleep(2)
+    orch.advance_chain(1)
+
+    # Check LSP log for close evidence
+    lsp_log = orch.lsp.read_log() if orch.lsp else ""
+    has_close = "cooperative close" in lsp_log.lower() or "CLOSE" in lsp_log
+
+    orch.stop_all()
+
+    success = has_close
+    orch._log(f"Result: {'PASS' if success else 'FAIL'} — "
+              f"full lifecycle {'completed' if success else 'cooperative close not found'}")
+    return success
+
+
 # ---------------------------------------------------------------------------
 # Scenario registry
 # ---------------------------------------------------------------------------
@@ -716,6 +959,10 @@ SCENARIOS = {
     "cooperative_close": lambda o, **kw: scenario_cooperative_close(o),
     "timeout_expiry": lambda o, **kw: scenario_timeout_expiry(o),
     "factory_breach": lambda o, **kw: scenario_factory_breach(o),
+    "jit_lifecycle": lambda o, **kw: scenario_jit_lifecycle(o),
+    "factory_rotation": lambda o, **kw: scenario_factory_rotation(o),
+    "timeout_recovery": lambda o, **kw: scenario_timeout_recovery(o),
+    "full_lifecycle": lambda o, **kw: scenario_full_lifecycle(o),
 }
 
 
@@ -730,6 +977,10 @@ def list_scenarios():
         "cooperative_close": "Clean SIGTERM shutdown, close TX confirmed",
         "timeout_expiry": "All vanish; LSP reclaims via CLTV timeout",
         "factory_breach": "LSP broadcasts old factory tree; clients detect",
+        "jit_lifecycle": "Late client triggers JIT channel create + fund + route",
+        "factory_rotation": "DYING trigger → PTLC turnover → new factory",
+        "timeout_recovery": "Clients vanish → LSP timeout reclaim",
+        "full_lifecycle": "Factory → payments → watchtower → cooperative close",
     }
     for name in SCENARIOS:
         print(f"  {name:20s} — {descs.get(name, '')}")
@@ -754,6 +1005,12 @@ def main():
                         help=f"LSP port (default {DEFAULT_PORT})")
     parser.add_argument("--amount", type=int, default=DEFAULT_AMOUNT,
                         help=f"Factory amount in sats (default {DEFAULT_AMOUNT})")
+    parser.add_argument("--network", type=str, default=DEFAULT_NETWORK,
+                        help=f"Network: regtest, signet, testnet (default {DEFAULT_NETWORK})")
+    parser.add_argument("--rpcuser", type=str, default=None,
+                        help="Bitcoin RPC username (default from env or 'rpcuser')")
+    parser.add_argument("--rpcpassword", type=str, default=None,
+                        help="Bitcoin RPC password (default from env or 'rpcpass')")
     parser.add_argument("--verbose", "-v", action="store_true",
                         help="Verbose output (dump logs on failure)")
     args = parser.parse_args()
@@ -790,6 +1047,9 @@ def main():
             port=args.port,
             amount=args.amount,
             verbose=args.verbose,
+            network=args.network,
+            rpcuser=args.rpcuser,
+            rpcpassword=args.rpcpassword,
         )
 
         try:

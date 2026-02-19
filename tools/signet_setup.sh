@@ -17,10 +17,18 @@ BTCBIN="${BTCBIN:-$(dirname "$(command -v bitcoin-cli 2>/dev/null || echo /usr/l
 CLNDIR="${CLNDIR:-$(dirname "$(command -v lightningd 2>/dev/null || echo /usr/local/bin/lightningd)")/..}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 SCBIN="${SCBIN:-$SCRIPT_DIR/../build}"
-DATADIR="/tmp/superscalar-signet"
-RPCUSER="superscalar"
-RPCPASS="superscalar123"
-RPCPORT="38332"
+
+# Source .env if it exists (credentials, paths)
+if [ -f "$SCRIPT_DIR/.env" ]; then
+    set -a
+    . "$SCRIPT_DIR/.env"
+    set +a
+fi
+
+DATADIR="${DATADIR:-/tmp/superscalar-signet}"
+RPCUSER="${RPCUSER:-superscalar}"
+RPCPASS="${RPCPASS:-superscalar123}"
+RPCPORT="${RPCPORT:-38332}"
 
 # Derived paths
 BTCDATA="$DATADIR/bitcoin"
@@ -523,7 +531,7 @@ cmd_start_lsp() {
                 --daemon \
                 --db "$LSPDB" \
                 --keyfile "$DATADIR/lsp.key" \
-                --passphrase superscalar \
+                --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
             > "$LOGDIR/lsp.log" 2>&1 &
         LSP_PID=$!
         sleep 1
@@ -557,7 +565,7 @@ cmd_start_client() {
         LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
             "$SCBIN/superscalar_client" \
                 --keyfile "$DATADIR/client1.key" \
-                --passphrase superscalar \
+                --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
                 --port 9735 \
                 --daemon \
@@ -595,7 +603,7 @@ cmd_start_client2() {
         LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
             "$SCBIN/superscalar_client" \
                 --keyfile "$DATADIR/client2.key" \
-                --passphrase superscalar \
+                --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network signet \
                 --port 9735 \
                 --daemon \
@@ -635,7 +643,7 @@ _start_demo_clients() {
         LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
             "$SCBIN/superscalar_client" \
                 --keyfile "$KEYFILE" \
-                --passphrase superscalar \
+                --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
                 --network "$NET" \
                 --port "$PORT" \
                 --db "$DBFILE" \
@@ -683,7 +691,7 @@ cmd_demo_coop() {
             --demo \
             --db "$LSPDB" \
             --keyfile "$DATADIR/lsp.key" \
-            --passphrase superscalar \
+            --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
         > "$LOGDIR/demo_coop.log" 2>&1 &
     LSP_PID=$!
     sleep 2
@@ -747,7 +755,7 @@ cmd_demo_force_close() {
             --force-close \
             --db "$LSPDB" \
             --keyfile "$DATADIR/lsp.key" \
-            --passphrase superscalar \
+            --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
         > "$LOGDIR/demo_force_close.log" 2>&1 &
     LSP_PID=$!
     sleep 2
@@ -779,7 +787,8 @@ cmd_demo_force_close() {
 # ==========================================================================
 
 cmd_demo_breach() {
-    header "Demo: Factory + Payments + Breach → Penalty + CPFP (regtest)"
+    local NET="${2:-regtest}"
+    header "Demo: Factory + Payments + Breach → Penalty + CPFP ($NET)"
 
     mkdir -p "$LOGDIR"
 
@@ -791,16 +800,22 @@ cmd_demo_breach() {
     # Clean DBs for fresh demo
     rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
 
-    step "Starting breach demo (4 clients, arity-1, regtest)..."
+    step "Starting breach demo (4 clients, arity-1, $NET)..."
     detail "This will: connect 4 clients → create factory → run payments"
     detail "→ LSP broadcasts revoked commitment (--cheat-daemon)"
     detail "→ client watchtowers detect breach → broadcast penalty with P2A anchor"
     detail "→ CPFP child bumps fee → penalty confirms"
 
+    # On signet, breach wait is longer (need real block confirmations)
+    local BREACH_WAIT=10
+    if [ "$NET" = "signet" ]; then
+        BREACH_WAIT=120
+    fi
+
     # Start LSP with --cheat-daemon (broadcasts revoked commitment, then sleeps)
     LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
         "$SCBIN/superscalar_lsp" \
-            --network regtest \
+            --network "$NET" \
             --cli-path "$BTCBIN/bitcoin-cli" \
             --rpcuser "$RPCUSER" \
             --rpcpassword "$RPCPASS" \
@@ -814,20 +829,20 @@ cmd_demo_breach() {
             --daemon \
             --db "$LSPDB" \
             --keyfile "$DATADIR/lsp.key" \
-            --passphrase superscalar \
+            --passphrase "${KEYFILE_PASSPHRASE:-superscalar}" \
         > "$LOGDIR/demo_breach.log" 2>&1 &
     LSP_PID=$!
     sleep 2
 
-    _start_demo_clients regtest 9735 demo_breach "--daemon"
+    _start_demo_clients "$NET" 9735 demo_breach "--daemon"
 
-    # Wait for LSP to finish (it sleeps ~30s after breach, then exits)
+    # Wait for LSP to finish (it sleeps ~30s after breach on regtest, longer on signet)
     wait "$LSP_PID"
     LSP_EXIT=$?
 
     # Give clients time to process watchtower
-    step "Waiting for client watchtowers to detect breach..."
-    sleep 10
+    step "Waiting for client watchtowers to detect breach (${BREACH_WAIT}s)..."
+    sleep "$BREACH_WAIT"
 
     for i in 1 2 3 4; do
         eval "wait \$CLIENT${i}_PID 2>/dev/null || true"
@@ -1064,6 +1079,90 @@ cmd_stop_all() {
 }
 
 # ==========================================================================
+# dump-state — Quick factory/channel/watchtower summary from all DBs
+# ==========================================================================
+
+cmd_dump_state() {
+    header "Dump State (all DBs)"
+
+    for LABEL_DB in "LSP:$LSPDB" "Client1:$CLIENTDB" "Client2:$CLIENT2DB" "Client3:$CLIENT3DB" "Client4:$CLIENT4DB"; do
+        LABEL="${LABEL_DB%%:*}"
+        DBPATH="${LABEL_DB##*:}"
+        echo -e "  ${BOLD}$LABEL${NC} ($DBPATH)"
+        if [ ! -f "$DBPATH" ]; then
+            detail "(not found)"
+            echo ""
+            continue
+        fi
+        python3 -c "
+import sqlite3
+db = sqlite3.connect('file:$DBPATH?mode=ro', uri=True)
+try:
+    f = db.execute('SELECT COUNT(*) FROM factories').fetchone()[0]
+    c = db.execute('SELECT COUNT(*) FROM channels').fetchone()[0]
+    print(f'    factories={f}  channels={c}', end='')
+except: print('    (no factories/channels)', end='')
+try:
+    h = db.execute('SELECT COUNT(*) FROM htlcs').fetchone()[0]
+    print(f'  htlcs={h}', end='')
+except: pass
+try:
+    w = db.execute('SELECT COUNT(*) FROM old_commitments').fetchone()[0]
+    print(f'  watchtower={w}', end='')
+except: pass
+print()
+# Channel balances
+try:
+    for r in db.execute('SELECT id, local_amount, remote_amount, commitment_number FROM channels').fetchall():
+        print(f'      ch#{r[0]}: local={r[1]} remote={r[2]} commit={r[3]}')
+except: pass
+db.close()
+" 2>/dev/null || fail "Could not read $LABEL database"
+        echo ""
+    done
+}
+
+# ==========================================================================
+# check-stuck — List unconfirmed wallet txs older than 2 blocks
+# ==========================================================================
+
+cmd_check_stuck() {
+    header "Check Stuck Transactions"
+
+    if ! btc getblockchaininfo &>/dev/null; then
+        fail "bitcoind is not running."
+        exit 1
+    fi
+
+    btc loadwallet superscalar_lsp 2>/dev/null || true
+
+    step "Checking for unconfirmed wallet transactions..."
+    btc_wallet listtransactions "*" 50 0 true 2>/dev/null | python3 -c "
+import json, sys
+txs = json.load(sys.stdin)
+unconfirmed = [t for t in txs if t.get('confirmations', 0) < 1]
+if not unconfirmed:
+    print('    No unconfirmed transactions')
+else:
+    print(f'    {len(unconfirmed)} unconfirmed transaction(s):')
+    for t in unconfirmed:
+        txid = t.get('txid', '?')
+        amount = t.get('amount', 0)
+        cat = t.get('category', '?')
+        print(f'      {txid[:20]}...  {amount:+.8f} BTC  ({cat})')
+" 2>/dev/null || fail "Could not query wallet transactions"
+
+    step "Checking mempool..."
+    MEMPOOL_SIZE=$(btc getmempoolinfo | python3 -c "import json,sys; print(json.load(sys.stdin).get('size',0))" 2>/dev/null)
+    info "Mempool size: $MEMPOOL_SIZE txs"
+
+    if [ "$MEMPOOL_SIZE" -gt 0 ] 2>/dev/null; then
+        detail "Use 'bash tools/signet_diagnose.sh mempool' for full mempool listing"
+        detail "Use 'bash tools/signet_diagnose.sh bump <TXID>' for emergency fee bump"
+    fi
+}
+
+# ==========================================================================
 # Help
 # ==========================================================================
 
@@ -1087,12 +1186,15 @@ cmd_help() {
     echo -e "${BOLD}Demo (standalone, no CLN needed):${NC}"
     echo "       bash $0 demo-coop          Factory + payments + cooperative close"
     echo "       bash $0 demo-force-close   Factory + payments + force close (tree broadcast)"
-    echo "       bash $0 demo-breach        Breach + watchtower penalty + CPFP (regtest)"
+    echo "       bash $0 demo-breach        Breach + watchtower penalty + CPFP (regtest default)"
+    echo "       bash $0 demo-breach-signet Breach + watchtower penalty + CPFP (signet)"
     echo ""
     echo -e "${BOLD}Diagnostics:${NC}"
     echo "       bash $0 status             Full system status dump"
     echo "       bash $0 channel-status     CLN channel details"
     echo "       bash $0 test-payment       Create + pay test invoice"
+    echo "       bash $0 dump-state         Quick factory/channel/watchtower summary"
+    echo "       bash $0 check-stuck        List unconfirmed txs, flag stuck ones"
     echo ""
     echo -e "${BOLD}Cleanup:${NC}"
     echo "       bash $0 stop-all           Graceful shutdown of everything"
@@ -1122,9 +1224,12 @@ case "${1:-}" in
     start-client2)       cmd_start_client2 ;;
     demo-coop)           cmd_demo_coop ;;
     demo-force-close)    cmd_demo_force_close ;;
-    demo-breach)         cmd_demo_breach ;;
+    demo-breach)         cmd_demo_breach "$@" ;;
+    demo-breach-signet)  cmd_demo_breach "$@" signet ;;
     status)              cmd_status ;;
     test-payment)        cmd_test_payment ;;
+    dump-state)          cmd_dump_state ;;
+    check-stuck)         cmd_check_stuck ;;
     stop-all)            cmd_stop_all ;;
     help|--help|-h)      cmd_help ;;
     *)                   cmd_help ;;

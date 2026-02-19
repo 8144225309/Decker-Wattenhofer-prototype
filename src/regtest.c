@@ -280,7 +280,8 @@ int regtest_get_confirmations(regtest_t *rt, const char *txid) {
     int height = atoi(result);
     free(result);
 
-    for (int i = 0; i < 20 && i <= height; i++) {
+    int scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 200;
+    for (int i = 0; i < scan_depth && i <= height; i++) {
         snprintf(params, sizeof(params), "%d", height - i);
         char *hash_result = regtest_exec(rt, "getblockhash", params);
         if (!hash_result) continue;
@@ -408,7 +409,8 @@ int regtest_get_tx_output(regtest_t *rt, const char *txid, uint32_t vout,
     int height = atoi(result);
     free(result);
 
-    for (int i = 0; i < 20 && i <= height; i++) {
+    int scan_depth = (strcmp(rt->network, "regtest") == 0) ? 20 : 200;
+    for (int i = 0; i < scan_depth && i <= height; i++) {
         snprintf(params, sizeof(params), "%d", height - i);
         char *hash_result = regtest_exec(rt, "getblockhash", params);
         if (!hash_result) continue;
@@ -494,6 +496,10 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
                                     int timeout_secs) {
     if (!rt || !txid) return -1;
 
+    int is_regtest = (strcmp(rt->network, "regtest") == 0);
+    int interval = is_regtest ? 5 : 15;       /* initial poll interval */
+    int max_interval = is_regtest ? 10 : 120;  /* cap */
+
     int elapsed = 0;
     while (elapsed < timeout_secs) {
         int conf = regtest_get_confirmations(rt, txid);
@@ -506,8 +512,12 @@ int regtest_wait_for_confirmation(regtest_t *rt, const char *txid,
         }
 
         printf("  waiting for confirmation... (%ds/%ds)\n", elapsed, timeout_secs);
-        sleep(10);
-        elapsed += 10;
+        sleep(interval);
+        elapsed += interval;
+        /* Exponential backoff, capped */
+        interval *= 2;
+        if (interval > max_interval)
+            interval = max_interval;
     }
 
     return -1;  /* timeout */
@@ -574,9 +584,8 @@ char *regtest_sign_raw_tx_with_wallet(regtest_t *rt, const char *unsigned_hex,
         size_t plen = strlen(unsigned_hex) + strlen(prevtxs_json) + 16;
         params = (char *)malloc(plen);
         if (!params) return NULL;
-        /* NOTE: Single-quote quoting works via popen()+sh on Unix/WSL but
-           would break on native Windows cmd.exe. Acceptable for now since
-           we only build/run via WSL. */
+        /* NOTE: Single-quote quoting relies on popen() invoking /bin/sh.
+           This works on Linux and macOS. */
         snprintf(params, plen, "\"%s\" '%s'", unsigned_hex, prevtxs_json);
     } else {
         size_t plen = strlen(unsigned_hex) + 8;
