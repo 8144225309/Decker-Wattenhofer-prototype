@@ -203,6 +203,7 @@ superscalar_lsp [OPTIONS]
 |------|----------|---------|-------------|
 | `--port` | PORT | 9735 | Listen port |
 | `--clients` | N | 4 | Number of clients |
+| `--arity` | N | 2 | Leaf arity: 1 (per-client leaves) or 2 (paired leaves) |
 | `--amount` | SATS | 100000 | Funding amount |
 | `--network` | MODE | regtest | regtest / signet / testnet / mainnet |
 | `--daemon` | — | off | Long-lived daemon mode |
@@ -221,6 +222,7 @@ superscalar_lsp [OPTIONS]
 | `--test-distrib` | — | off | Broadcast pre-signed distribution tx |
 | `--test-turnover` | — | off | PTLC key turnover, close with extracted keys |
 | `--test-rotation` | — | off | Full factory rotation lifecycle |
+| `--force-close` | — | off | Broadcast factory tree on-chain, wait for confirmations |
 
 ### superscalar_client
 
@@ -324,7 +326,7 @@ Revocation via random per-commitment secrets, penalty sweeps on breach, 2-leaf t
 
 ### Wire Protocol
 
-50 message types over TCP with length-prefixed JSON framing:
+49 message types over TCP with length-prefixed JSON framing:
 
 | Category | Messages |
 |----------|----------|
@@ -368,7 +370,7 @@ CLN (lightningd)
 | `channel` | channel.c | Poon-Dryja channels: commitment txs, revocation, penalty, HTLCs |
 | `adaptor` | adaptor.c | MuSig2 adaptor signatures, PTLC key turnover |
 | `ladder` | ladder.c | Ladder manager: overlapping factory lifecycle, migration |
-| `wire` | wire.c | TCP transport, JSON framing, 50 message types |
+| `wire` | wire.c | TCP transport, JSON framing, 49 message types |
 | `lsp` | lsp.c | LSP server: factory creation, cooperative close |
 | `client` | client.c | Client: factory ceremony, channel ops, rotation |
 | `lsp_channels` | lsp_channels.c | HTLC forwarding, event loop, watchtower, multi-factory |
@@ -377,6 +379,10 @@ CLN (lightningd)
 | `fee` | fee.c | Configurable fee estimation |
 | `watchtower` | watchtower.c | Breach detection + penalty broadcast (LSP + client-side, factory nodes) |
 | `keyfile` | keyfile.c | Encrypted keyfile storage |
+| `jit_channel` | jit_channel.c | JIT channel fallback for offline/low-balance clients |
+| `noise` | noise.c | Noise protocol encrypted transport |
+| `crypto_aead` | crypto_aead.c | AEAD encryption primitives |
+| `report` | report.c | JSON diagnostic report generation |
 | `regtest` | regtest.c | bitcoin-cli subprocess harness |
 | `util` | util.c | SHA-256, tagged hashing, hex, byte utilities |
 
