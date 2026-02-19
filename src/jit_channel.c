@@ -264,6 +264,16 @@ int jit_channel_create(void *mgr_ptr, void *lsp_ptr,
     jit->funding_amount = actual_amount;
     jit->funding_confirmed = 1;
 
+    /* Persist the raw funding tx hex for crash recovery */
+    jit->funding_tx_hex[0] = '\0';
+    regtest_get_raw_tx(rt, fund_txid_hex,
+                       jit->funding_tx_hex, sizeof(jit->funding_tx_hex));
+    /* Log the broadcast */
+    if (mgr->persist) {
+        persist_log_broadcast((persist_t *)mgr->persist, fund_txid_hex,
+                              "jit_funding", jit->funding_tx_hex, "ok");
+    }
+
     /* Get current block height */
     int cur_h = regtest_get_block_height(rt);
     jit->created_block = (cur_h > 0) ? (uint32_t)cur_h : 0;

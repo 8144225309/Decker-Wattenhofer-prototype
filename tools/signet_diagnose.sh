@@ -404,6 +404,238 @@ except:
 }
 
 # ==========================================================================
+# broadcast-log — Show broadcast audit trail
+# ==========================================================================
+
+cmd_broadcast_log() {
+    header "Broadcast Audit Log"
+
+    if [ ! -f "$LSPDB" ]; then
+        fail "LSP database not found: $LSPDB"
+        exit 1
+    fi
+
+    python3 -c "
+import sqlite3, sys
+
+db = sqlite3.connect('file:$LSPDB?mode=ro', uri=True)
+try:
+    rows = db.execute(
+        'SELECT id, txid, source, result, broadcast_time, '
+        'CASE WHEN raw_hex IS NOT NULL THEN length(raw_hex)/2 ELSE 0 END as tx_bytes '
+        'FROM broadcast_log ORDER BY id DESC LIMIT 50'
+    ).fetchall()
+    if not rows:
+        print('    (no broadcasts logged)')
+    else:
+        print(f'  {\"ID\":>4s}  {\"Source\":>18s}  {\"TXID\":>22s}  {\"Result\":>8s}  {\"Size\":>6s}  {\"Time\":>12s}')
+        print(f'  {\"-\"*4}  {\"-\"*18}  {\"-\"*22}  {\"-\"*8}  {\"-\"*6}  {\"-\"*12}')
+        for r in rows:
+            bid, txid, source, result, btime, tx_bytes = r
+            txid_short = (txid[:20] + '..') if len(txid or '') > 20 else (txid or '?')
+            import datetime
+            ts = datetime.datetime.fromtimestamp(btime).strftime('%H:%M:%S') if btime else '?'
+            print(f'  {bid:>4d}  {source:>18s}  {txid_short:>22s}  {result or \"?\":>8s}  {tx_bytes:>5d}B  {ts:>12s}')
+except sqlite3.OperationalError as e:
+    print(f'    (table not found: {e})')
+except Exception as e:
+    print(f'    error: {e}')
+db.close()
+" 2>/dev/null || fail "Could not read broadcast log"
+}
+
+# ==========================================================================
+# rebroadcast-tree — Re-broadcast signed tree nodes from DB
+# ==========================================================================
+
+cmd_rebroadcast_tree() {
+    header "Re-broadcast Factory Tree from DB"
+
+    if [ ! -f "$LSPDB" ]; then
+        fail "LSP database not found: $LSPDB"
+        exit 1
+    fi
+
+    if ! btc getblockchaininfo &>/dev/null; then
+        fail "bitcoind is not running."
+        exit 1
+    fi
+
+    step "Checking tree nodes with stored signed_tx_hex..."
+    python3 -c "
+import sqlite3, subprocess, json, sys
+
+db = sqlite3.connect('file:$LSPDB?mode=ro', uri=True)
+try:
+    rows = db.execute(
+        'SELECT node_index, txid, signed_tx_hex FROM tree_nodes '
+        'WHERE signed_tx_hex IS NOT NULL ORDER BY node_index'
+    ).fetchall()
+except sqlite3.OperationalError:
+    print('    (signed_tx_hex column not found — upgrade DB schema)')
+    sys.exit(0)
+
+if not rows:
+    print('    No signed transactions stored in DB')
+    sys.exit(0)
+
+print(f'    Found {len(rows)} node(s) with stored signed tx hex')
+
+for node_idx, txid, tx_hex in rows:
+    # Check if already on-chain
+    try:
+        result = subprocess.run(
+            ['$BTCBIN/bitcoin-cli', '-signet', '-rpcuser=$RPCUSER',
+             '-rpcpassword=$RPCPASS', '-rpcport=$RPCPORT',
+             'getrawtransaction', txid, 'true'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            conf = info.get('confirmations', 0)
+            if conf > 0:
+                print(f'    node[{node_idx}] {txid[:20]}... already confirmed ({conf} conf)')
+                continue
+            else:
+                print(f'    node[{node_idx}] {txid[:20]}... in mempool, skipping')
+                continue
+    except:
+        pass
+
+    # Try to broadcast
+    try:
+        result = subprocess.run(
+            ['$BTCBIN/bitcoin-cli', '-signet', '-rpcuser=$RPCUSER',
+             '-rpcpassword=$RPCPASS', '-rpcport=$RPCPORT',
+             'sendrawtransaction', tx_hex],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            print(f'    node[{node_idx}] BROADCAST OK: {result.stdout.strip()[:20]}...')
+        else:
+            err = result.stderr.strip()[:60]
+            print(f'    node[{node_idx}] broadcast failed: {err}')
+    except Exception as e:
+        print(f'    node[{node_idx}] error: {e}')
+
+db.close()
+" 2>/dev/null || fail "Re-broadcast failed"
+}
+
+# ==========================================================================
+# rebroadcast-jit — Re-broadcast JIT funding txs from DB
+# ==========================================================================
+
+cmd_rebroadcast_jit() {
+    header "Re-broadcast JIT Funding Transactions from DB"
+
+    if [ ! -f "$LSPDB" ]; then
+        fail "LSP database not found: $LSPDB"
+        exit 1
+    fi
+
+    if ! btc getblockchaininfo &>/dev/null; then
+        fail "bitcoind is not running."
+        exit 1
+    fi
+
+    python3 -c "
+import sqlite3, subprocess, json, sys
+
+db = sqlite3.connect('file:$LSPDB?mode=ro', uri=True)
+try:
+    rows = db.execute(
+        'SELECT jit_channel_id, client_idx, state, funding_txid, funding_tx_hex '
+        'FROM jit_channels WHERE funding_tx_hex IS NOT NULL AND funding_tx_hex != \"\"'
+    ).fetchall()
+except sqlite3.OperationalError:
+    print('    (funding_tx_hex column not found — upgrade DB schema)')
+    sys.exit(0)
+
+if not rows:
+    print('    No JIT funding txs stored in DB')
+    sys.exit(0)
+
+for jit_id, cidx, state, txid, tx_hex in rows:
+    if state == 'CLOSED':
+        print(f'    JIT #{jit_id} (client {cidx}): CLOSED, skipping')
+        continue
+
+    # Check if already confirmed
+    try:
+        result = subprocess.run(
+            ['$BTCBIN/bitcoin-cli', '-signet', '-rpcuser=$RPCUSER',
+             '-rpcpassword=$RPCPASS', '-rpcport=$RPCPORT',
+             'getrawtransaction', txid, 'true'],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            conf = info.get('confirmations', 0)
+            if conf > 0:
+                print(f'    JIT #{jit_id} (client {cidx}): already confirmed ({conf} conf)')
+                continue
+    except:
+        pass
+
+    # Re-broadcast
+    try:
+        result = subprocess.run(
+            ['$BTCBIN/bitcoin-cli', '-signet', '-rpcuser=$RPCUSER',
+             '-rpcpassword=$RPCPASS', '-rpcport=$RPCPORT',
+             'sendrawtransaction', tx_hex],
+            capture_output=True, text=True, timeout=10
+        )
+        if result.returncode == 0:
+            print(f'    JIT #{jit_id} (client {cidx}): BROADCAST OK')
+        else:
+            err = result.stderr.strip()[:60]
+            print(f'    JIT #{jit_id} (client {cidx}): failed: {err}')
+    except Exception as e:
+        print(f'    JIT #{jit_id} (client {cidx}): error: {e}')
+
+db.close()
+" 2>/dev/null || fail "Re-broadcast failed"
+}
+
+# ==========================================================================
+# signing-state — Show signing progress
+# ==========================================================================
+
+cmd_signing_state() {
+    header "Signing Progress"
+
+    if [ ! -f "$LSPDB" ]; then
+        fail "LSP database not found: $LSPDB"
+        exit 1
+    fi
+
+    python3 -c "
+import sqlite3
+
+db = sqlite3.connect('file:$LSPDB?mode=ro', uri=True)
+try:
+    rows = db.execute(
+        'SELECT factory_id, node_index, signer_slot, has_nonce, has_partial_sig, updated_at '
+        'FROM signing_progress ORDER BY factory_id, node_index, signer_slot'
+    ).fetchall()
+    if not rows:
+        print('    (no signing progress — either complete or not started)')
+    else:
+        print(f'    {len(rows)} signing progress entries:')
+        for fid, nidx, slot, has_n, has_ps, ts in rows:
+            n_str = 'nonce' if has_n else '     '
+            p_str = 'psig' if has_ps else '    '
+            print(f'      factory={fid} node={nidx} signer={slot} [{n_str}] [{p_str}]')
+except sqlite3.OperationalError as e:
+    print(f'    (table not found: {e})')
+except Exception as e:
+    print(f'    error: {e}')
+db.close()
+" 2>/dev/null || fail "Could not read signing progress"
+}
+
+# ==========================================================================
 # Help
 # ==========================================================================
 
@@ -419,9 +651,13 @@ cmd_help() {
     echo "   bash $0 factory-state      LSP factory/channel/DW/watchtower state"
     echo "   bash $0 jit-state          JIT channel state from all client DBs"
     echo "   bash $0 watchtower-state   Old commitments from all DBs"
+    echo "   bash $0 broadcast-log      Broadcast audit trail (all txs sent)"
+    echo "   bash $0 signing-state      MuSig2 signing progress"
     echo ""
     echo -e "${BOLD}Recovery:${NC}"
     echo "   bash $0 bump <TXID>        CPFP fee bump for stuck mempool tx"
+    echo "   bash $0 rebroadcast-tree   Re-broadcast signed tree nodes from DB"
+    echo "   bash $0 rebroadcast-jit    Re-broadcast JIT funding txs from DB"
     echo ""
     echo -e "${BOLD}Configuration:${NC}"
     echo "  Sources tools/.env if present. Data directory: $DATADIR"
@@ -438,7 +674,11 @@ case "${1:-}" in
     factory-state)     cmd_factory_state ;;
     jit-state)         cmd_jit_state ;;
     watchtower-state)  cmd_watchtower_state ;;
+    broadcast-log)     cmd_broadcast_log ;;
+    signing-state)     cmd_signing_state ;;
     bump)              cmd_bump "$@" ;;
+    rebroadcast-tree)  cmd_rebroadcast_tree ;;
+    rebroadcast-jit)   cmd_rebroadcast_jit ;;
     help|--help|-h)    cmd_help ;;
     *)                 cmd_help ;;
 esac

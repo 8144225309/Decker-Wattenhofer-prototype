@@ -116,7 +116,25 @@ static const char *SCHEMA_SQL =
     "  is_built INTEGER,"
     "  is_signed INTEGER,"
     "  spending_spk TEXT,"
+    "  signed_tx_hex TEXT,"
     "  PRIMARY KEY (factory_id, node_index)"
+    ");"
+    "CREATE TABLE IF NOT EXISTS broadcast_log ("
+    "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+    "  txid TEXT NOT NULL,"
+    "  source TEXT NOT NULL,"
+    "  raw_hex TEXT,"
+    "  result TEXT,"
+    "  broadcast_time INTEGER DEFAULT (strftime('%%s','now'))"
+    ");"
+    "CREATE TABLE IF NOT EXISTS signing_progress ("
+    "  factory_id INTEGER NOT NULL,"
+    "  node_index INTEGER NOT NULL,"
+    "  signer_slot INTEGER NOT NULL,"
+    "  has_nonce INTEGER NOT NULL DEFAULT 0,"
+    "  has_partial_sig INTEGER NOT NULL DEFAULT 0,"
+    "  updated_at INTEGER DEFAULT (strftime('%%s','now')),"
+    "  PRIMARY KEY (factory_id, node_index, signer_slot)"
     ");"
     "CREATE TABLE IF NOT EXISTS ladder_factories ("
     "  factory_id INTEGER PRIMARY KEY,"
@@ -223,7 +241,8 @@ static const char *SCHEMA_SQL =
     "  commitment_number INTEGER DEFAULT 0,"
     "  created_at INTEGER,"
     "  created_block INTEGER,"
-    "  target_factory_id INTEGER DEFAULT 0"
+    "  target_factory_id INTEGER DEFAULT 0,"
+    "  funding_tx_hex TEXT"
     ");";
 
 int persist_open(persist_t *p, const char *path) {
@@ -1102,8 +1121,9 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
         "INSERT OR REPLACE INTO tree_nodes "
         "(factory_id, node_index, type, parent_index, parent_vout, "
         " dw_layer_index, n_signers, signer_indices, n_outputs, output_amounts, "
-        " nsequence, input_amount, txid, is_built, is_signed, spending_spk) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        " nsequence, input_amount, txid, is_built, is_signed, spending_spk, "
+        " signed_tx_hex) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     for (size_t i = 0; i < f->n_nodes; i++) {
         const factory_node_t *node = &f->nodes[i];
@@ -1172,12 +1192,100 @@ int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_i
             sqlite3_bind_null(stmt, 16);
         }
 
+        /* signed_tx_hex — persist the signed transaction for crash recovery */
+        if (node->is_signed && node->signed_tx.len > 0) {
+            char *stx_hex = (char *)malloc(node->signed_tx.len * 2 + 1);
+            if (stx_hex) {
+                hex_encode(node->signed_tx.data, node->signed_tx.len, stx_hex);
+                sqlite3_bind_text(stmt, 17, stx_hex, -1, SQLITE_TRANSIENT);
+                free(stx_hex);
+            } else {
+                sqlite3_bind_null(stmt, 17);
+            }
+        } else {
+            sqlite3_bind_null(stmt, 17);
+        }
+
         int ok = (sqlite3_step(stmt) == SQLITE_DONE);
         sqlite3_finalize(stmt);
         if (!ok) return 0;
     }
 
     return 1;
+}
+
+/* --- Broadcast audit log --- */
+
+int persist_log_broadcast(persist_t *p, const char *txid,
+                           const char *source, const char *raw_hex,
+                           const char *result) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "INSERT INTO broadcast_log (txid, source, raw_hex, result) "
+        "VALUES (?, ?, ?, ?);";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_text(stmt, 1, txid ? txid : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(stmt, 2, source ? source : "unknown", -1, SQLITE_TRANSIENT);
+    if (raw_hex)
+        sqlite3_bind_text(stmt, 3, raw_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 3);
+    if (result)
+        sqlite3_bind_text(stmt, 4, result, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 4);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+/* --- Signing progress tracking --- */
+
+int persist_save_signing_progress(persist_t *p, uint32_t factory_id,
+                                    uint32_t node_index, uint32_t signer_slot,
+                                    int has_nonce, int has_partial_sig) {
+    if (!p || !p->db) return 0;
+
+    const char *sql =
+        "INSERT OR REPLACE INTO signing_progress "
+        "(factory_id, node_index, signer_slot, has_nonce, has_partial_sig, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, strftime('%s','now'));";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+    sqlite3_bind_int(stmt, 2, (int)node_index);
+    sqlite3_bind_int(stmt, 3, (int)signer_slot);
+    sqlite3_bind_int(stmt, 4, has_nonce);
+    sqlite3_bind_int(stmt, 5, has_partial_sig);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
+}
+
+int persist_clear_signing_progress(persist_t *p, uint32_t factory_id) {
+    if (!p || !p->db) return 0;
+
+    const char *sql = "DELETE FROM signing_progress WHERE factory_id = ?;";
+
+    sqlite3_stmt *stmt;
+    if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
+        return 0;
+
+    sqlite3_bind_int(stmt, 1, (int)factory_id);
+
+    int ok = (sqlite3_step(stmt) == SQLITE_DONE);
+    sqlite3_finalize(stmt);
+    return ok;
 }
 
 /* --- Ladder factory state (Phase 22) --- */
@@ -2035,8 +2143,8 @@ int persist_save_jit_channel(persist_t *p, const void *jit_ptr) {
         "INSERT OR REPLACE INTO jit_channels "
         "(jit_channel_id, client_idx, state, funding_txid, funding_vout, "
         "funding_amount, local_amount, remote_amount, commitment_number, "
-        "created_at, created_block, target_factory_id) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
+        "created_at, created_block, target_factory_id, funding_tx_hex) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?);";
 
     sqlite3_stmt *stmt;
     if (sqlite3_prepare_v2(p->db, sql, -1, &stmt, NULL) != SQLITE_OK)
@@ -2054,6 +2162,10 @@ int persist_save_jit_channel(persist_t *p, const void *jit_ptr) {
     sqlite3_bind_int64(stmt, 10, (sqlite3_int64)jit->created_at);
     sqlite3_bind_int(stmt, 11, (int)jit->created_block);
     sqlite3_bind_int(stmt, 12, (int)jit->target_factory_id);
+    if (jit->funding_tx_hex[0])
+        sqlite3_bind_text(stmt, 13, jit->funding_tx_hex, -1, SQLITE_TRANSIENT);
+    else
+        sqlite3_bind_null(stmt, 13);
 
     int ok = (sqlite3_step(stmt) == SQLITE_DONE);
     sqlite3_finalize(stmt);
@@ -2068,7 +2180,7 @@ size_t persist_load_jit_channels(persist_t *p, void *out_ptr, size_t max,
     const char *sql =
         "SELECT jit_channel_id, client_idx, state, funding_txid, funding_vout, "
         "funding_amount, local_amount, remote_amount, commitment_number, "
-        "created_at, created_block, target_factory_id "
+        "created_at, created_block, target_factory_id, funding_tx_hex "
         "FROM jit_channels ORDER BY jit_channel_id;";
 
     sqlite3_stmt *stmt;
@@ -2098,6 +2210,11 @@ size_t persist_load_jit_channels(persist_t *p, void *out_ptr, size_t max,
         jit->created_at = (time_t)sqlite3_column_int64(stmt, 9);
         jit->created_block = (uint32_t)sqlite3_column_int(stmt, 10);
         jit->target_factory_id = (uint32_t)sqlite3_column_int(stmt, 11);
+        const char *ftx_hex = (const char *)sqlite3_column_text(stmt, 12);
+        if (ftx_hex) {
+            strncpy(jit->funding_tx_hex, ftx_hex, sizeof(jit->funding_tx_hex) - 1);
+            jit->funding_tx_hex[sizeof(jit->funding_tx_hex) - 1] = '\0';
+        }
         count++;
     }
 

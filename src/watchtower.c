@@ -1,4 +1,5 @@
 #include "superscalar/watchtower.h"
+#include "superscalar/persist.h"
 #include "cJSON.h"
 #include <stdio.h>
 #include <string.h>
@@ -304,8 +305,14 @@ int watchtower_check(watchtower_t *wt) {
                     if (regtest_send_raw_tx(wt->rt, resp_hex, resp_txid)) {
                         printf("  Latest state tx broadcast: %s\n", resp_txid);
                         penalties_broadcast++;
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, resp_txid,
+                                                  "factory_response", resp_hex, "ok");
                     } else {
                         fprintf(stderr, "  Latest state tx broadcast failed\n");
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, "?",
+                                                  "factory_response", resp_hex, "failed");
                     }
                     free(resp_hex);
                 }
@@ -367,8 +374,14 @@ int watchtower_check(watchtower_t *wt) {
                 printf("  Penalty tx broadcast: %s\n", penalty_txid);
                 penalties_broadcast++;
                 penalty_sent = 1;
+                if (wt->db && wt->db->db)
+                    persist_log_broadcast(wt->db, penalty_txid, "penalty",
+                                          penalty_hex, "ok");
             } else {
                 fprintf(stderr, "  Penalty tx broadcast failed\n");
+                if (wt->db && wt->db->db)
+                    persist_log_broadcast(wt->db, "?", "penalty",
+                                          penalty_hex, "failed");
             }
             free(penalty_hex);
         }
@@ -422,9 +435,15 @@ int watchtower_check(watchtower_t *wt) {
                         printf("  HTLC penalty tx (vout %u) broadcast: %s\n",
                                e->htlc_outputs[h].htlc_vout, htlc_txid);
                         penalties_broadcast++;
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, htlc_txid,
+                                                  "htlc_penalty", htlc_hex, "ok");
                     } else {
                         fprintf(stderr, "  HTLC penalty tx (vout %u) broadcast failed\n",
                                 e->htlc_outputs[h].htlc_vout);
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, "?",
+                                                  "htlc_penalty", htlc_hex, "failed");
                     }
                     free(htlc_hex);
                 }
@@ -478,9 +497,14 @@ int watchtower_check(watchtower_t *wt) {
                             persist_save_pending(wt->db, p->txid,
                                 p->anchor_vout, p->anchor_amount,
                                 p->cycles_in_mempool, p->bump_count);
+                            persist_log_broadcast(wt->db, cpfp_txid,
+                                                  "cpfp", cpfp_hex, "ok");
                         }
                     } else {
                         fprintf(stderr, "  CPFP child broadcast failed\n");
+                        if (wt->db && wt->db->db)
+                            persist_log_broadcast(wt->db, "?",
+                                                  "cpfp", cpfp_hex, "failed");
                     }
                     free(cpfp_hex);
                 }

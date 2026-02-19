@@ -676,6 +676,11 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (!factory_session_set_partial_sig(f, node_idx, (size_t)lsp_slot, &lsp_psig))
         return 0;
 
+    /* Track LSP signing progress */
+    if (mgr->persist)
+        persist_save_signing_progress((persist_t *)mgr->persist, 0,
+                                       (uint32_t)node_idx, (uint32_t)lsp_slot, 1, 1);
+
     /* Step 8: Set client's partial sig */
     secp256k1_musig_partial_sig client_psig;
     if (!musig_partial_sig_parse(lsp->ctx, &client_psig, client_psig_ser))
@@ -684,11 +689,20 @@ static int lsp_advance_leaf(lsp_channel_mgr_t *mgr, lsp_t *lsp, int leaf_side) {
     if (!factory_session_set_partial_sig(f, node_idx, (size_t)client_slot, &client_psig))
         return 0;
 
+    /* Track client signing progress */
+    if (mgr->persist)
+        persist_save_signing_progress((persist_t *)mgr->persist, 0,
+                                       (uint32_t)node_idx, (uint32_t)client_slot, 1, 1);
+
     /* Step 9: Aggregate + finalize */
     if (!factory_session_complete_node(f, node_idx)) {
         fprintf(stderr, "LSP: session complete failed for leaf node %zu\n", node_idx);
         return 0;
     }
+
+    /* Clear signing progress after successful aggregation */
+    if (mgr->persist)
+        persist_clear_signing_progress((persist_t *)mgr->persist, 0);
 
     /* Step 10: Send LEAF_ADVANCE_DONE to all clients */
     cJSON *done = wire_build_leaf_advance_done(leaf_side);
@@ -1674,6 +1688,11 @@ int lsp_channels_rotate_factory(lsp_channel_mgr_t *mgr, lsp_t *lsp) {
         return 0;
     }
     int rc_sent = regtest_send_raw_tx(rt, rc_hex, rc_txid);
+    if (mgr->persist) {
+        persist_log_broadcast((persist_t *)mgr->persist,
+                              rc_sent ? rc_txid : "?", "rotation_close",
+                              rc_hex, rc_sent ? "ok" : "failed");
+    }
     free(rc_hex);
     tx_buf_free(&rot_close_tx);
 

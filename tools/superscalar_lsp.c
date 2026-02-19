@@ -27,6 +27,7 @@ extern void sha256_tagged(const char *, const unsigned char *, size_t, unsigned 
 
 static volatile sig_atomic_t g_shutdown = 0;
 static lsp_t *g_lsp = NULL;  /* for signal handler cleanup */
+static persist_t *g_db = NULL;  /* for broadcast audit logging */
 
 static void sigint_handler(int sig) {
     (void)sig;
@@ -275,6 +276,14 @@ static int broadcast_factory_tree(factory_t *f, regtest_t *rt,
 
         char txid_out[65];
         int ok = regtest_send_raw_tx(rt, tx_hex, txid_out);
+
+        /* Audit log */
+        if (g_db) {
+            char src[32];
+            snprintf(src, sizeof(src), "tree_node_%zu", i);
+            persist_log_broadcast(g_db, ok ? txid_out : "?", src, tx_hex,
+                                  ok ? "ok" : "failed");
+        }
         free(tx_hex);
 
         if (!ok) {
@@ -363,6 +372,14 @@ static int broadcast_factory_tree_any_network(factory_t *f, regtest_t *rt,
             } else {
                 sleep(15);
             }
+        }
+
+        /* Audit log */
+        if (g_db) {
+            char src[32];
+            snprintf(src, sizeof(src), "tree_node_%zu", i);
+            persist_log_broadcast(g_db, ok ? txid_out : "?", src, tx_hex,
+                                  ok ? "ok" : "failed");
         }
         free(tx_hex);
 
@@ -541,6 +558,7 @@ int main(int argc, char *argv[]) {
             return 1;
         }
         use_db = 1;
+        g_db = &db;
         printf("LSP: persistence enabled (%s)\n", db_path);
 
         /* Wire message logging (Phase 22) */

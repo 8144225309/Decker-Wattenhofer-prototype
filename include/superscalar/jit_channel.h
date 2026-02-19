@@ -30,6 +30,7 @@ typedef struct jit_channel {
     time_t created_at;
     uint32_t created_block;
     uint32_t target_factory_id; /* Factory to migrate into, or 0 */
+    char funding_tx_hex[4096]; /* Signed funding tx hex for crash recovery */
 } jit_channel_t;
 
 #define JIT_MAX_CHANNELS 8

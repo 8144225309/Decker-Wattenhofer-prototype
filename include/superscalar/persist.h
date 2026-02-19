@@ -161,8 +161,26 @@ void persist_log_wire_message(persist_t *p, int direction, uint8_t msg_type,
 
 /* --- Factory tree nodes (Phase 22) --- */
 
-/* Save all tree nodes for a factory. */
+/* Save all tree nodes for a factory (includes signed_tx_hex if available). */
 int persist_save_tree_nodes(persist_t *p, const factory_t *f, uint32_t factory_id);
+
+/* --- Broadcast audit log --- */
+
+/* Log a broadcast attempt (txid, source label, raw hex, result).
+   source examples: "tree_node_0", "penalty", "cpfp", "jit_funding". */
+int persist_log_broadcast(persist_t *p, const char *txid,
+                           const char *source, const char *raw_hex,
+                           const char *result);
+
+/* --- Signing progress tracking --- */
+
+/* Save nonce/partial-sig receipt for one signer on one tree node. */
+int persist_save_signing_progress(persist_t *p, uint32_t factory_id,
+                                    uint32_t node_index, uint32_t signer_slot,
+                                    int has_nonce, int has_partial_sig);
+
+/* Clear all signing progress for a factory (after successful aggregate). */
+int persist_clear_signing_progress(persist_t *p, uint32_t factory_id);
 
 /* --- Ladder factory state (Phase 22) --- */
 
