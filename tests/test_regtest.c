@@ -623,9 +623,231 @@ int test_regtest_cpfp_penalty_bump(void) {
     fee_estimator_t fee;
     fee_init(&fee, 1000);
     watchtower_init(&wt, 1, &rt, &fee, NULL);
-    TEST_ASSERT(wt.anchor_spk_len == 34, "anchor SPK initialized");
-    printf("  Watchtower anchor SPK generated successfully\n");
+    TEST_ASSERT(wt.anchor_spk_len == P2A_SPK_LEN, "P2A anchor SPK initialized");
+    printf("  Watchtower P2A anchor SPK set successfully\n");
 
     watchtower_cleanup(&wt);
+    return 1;
+}
+
+/* Full on-chain breach → penalty → CPFP regtest test.
+   1. Set up LSP + client channels with proper key derivation
+   2. Build/sign commitment #0, advance to #1, exchange revocations
+   3. Client watchtower registers old commitment #0
+   4. Broadcast revoked commitment #0 (breach)
+   5. watchtower_check() detects breach, builds penalty with P2A anchor
+   6. Simulate CPFP bumping cycles
+   7. Mine and verify penalty confirms */
+int test_regtest_breach_penalty_cpfp(void) {
+    secp256k1_context *ctx = secp256k1_context_create(
+        SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
+    regtest_t rt;
+    if (!regtest_init(&rt)) {
+        printf("  SKIP: bitcoind not running\n");
+        secp256k1_context_destroy(ctx);
+        return 1;
+    }
+    regtest_create_wallet(&rt, "test_breach_cpfp");
+
+    char mine_addr[128];
+    TEST_ASSERT(regtest_get_new_address(&rt, mine_addr, sizeof(mine_addr)),
+                "get mining address");
+    regtest_mine_blocks(&rt, 101, mine_addr);
+
+    /* --- Set up a 2-of-2 MuSig funding UTXO --- */
+    secp256k1_keypair kps[2];
+    musig_keyagg_t keyagg;
+    char factory_addr[128];
+    char funding_txid_hex[65];
+    int found_vout = -1;
+    uint64_t fund_amount;
+    unsigned char fund_spk[34];
+    size_t fund_spk_len;
+
+    TEST_ASSERT(setup_factory(&rt, ctx, kps, &keyagg, factory_addr,
+                                funding_txid_hex, &found_vout,
+                                &fund_amount, fund_spk, &fund_spk_len),
+                "factory setup for channel funding");
+    printf("  Funding UTXO: %s:%d (%llu sats)\n",
+           funding_txid_hex, found_vout, (unsigned long long)fund_amount);
+
+    unsigned char fund_txid_bytes[32];
+    hex_decode(funding_txid_hex, fund_txid_bytes, 32);
+    reverse_bytes(fund_txid_bytes, 32);
+
+    /* --- Set up LSP + client channels --- */
+    secp256k1_pubkey lsp_pk, client_pk;
+    secp256k1_keypair_pub(ctx, &lsp_pk, &kps[0]);
+    secp256k1_keypair_pub(ctx, &client_pk, &kps[1]);
+
+    fee_estimator_t fe;
+    fee_init(&fe, 1000);
+    uint64_t commit_fee = fee_for_commitment_tx(&fe, 0);
+    uint64_t usable = fund_amount > commit_fee ? fund_amount - commit_fee : fund_amount;
+    uint64_t local_amt = usable / 2;
+    uint64_t remote_amt = usable - local_amt;
+    uint32_t csv_delay = 6;
+
+    /* LSP channel (local=LSP, remote=client) */
+    channel_t lsp_ch;
+    TEST_ASSERT(channel_init(&lsp_ch, ctx, lsp_seckey, &lsp_pk, &client_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34, local_amt, remote_amt, csv_delay),
+                "init LSP channel");
+    channel_generate_random_basepoints(&lsp_ch);
+
+    /* Client channel (local=client, remote=LSP) */
+    channel_t client_ch;
+    TEST_ASSERT(channel_init(&client_ch, ctx, client_seckey, &client_pk, &lsp_pk,
+                               fund_txid_bytes, (uint32_t)found_vout, fund_amount,
+                               fund_spk, 34, remote_amt, local_amt, csv_delay),
+                "init client channel");
+    channel_generate_random_basepoints(&client_ch);
+
+    /* Exchange basepoints */
+    channel_set_remote_basepoints(&lsp_ch,
+        &client_ch.local_payment_basepoint,
+        &client_ch.local_delayed_payment_basepoint,
+        &client_ch.local_revocation_basepoint);
+    channel_set_remote_basepoints(&client_ch,
+        &lsp_ch.local_payment_basepoint,
+        &lsp_ch.local_delayed_payment_basepoint,
+        &lsp_ch.local_revocation_basepoint);
+
+    /* Exchange HTLC basepoints */
+    channel_set_remote_htlc_basepoint(&lsp_ch, &client_ch.local_htlc_basepoint);
+    channel_set_remote_htlc_basepoint(&client_ch, &lsp_ch.local_htlc_basepoint);
+
+    /* Exchange per-commitment points for commitments 0 and 1 */
+    secp256k1_pubkey lsp_pcp0, lsp_pcp1, client_pcp0, client_pcp1;
+    channel_get_per_commitment_point(&lsp_ch, 0, &lsp_pcp0);
+    channel_get_per_commitment_point(&lsp_ch, 1, &lsp_pcp1);
+    channel_get_per_commitment_point(&client_ch, 0, &client_pcp0);
+    channel_get_per_commitment_point(&client_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&lsp_ch, 0, &client_pcp0);
+    channel_set_remote_pcp(&lsp_ch, 1, &client_pcp1);
+    channel_set_remote_pcp(&client_ch, 0, &lsp_pcp0);
+    channel_set_remote_pcp(&client_ch, 1, &lsp_pcp1);
+
+    /* --- Build + sign commitment #0 (LSP's local commitment) --- */
+    tx_buf_t commit0_unsigned;
+    tx_buf_init(&commit0_unsigned, 512);
+    unsigned char commit0_txid[32];
+    TEST_ASSERT(channel_build_commitment_tx(&lsp_ch, &commit0_unsigned, commit0_txid),
+                "build LSP commitment #0");
+
+    tx_buf_t commit0_signed;
+    tx_buf_init(&commit0_signed, 1024);
+    TEST_ASSERT(channel_sign_commitment(&lsp_ch, &commit0_signed, &commit0_unsigned,
+                                          &kps[1]),
+                "sign LSP commitment #0 (client countersigns)");
+
+    /* Extract to_local SPK from commitment #0 unsigned for watchtower registration.
+       Layout: nVersion(4) + varint_in(1) + txid(32) + vout(4) + scriptSig_len(1) +
+       nSequence(4) = 46, then varint_out(1) = 47, then amount(8) + spk_varint(1) + spk(34) */
+    unsigned char to_local_spk[34];
+    memcpy(to_local_spk, commit0_unsigned.data + 47 + 8 + 1, 34);
+
+    /* --- Advance to commitment #1 --- */
+    channel_generate_local_pcs(&lsp_ch, 1);
+    channel_generate_local_pcs(&client_ch, 1);
+
+    secp256k1_pubkey lsp_pcp2, client_pcp2;
+    channel_get_per_commitment_point(&lsp_ch, 2, &lsp_pcp2);
+    channel_get_per_commitment_point(&client_ch, 2, &client_pcp2);
+    channel_set_remote_pcp(&lsp_ch, 2, &client_pcp2);
+    channel_set_remote_pcp(&client_ch, 2, &lsp_pcp2);
+
+    lsp_ch.commitment_number = 1;
+    client_ch.commitment_number = 1;
+
+    /* Exchange revocation secrets for commitment #0 */
+    unsigned char lsp_secret0[32], client_secret0[32];
+    channel_get_revocation_secret(&lsp_ch, 0, lsp_secret0);
+    channel_get_revocation_secret(&client_ch, 0, client_secret0);
+    channel_receive_revocation(&lsp_ch, 0, client_secret0);
+    channel_receive_revocation(&client_ch, 0, lsp_secret0);
+
+    /* --- Client watchtower: register old commitment #0 for monitoring --- */
+    watchtower_t wt;
+    watchtower_init(&wt, 1, &rt, &fe, NULL);
+    watchtower_set_channel(&wt, 0, &client_ch);
+    TEST_ASSERT(wt.anchor_spk_len == P2A_SPK_LEN, "P2A anchor initialized");
+
+    /* Build the remote-view commitment #0 to get the correct txid */
+    tx_buf_t remote_commit0;
+    tx_buf_init(&remote_commit0, 512);
+    unsigned char remote_commit0_txid[32];
+    client_ch.commitment_number = 0;
+    channel_build_commitment_tx_for_remote(&client_ch, &remote_commit0, remote_commit0_txid);
+    client_ch.commitment_number = 1;
+
+    /* Extract to_local SPK/amount from the remote view (this is what the
+       breach tx will look like — LSP's to_local output that client can sweep) */
+    unsigned char breach_to_local_spk[34];
+    memcpy(breach_to_local_spk, remote_commit0.data + 47 + 8 + 1, 34);
+    tx_buf_free(&remote_commit0);
+
+    TEST_ASSERT(watchtower_watch(&wt, 0, 0, commit0_txid,
+                                   0, local_amt, breach_to_local_spk, 34),
+                "register old commitment for watching");
+    printf("  Watchtower watching commitment #0\n");
+
+    /* --- BREACH: broadcast revoked commitment #0 --- */
+    char *commit0_hex = (char *)malloc(commit0_signed.len * 2 + 1);
+    hex_encode(commit0_signed.data, commit0_signed.len, commit0_hex);
+
+    char commit0_txid_hex[65];
+    int sent = regtest_send_raw_tx(&rt, commit0_hex, commit0_txid_hex);
+    free(commit0_hex);
+    TEST_ASSERT(sent, "broadcast revoked commitment #0 (breach)");
+    printf("  BREACH: revoked commitment broadcast: %s\n", commit0_txid_hex);
+
+    /* Mine 1 block to confirm the breach */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+    int conf = regtest_get_confirmations(&rt, commit0_txid_hex);
+    TEST_ASSERT(conf > 0, "breach commitment confirmed");
+
+    /* --- watchtower_check() detects breach and broadcasts penalty --- */
+    int penalties = watchtower_check(&wt);
+    TEST_ASSERT(penalties > 0, "watchtower detected breach and broadcast penalty");
+    printf("  Watchtower broadcast %d penalty tx(s)\n", penalties);
+
+    /* Verify penalty is pending for CPFP */
+    TEST_ASSERT(wt.n_pending > 0, "pending penalty entry created");
+    TEST_ASSERT(wt.pending[0].anchor_amount == ANCHOR_OUTPUT_AMOUNT,
+                "pending anchor amount matches P2A");
+    printf("  Penalty pending: txid=%s, anchor_vout=%u\n",
+           wt.pending[0].txid, wt.pending[0].anchor_vout);
+
+    /* --- Simulate CPFP bumping --- */
+    /* Cycle 1: penalty in mempool, not yet bumped */
+    int check1 = watchtower_check(&wt);
+    TEST_ASSERT(wt.n_pending > 0, "still pending after cycle 1");
+    TEST_ASSERT(wt.pending[0].bump_count == 0, "no bump yet at cycle 1");
+    (void)check1;
+
+    /* Cycle 2: should trigger first CPFP bump */
+    int check2 = watchtower_check(&wt);
+    (void)check2;
+    printf("  After 2 CPFP cycles: bump_count=%d\n", wt.pending[0].bump_count);
+    /* Bump may or may not succeed depending on wallet UTXO availability,
+       but the pending tracking should be working */
+
+    /* --- Mine and verify penalty confirms --- */
+    regtest_mine_blocks(&rt, 1, mine_addr);
+
+    /* Run check again — should clear pending since penalty is now confirmed */
+    watchtower_check(&wt);
+    printf("  After mining: n_pending=%zu\n", wt.n_pending);
+    TEST_ASSERT(wt.n_pending == 0, "pending cleared after penalty confirmed");
+
+    /* Cleanup */
+    tx_buf_free(&commit0_unsigned);
+    tx_buf_free(&commit0_signed);
+    watchtower_cleanup(&wt);
+    secp256k1_context_destroy(ctx);
+
+    printf("  Breach → Penalty → CPFP flow complete!\n");
     return 1;
 }

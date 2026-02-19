@@ -570,7 +570,7 @@ int test_fee_penalty_tx(void) {
     uint64_t penalty = fee_for_penalty_tx(&fe);
     TEST_ASSERT(penalty >= 100, "penalty fee >= 100");
     TEST_ASSERT(penalty <= 10000, "penalty fee <= 10000");
-    TEST_ASSERT_EQ(penalty, 195, "penalty fee = 195 sats at 1 sat/vB (with anchor)");
+    TEST_ASSERT_EQ(penalty, 165, "penalty fee = 165 sats at 1 sat/vB (P2A anchor)");
 
     uint64_t htlc = fee_for_htlc_tx(&fe);
     TEST_ASSERT(htlc >= 100, "htlc fee >= 100");
@@ -580,7 +580,7 @@ int test_fee_penalty_tx(void) {
     /* At higher fee rate */
     fee_estimator_t fe5;
     fee_init(&fe5, 5000);  /* 5 sat/vB */
-    TEST_ASSERT_EQ(fee_for_penalty_tx(&fe5), 975, "penalty at 5 sat/vB (with anchor)");
+    TEST_ASSERT_EQ(fee_for_penalty_tx(&fe5), 825, "penalty at 5 sat/vB (P2A anchor)");
     TEST_ASSERT_EQ(fee_for_htlc_tx(&fe5), 900, "htlc at 5 sat/vB");
 
     return 1;

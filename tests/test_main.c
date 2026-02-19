@@ -292,12 +292,12 @@ extern int test_watchtower_pending_tracking(void);
 extern int test_penalty_fee_updated(void);
 extern int test_watchtower_anchor_init(void);
 extern int test_regtest_cpfp_penalty_bump(void);
+extern int test_regtest_breach_penalty_cpfp(void);
 
 /* CPFP Audit & Remediation */
 extern int test_cpfp_sign_complete_check(void);
 extern int test_cpfp_witness_offset_p2wpkh(void);
 extern int test_cpfp_retry_bump(void);
-extern int test_anchor_key_persistence(void);
 extern int test_pending_persistence(void);
 
 /* Continuous Ladder Daemon (Gap #3) */
@@ -623,7 +623,6 @@ static void run_unit_tests(void) {
     RUN_TEST(test_cpfp_sign_complete_check);
     RUN_TEST(test_cpfp_witness_offset_p2wpkh);
     RUN_TEST(test_cpfp_retry_bump);
-    RUN_TEST(test_anchor_key_persistence);
     RUN_TEST(test_pending_persistence);
 
     printf("\n=== Continuous Ladder Daemon (Gap #3) ===\n");
@@ -733,8 +732,9 @@ static void run_regtest_tests(void) {
     RUN_TEST(test_regtest_intra_factory_payment);
     RUN_TEST(test_regtest_multi_payment);
 
-    printf("\n=== Regtest CPFP Anchor ===\n");
+    printf("\n=== Regtest CPFP Anchor (P2A) ===\n");
     RUN_TEST(test_regtest_cpfp_penalty_bump);
+    RUN_TEST(test_regtest_breach_penalty_cpfp);
 }
 
 int main(int argc, char *argv[]) {

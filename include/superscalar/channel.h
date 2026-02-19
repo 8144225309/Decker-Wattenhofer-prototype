@@ -13,7 +13,11 @@
 #define CHANNEL_DUST_LIMIT_SATS  546   /* P2TR dust limit */
 #define CHANNEL_RESERVE_SATS     5000  /* min balance to keep for fees */
 #define CHANNEL_MAX_SECRETS      256   /* max per-commitment secrets stored */
-#define ANCHOR_OUTPUT_AMOUNT     330   /* P2TR anchor for CPFP fee bumping (sats) */
+#define ANCHOR_OUTPUT_AMOUNT     240   /* P2A anchor for CPFP fee bumping (sats) */
+
+/* P2A (Pay-to-Anchor) scriptPubKey: OP_1 OP_PUSHBYTES_2 4e73 (anyone-can-spend) */
+#define P2A_SPK_LEN  4
+static const unsigned char P2A_SPK[4] = {0x51, 0x02, 0x4e, 0x73};
 
 typedef enum { HTLC_OFFERED, HTLC_RECEIVED } htlc_direction_t;
 typedef enum { HTLC_STATE_ACTIVE, HTLC_STATE_FULFILLED, HTLC_STATE_FAILED } htlc_state_t;

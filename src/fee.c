@@ -51,13 +51,13 @@ uint64_t fee_estimate(const fee_estimator_t *fe, size_t vsize_bytes) {
 }
 
 uint64_t fee_for_penalty_tx(const fee_estimator_t *fe) {
-    /* Penalty tx: 1 Schnorr key-path input, 2 P2TR outputs (sweep + anchor) ~195 vB */
-    return fee_estimate(fe, 195);
+    /* Penalty tx: 1 Schnorr key-path input, 2 outputs (sweep P2TR + P2A anchor) ~165 vB */
+    return fee_estimate(fe, 165);
 }
 
 uint64_t fee_for_cpfp_child(const fee_estimator_t *fe) {
-    /* CPFP child: 2 Schnorr key-path inputs (anchor + wallet), 1 P2TR output ~264 vB */
-    return fee_estimate(fe, 264);
+    /* CPFP child: P2A anchor input (empty witness) + wallet input, 1 output ~200 vB */
+    return fee_estimate(fe, 200);
 }
 
 uint64_t fee_for_htlc_tx(const fee_estimator_t *fe) {

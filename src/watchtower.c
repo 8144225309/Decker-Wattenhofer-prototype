@@ -3,17 +3,10 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
-#include <secp256k1.h>
-#include <secp256k1_extrakeys.h>
-#include <secp256k1_schnorrsig.h>
 
 extern void hex_encode(const unsigned char *data, size_t len, char *out);
 extern int hex_decode(const char *hex, unsigned char *out, size_t out_len);
 extern void reverse_bytes(unsigned char *data, size_t len);
-extern void sha256(const unsigned char *data, size_t len, unsigned char *out32);
-extern void sha256_tagged(const char *tag, const unsigned char *data, size_t data_len,
-                           unsigned char *out32);
-extern int channel_read_random_bytes(unsigned char *buf, size_t len);
 
 int watchtower_init(watchtower_t *wt, size_t n_channels,
                       regtest_t *rt, fee_estimator_t *fee, persist_t *db) {
@@ -24,40 +17,9 @@ int watchtower_init(watchtower_t *wt, size_t n_channels,
     wt->fee = fee;
     wt->db = db;
 
-    /* Load or generate anchor keypair for CPFP fee bumping.
-       If a persisted key exists, use it; otherwise generate fresh and save. */
-    wt->ctx = secp256k1_context_create(SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
-    int have_anchor_key = 0;
-    if (db && db->db) {
-        have_anchor_key = persist_load_anchor_key(db, wt->anchor_seckey);
-    }
-    if (!have_anchor_key) {
-        have_anchor_key = channel_read_random_bytes(wt->anchor_seckey, 32);
-        if (have_anchor_key && db && db->db) {
-            persist_save_anchor_key(db, wt->anchor_seckey);
-        }
-    }
-    if (have_anchor_key) {
-        if (secp256k1_keypair_create(wt->ctx, &wt->anchor_keypair, wt->anchor_seckey)) {
-            secp256k1_keypair_xonly_pub(wt->ctx, &wt->anchor_xonly, NULL,
-                                         &wt->anchor_keypair);
-            /* Build P2TR scriptPubKey: key-path-only (no script tree) */
-            unsigned char internal_ser[32];
-            secp256k1_xonly_pubkey_serialize(wt->ctx, internal_ser, &wt->anchor_xonly);
-            /* TapTweak for key-path-only: tweak = H("TapTweak", internal_key) */
-            unsigned char tweak[32];
-            sha256_tagged("TapTweak", internal_ser, 32, tweak);
-            secp256k1_pubkey tweaked_full;
-            if (secp256k1_xonly_pubkey_tweak_add(wt->ctx, &tweaked_full,
-                                                   &wt->anchor_xonly, tweak)) {
-                secp256k1_xonly_pubkey tweaked_xonly;
-                secp256k1_xonly_pubkey_from_pubkey(wt->ctx, &tweaked_xonly, NULL,
-                                                     &tweaked_full);
-                build_p2tr_script_pubkey(wt->anchor_spk, &tweaked_xonly);
-                wt->anchor_spk_len = 34;
-            }
-        }
-    }
+    /* P2A anchor: static anyone-can-spend SPK — no keys needed */
+    memcpy(wt->anchor_spk, P2A_SPK, P2A_SPK_LEN);
+    wt->anchor_spk_len = P2A_SPK_LEN;
 
     /* Load old commitments from DB if available */
     if (db && db->db) {
@@ -414,7 +376,7 @@ int watchtower_check(watchtower_t *wt) {
 
         /* Track in pending for CPFP bump if anchor is active.
            NOTE: anchor_vout=1 must match channel_build_penalty_tx output order. */
-        if (penalty_sent && wt->anchor_spk_len == 34 &&
+        if (penalty_sent && wt->anchor_spk_len == P2A_SPK_LEN &&
             wt->n_pending < WATCHTOWER_MAX_PENDING) {
             watchtower_pending_t *p = &wt->pending[wt->n_pending++];
             strncpy(p->txid, penalty_txid, 64);
@@ -532,94 +494,7 @@ int watchtower_check(watchtower_t *wt) {
     return penalties_broadcast;
 }
 
-/* --- CPFP child transaction builder --- */
-
-static void write_u32_le_buf(unsigned char *buf, uint32_t val) {
-    buf[0] = (unsigned char)(val & 0xff);
-    buf[1] = (unsigned char)((val >> 8) & 0xff);
-    buf[2] = (unsigned char)((val >> 16) & 0xff);
-    buf[3] = (unsigned char)((val >> 24) & 0xff);
-}
-
-static void write_u64_le_buf(unsigned char *buf, uint64_t val) {
-    for (int i = 0; i < 8; i++)
-        buf[i] = (unsigned char)((val >> (i * 8)) & 0xff);
-}
-
-/* Compute BIP-341 sighash for one input in a 2-input, 1-output tx */
-static int compute_cpfp_sighash(
-    unsigned char *sighash_out32,
-    const unsigned char *in0_txid, uint32_t in0_vout,
-    uint64_t in0_amount, const unsigned char *in0_spk, size_t in0_spk_len,
-    uint32_t in0_sequence,
-    const unsigned char *in1_txid, uint32_t in1_vout,
-    uint64_t in1_amount, const unsigned char *in1_spk, size_t in1_spk_len,
-    uint32_t in1_sequence,
-    uint64_t out0_amount, const unsigned char *out0_spk, size_t out0_spk_len,
-    uint32_t input_index)
-{
-    /* sha_prevouts = SHA256(in0_txid(32) || in0_vout(4) || in1_txid(32) || in1_vout(4)) */
-    unsigned char prevouts[72];
-    memcpy(prevouts, in0_txid, 32);
-    write_u32_le_buf(prevouts + 32, in0_vout);
-    memcpy(prevouts + 36, in1_txid, 32);
-    write_u32_le_buf(prevouts + 68, in1_vout);
-    unsigned char sha_prevouts[32];
-    sha256(prevouts, 72, sha_prevouts);
-
-    /* sha_amounts = SHA256(in0_amount(8) || in1_amount(8)) */
-    unsigned char amounts[16];
-    write_u64_le_buf(amounts, in0_amount);
-    write_u64_le_buf(amounts + 8, in1_amount);
-    unsigned char sha_amounts[32];
-    sha256(amounts, 16, sha_amounts);
-
-    /* sha_scriptpubkeys = SHA256(varint(len0) || spk0 || varint(len1) || spk1) */
-    size_t spks_len = 1 + in0_spk_len + 1 + in1_spk_len;
-    unsigned char spks_buf[128];
-    if (spks_len > sizeof(spks_buf)) return 0;
-    spks_buf[0] = (unsigned char)in0_spk_len;
-    memcpy(spks_buf + 1, in0_spk, in0_spk_len);
-    spks_buf[1 + in0_spk_len] = (unsigned char)in1_spk_len;
-    memcpy(spks_buf + 2 + in0_spk_len, in1_spk, in1_spk_len);
-    unsigned char sha_scriptpubkeys[32];
-    sha256(spks_buf, spks_len, sha_scriptpubkeys);
-
-    /* sha_sequences = SHA256(seq0(4) || seq1(4)) */
-    unsigned char sequences[8];
-    write_u32_le_buf(sequences, in0_sequence);
-    write_u32_le_buf(sequences + 4, in1_sequence);
-    unsigned char sha_sequences[32];
-    sha256(sequences, 8, sha_sequences);
-
-    /* sha_outputs = SHA256(out0_amount(8) || varint(spk_len) || spk) */
-    size_t out_len = 8 + 1 + out0_spk_len;
-    unsigned char out_data[64];
-    if (out_len > sizeof(out_data)) return 0;
-    write_u64_le_buf(out_data, out0_amount);
-    out_data[8] = (unsigned char)out0_spk_len;
-    memcpy(out_data + 9, out0_spk, out0_spk_len);
-    unsigned char sha_outputs[32];
-    sha256(out_data, out_len, sha_outputs);
-
-    /* Assemble sighash preimage (BIP-341 §4) */
-    unsigned char msg[175];
-    size_t pos = 0;
-    msg[pos++] = 0x00;  /* epoch */
-    msg[pos++] = 0x00;  /* SIGHASH_DEFAULT */
-    write_u32_le_buf(msg + pos, 2); pos += 4;  /* nVersion = 2 */
-    write_u32_le_buf(msg + pos, 0); pos += 4;  /* nLockTime = 0 */
-    memcpy(msg + pos, sha_prevouts, 32); pos += 32;
-    memcpy(msg + pos, sha_amounts, 32); pos += 32;
-    memcpy(msg + pos, sha_scriptpubkeys, 32); pos += 32;
-    memcpy(msg + pos, sha_sequences, 32); pos += 32;
-    memcpy(msg + pos, sha_outputs, 32); pos += 32;
-    msg[pos++] = 0x00;  /* spend_type: key-path, no annex */
-    write_u32_le_buf(msg + pos, input_index); pos += 4;
-
-    sha256_tagged("TapSighash", msg, pos, sighash_out32);
-    return 1;
-}
+/* --- CPFP child transaction builder (P2A anchor — no signing needed) --- */
 
 int watchtower_build_cpfp_tx(watchtower_t *wt,
                                tx_buf_t *cpfp_tx_out,
@@ -627,7 +502,7 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
                                uint32_t anchor_vout,
                                uint64_t anchor_amount) {
     if (!wt || !wt->rt || !cpfp_tx_out || !parent_txid) return 0;
-    if (wt->anchor_spk_len != 34) return 0;
+    if (wt->anchor_spk_len != P2A_SPK_LEN) return 0;
 
     /* Get a wallet UTXO to fund the CPFP child */
     char wallet_txid_hex[65];
@@ -636,7 +511,7 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     unsigned char wallet_spk[64];
     size_t wallet_spk_len = 0;
 
-    uint64_t cpfp_fee = wt->fee ? fee_for_cpfp_child(wt->fee) : 264;
+    uint64_t cpfp_fee = wt->fee ? fee_for_cpfp_child(wt->fee) : 200;
     uint64_t min_amount = cpfp_fee + 1000;  /* fee + dust margin */
 
     if (!regtest_get_utxo_for_bump(wt->rt, min_amount,
@@ -694,7 +569,7 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     tx_buf_init(&unsigned_tx, 256);
     tx_buf_write_u32_le(&unsigned_tx, 2);           /* nVersion */
     tx_buf_write_varint(&unsigned_tx, 2);            /* 2 inputs */
-    /* Input 0: anchor output from penalty tx */
+    /* Input 0: P2A anchor output from penalty tx (anyone-can-spend) */
     tx_buf_write_bytes(&unsigned_tx, anchor_txid, 32);
     tx_buf_write_u32_le(&unsigned_tx, anchor_vout);
     tx_buf_write_varint(&unsigned_tx, 0);            /* empty scriptSig */
@@ -712,38 +587,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     /* nLockTime */
     tx_buf_write_u32_le(&unsigned_tx, 0);
 
-    /* Compute sighash for input 0 (anchor) and sign with anchor key */
-    unsigned char sighash[32];
-    if (!compute_cpfp_sighash(sighash,
-            anchor_txid, anchor_vout, anchor_amount,
-            wt->anchor_spk, wt->anchor_spk_len, 0xFFFFFFFE,
-            wallet_txid, wallet_vout, wallet_amount,
-            wallet_spk, wallet_spk_len, 0xFFFFFFFE,
-            change_amount, change_spk, change_spk_len, 0)) {
-        tx_buf_free(&unsigned_tx);
-        return 0;
-    }
-
-    /* Apply taptweak to anchor keypair for signing */
-    secp256k1_keypair tweaked_kp;
-    memcpy(&tweaked_kp, &wt->anchor_keypair, sizeof(secp256k1_keypair));
-    unsigned char internal_ser[32];
-    secp256k1_xonly_pubkey_serialize(wt->ctx, internal_ser, &wt->anchor_xonly);
-    unsigned char tweak[32];
-    sha256_tagged("TapTweak", internal_ser, 32, tweak);
-    if (!secp256k1_keypair_xonly_tweak_add(wt->ctx, &tweaked_kp, tweak)) {
-        tx_buf_free(&unsigned_tx);
-        return 0;
-    }
-
-    unsigned char anchor_sig64[64];
-    if (!secp256k1_schnorrsig_sign32(wt->ctx, anchor_sig64, sighash,
-                                       &tweaked_kp, NULL)) {
-        tx_buf_free(&unsigned_tx);
-        return 0;
-    }
-
-    /* Hex-encode the unsigned tx for signrawtransactionwithwallet */
+    /* Hex-encode the unsigned tx for signrawtransactionwithwallet.
+       Input 0 (P2A anchor) is anyone-can-spend — empty witness is valid.
+       The wallet only needs to sign input 1. */
     char *unsigned_hex = (char *)malloc(unsigned_tx.len * 2 + 1);
     if (!unsigned_hex) {
         tx_buf_free(&unsigned_tx);
@@ -751,8 +597,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     }
     hex_encode(unsigned_tx.data, unsigned_tx.len, unsigned_hex);
 
-    /* Build prevtxs JSON for the anchor input (wallet needs this for sighash) */
-    char anchor_spk_hex[69];
+    /* Build prevtxs JSON for the P2A anchor input so the wallet knows
+       to leave it unsigned (it only signs its own input 1). */
+    char anchor_spk_hex[16];
     hex_encode(wt->anchor_spk, wt->anchor_spk_len, anchor_spk_hex);
     char prevtxs[512];
     snprintf(prevtxs, sizeof(prevtxs),
@@ -766,12 +613,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
 
     if (!signed_hex) return 0;
 
-    /* Decode the partially-signed tx and insert our anchor witness.
-       Segwit tx layout for 2-in, 1-out:
-       nVersion(4) + marker(1) + flag(1) + vin_count(1) +
-       input0(41) + input1(41) + vout_count(1) + output0(8+1+spk_len)
-       = 6 + 1 + 41 + 41 + 1 + (9 + change_spk_len) = 90 + 9 + change_spk_len
-       At that offset: witness for input 0 (empty = 0x00) */
+    /* Decode the signed tx binary. The wallet signed input 1 and left
+       input 0 (P2A) with empty witness (0x00), which is valid for
+       anyone-can-spend. No witness splicing needed. */
     size_t signed_hex_len = strlen(signed_hex);
     size_t signed_bin_len = signed_hex_len / 2;
     unsigned char *signed_bin = (unsigned char *)malloc(signed_bin_len);
@@ -782,56 +626,9 @@ int watchtower_build_cpfp_tx(watchtower_t *wt,
     hex_decode(signed_hex, signed_bin, signed_bin_len);
     free(signed_hex);
 
-    /* Find witness section offset by parsing the signed tx binary.
-       Layout: version(4) + marker(1) + flag(1) + vin_count(1) +
-       inputs(N*41) + vout_count(1) + outputs(variable).
-       Parse output lengths from the binary rather than assuming SPK sizes,
-       so this works for any change address type (P2TR, P2WPKH, etc.). */
-    size_t witness_offset = 4 + 2 + 1 + 41 * 2 + 1;  /* up to first output */
-    if (witness_offset < signed_bin_len) {
-        /* Parse each output: 8 (amount) + varint(spk_len) + spk_len */
-        uint8_t n_vout = signed_bin[4 + 2 + 1 + 41 * 2];
-        for (uint8_t v = 0; v < n_vout && witness_offset + 9 <= signed_bin_len; v++) {
-            uint8_t spk_byte = signed_bin[witness_offset + 8];
-            witness_offset += 8 + 1 + spk_byte;
-        }
-    }
-
-    if (witness_offset >= signed_bin_len || signed_bin[witness_offset] != 0x00) {
-        /* Unexpected format — wallet might have already filled input 0 witness,
-           or layout differs. Fall back: try broadcasting as-is. */
-        tx_buf_reset(cpfp_tx_out);
-        tx_buf_write_bytes(cpfp_tx_out, signed_bin, signed_bin_len);
-        free(signed_bin);
-        return 1;
-    }
-
-    /* Replace the empty witness (0x00) at witness_offset with our anchor sig.
-       Our witness: 0x01 (count=1) + 0x40 (len=64) + sig64 = 66 bytes.
-       This replaces 1 byte with 66 bytes = net +65 bytes. */
-    size_t new_len = signed_bin_len + 65;
-    unsigned char *new_tx = (unsigned char *)malloc(new_len);
-    if (!new_tx) {
-        free(signed_bin);
-        return 0;
-    }
-
-    /* Copy bytes before witness 0 */
-    memcpy(new_tx, signed_bin, witness_offset);
-    /* Insert anchor witness: count=1, len=64, sig */
-    new_tx[witness_offset] = 0x01;
-    new_tx[witness_offset + 1] = 0x40;
-    memcpy(new_tx + witness_offset + 2, anchor_sig64, 64);
-    /* Copy remaining bytes (witness for input 1 + nLockTime) */
-    memcpy(new_tx + witness_offset + 66,
-           signed_bin + witness_offset + 1,
-           signed_bin_len - witness_offset - 1);
-
-    free(signed_bin);
-
     tx_buf_reset(cpfp_tx_out);
-    tx_buf_write_bytes(cpfp_tx_out, new_tx, new_len);
-    free(new_tx);
+    tx_buf_write_bytes(cpfp_tx_out, signed_bin, signed_bin_len);
+    free(signed_bin);
 
     return 1;
 }
@@ -869,11 +666,6 @@ void watchtower_cleanup(watchtower_t *wt) {
             wt->entries[i].response_tx = NULL;
         }
     }
-    if (wt->ctx) {
-        secp256k1_context_destroy(wt->ctx);
-        wt->ctx = NULL;
-    }
-    memset(wt->anchor_seckey, 0, 32);
 }
 
 void watchtower_remove_channel(watchtower_t *wt, uint32_t channel_id) {

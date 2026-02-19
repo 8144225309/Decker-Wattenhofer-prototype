@@ -775,6 +775,104 @@ cmd_demo_force_close() {
 }
 
 # ==========================================================================
+# Demo: breach (LSP + 4 clients, --demo --cheat-daemon, regtest only)
+# ==========================================================================
+
+cmd_demo_breach() {
+    header "Demo: Factory + Payments + Breach → Penalty + CPFP (regtest)"
+
+    mkdir -p "$LOGDIR"
+
+    step "Stopping any running SuperScalar processes..."
+    pkill -f "superscalar_lsp" 2>/dev/null || true
+    pkill -f "superscalar_client" 2>/dev/null || true
+    sleep 2
+
+    # Clean DBs for fresh demo
+    rm -f "$LSPDB" "$CLIENTDB" "$CLIENT2DB" "$CLIENT3DB" "$CLIENT4DB"
+
+    step "Starting breach demo (4 clients, arity-1, regtest)..."
+    detail "This will: connect 4 clients → create factory → run payments"
+    detail "→ LSP broadcasts revoked commitment (--cheat-daemon)"
+    detail "→ client watchtowers detect breach → broadcast penalty with P2A anchor"
+    detail "→ CPFP child bumps fee → penalty confirms"
+
+    # Start LSP with --cheat-daemon (broadcasts revoked commitment, then sleeps)
+    LD_LIBRARY_PATH="$LD_LIBRARY_PATH_SC" \
+        "$SCBIN/superscalar_lsp" \
+            --network regtest \
+            --cli-path "$BTCBIN/bitcoin-cli" \
+            --rpcuser "$RPCUSER" \
+            --rpcpassword "$RPCPASS" \
+            --port 9735 \
+            --clients 4 \
+            --amount 200000 \
+            --arity 1 \
+            --step-blocks 1 \
+            --demo \
+            --cheat-daemon \
+            --daemon \
+            --db "$LSPDB" \
+            --keyfile "$DATADIR/lsp.key" \
+            --passphrase superscalar \
+        > "$LOGDIR/demo_breach.log" 2>&1 &
+    LSP_PID=$!
+    sleep 2
+
+    _start_demo_clients regtest 9735 demo_breach "--daemon"
+
+    # Wait for LSP to finish (it sleeps ~30s after breach, then exits)
+    wait "$LSP_PID"
+    LSP_EXIT=$?
+
+    # Give clients time to process watchtower
+    step "Waiting for client watchtowers to detect breach..."
+    sleep 10
+
+    for i in 1 2 3 4; do
+        eval "wait \$CLIENT${i}_PID 2>/dev/null || true"
+    done
+
+    echo ""
+    echo "=== LSP Output ==="
+    cat "$LOGDIR/demo_breach.log"
+
+    # Check client logs for breach detection and penalty
+    BREACH_COUNT=0
+    PENALTY_COUNT=0
+    CPFP_COUNT=0
+    for i in 1 2 3 4; do
+        LOGFILE="$LOGDIR/demo_breach_client${i}.log"
+        if [ -f "$LOGFILE" ]; then
+            echo ""
+            echo "=== Client $i Output (last 20 lines) ==="
+            tail -20 "$LOGFILE"
+            if grep -q "BREACH DETECTED" "$LOGFILE"; then
+                BREACH_COUNT=$((BREACH_COUNT + 1))
+            fi
+            if grep -q "Penalty tx" "$LOGFILE"; then
+                PENALTY_COUNT=$((PENALTY_COUNT + 1))
+            fi
+            if grep -q "CPFP child" "$LOGFILE"; then
+                CPFP_COUNT=$((CPFP_COUNT + 1))
+            fi
+        fi
+    done
+
+    echo ""
+    echo "=== Results ==="
+    info "Breach detected by: $BREACH_COUNT/4 clients"
+    info "Penalty broadcast by: $PENALTY_COUNT/4 clients"
+    info "CPFP child broadcast by: $CPFP_COUNT/4 clients"
+
+    if [ "$BREACH_COUNT" -gt 0 ] && [ "$PENALTY_COUNT" -gt 0 ]; then
+        info "Breach demo PASSED — watchtower detected and penalized!"
+    else
+        fail "Breach demo FAILED — check logs in $LOGDIR/"
+    fi
+}
+
+# ==========================================================================
 # 12. status
 # ==========================================================================
 
@@ -989,6 +1087,7 @@ cmd_help() {
     echo -e "${BOLD}Demo (standalone, no CLN needed):${NC}"
     echo "       bash $0 demo-coop          Factory + payments + cooperative close"
     echo "       bash $0 demo-force-close   Factory + payments + force close (tree broadcast)"
+    echo "       bash $0 demo-breach        Breach + watchtower penalty + CPFP (regtest)"
     echo ""
     echo -e "${BOLD}Diagnostics:${NC}"
     echo "       bash $0 status             Full system status dump"
@@ -1023,6 +1122,7 @@ case "${1:-}" in
     start-client2)       cmd_start_client2 ;;
     demo-coop)           cmd_demo_coop ;;
     demo-force-close)    cmd_demo_force_close ;;
+    demo-breach)         cmd_demo_breach ;;
     status)              cmd_status ;;
     test-payment)        cmd_test_payment ;;
     stop-all)            cmd_stop_all ;;

@@ -451,7 +451,7 @@ class Orchestrator:
 # ---------------------------------------------------------------------------
 
 def scenario_all_watch(orch):
-    """All N clients online — all detect LSP breach, penalty confirmed."""
+    """All N clients online — all detect LSP breach, penalty + CPFP confirmed."""
     orch._log("=== SCENARIO: all_watch ===")
     orch._log("All clients online; LSP broadcasts revoked commitment.")
 
@@ -466,22 +466,31 @@ def scenario_all_watch(orch):
     rc = orch.wait_for_lsp(timeout=90)
     orch._log(f"LSP exited with code {rc}")
 
-    # Give clients a moment to process watchtower
-    time.sleep(5)
+    # Give clients a moment to process watchtower + CPFP cycles
+    time.sleep(10)
 
-    # Check which clients detected the breach
+    # Check which clients detected the breach and broadcast CPFP
     n_detected = 0
+    n_cpfp = 0
     for i in range(orch.n_clients):
         detected = orch.check_penalty_in_log(i)
         status = "DETECTED" if detected else "missed"
-        orch._log(f"  Client {i}: {status}")
+        cpfp = False
+        if orch.clients[i]:
+            log = orch.clients[i].read_log()
+            cpfp = "CPFP child" in log
+        cpfp_status = "+CPFP" if cpfp else ""
+        orch._log(f"  Client {i}: {status} {cpfp_status}")
         if detected:
             n_detected += 1
+        if cpfp:
+            n_cpfp += 1
 
     orch.stop_all()
 
     success = n_detected == orch.n_clients
-    orch._log(f"Result: {n_detected}/{orch.n_clients} detected breach — "
+    orch._log(f"Result: {n_detected}/{orch.n_clients} detected breach, "
+              f"{n_cpfp}/{orch.n_clients} broadcast CPFP child — "
               f"{'PASS' if success else 'FAIL'}")
     return success
 

@@ -6,7 +6,6 @@
 #include "regtest.h"
 #include "fee.h"
 #include <secp256k1.h>
-#include <secp256k1_extrakeys.h>
 
 #define WATCHTOWER_MAX_WATCH 64
 
@@ -53,7 +52,7 @@ typedef struct {
 typedef struct {
     char txid[65];              /* penalty tx we broadcast */
     uint32_t anchor_vout;       /* anchor output index (always 1) */
-    uint64_t anchor_amount;     /* 330 sats */
+    uint64_t anchor_amount;     /* 240 sats (P2A) */
     int cycles_in_mempool;      /* how many 5s cycles it's been stuck */
     int bump_count;             /* how many CPFP bumps attempted (max 3) */
     int cycles_since_bump;      /* cycles since last bump attempt */
@@ -68,13 +67,9 @@ typedef struct {
     fee_estimator_t *fee;
     persist_t *db;
 
-    /* Anchor key for CPFP fee bumping */
-    unsigned char anchor_seckey[32];
-    secp256k1_keypair anchor_keypair;
-    secp256k1_xonly_pubkey anchor_xonly;
-    unsigned char anchor_spk[34];       /* P2TR scriptPubKey */
+    /* P2A anchor SPK for CPFP fee bumping (anyone-can-spend, no keys needed) */
+    unsigned char anchor_spk[P2A_SPK_LEN];
     size_t anchor_spk_len;
-    secp256k1_context *ctx;
 
     /* Pending penalty txs awaiting confirmation */
     watchtower_pending_t pending[WATCHTOWER_MAX_PENDING];

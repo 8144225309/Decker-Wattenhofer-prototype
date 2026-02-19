@@ -1,10 +1,10 @@
-/* Tests for CPFP anchor system.
+/* Tests for CPFP anchor system (P2A — Pay-to-Anchor).
    Verifies that:
-   1. Penalty tx includes anchor output when anchor_spk is provided
-   2. HTLC penalty tx includes anchor output
+   1. Penalty tx includes P2A anchor output when anchor_spk is provided
+   2. HTLC penalty tx includes P2A anchor output
    3. Watchtower pending tracking works (add, increment, remove)
-   4. Fee for penalty tx updated to 195 vB
-   5. Watchtower init generates valid anchor keypair
+   4. Fee for penalty tx updated to 165 vB (P2A)
+   5. Watchtower init sets static P2A SPK
 */
 
 #include "superscalar/channel.h"
@@ -105,7 +105,7 @@ static void setup_penalty_channel_pair(secp256k1_context *ctx,
     }
 }
 
-/* Test 1: penalty tx with anchor has 2 outputs, anchor = 330 sats */
+/* Test 1: penalty tx with P2A anchor has 2 outputs, anchor = 240 sats */
 int test_penalty_tx_has_anchor(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -148,9 +148,9 @@ int test_penalty_tx_has_anchor(void) {
     memcpy(to_local_spk, commit_tx.data + 47 + 8 + 1, 34);
     tx_buf_free(&commit_tx);
 
-    /* Create a fake anchor SPK (any valid P2TR SPK) */
-    unsigned char anchor_spk[34] = {0x51, 0x20};
-    memset(anchor_spk + 2, 0xCC, 32);
+    /* Use the P2A anchor SPK */
+    unsigned char anchor_spk[P2A_SPK_LEN];
+    memcpy(anchor_spk, P2A_SPK, P2A_SPK_LEN);
 
     /* Build penalty tx WITH anchor */
     tx_buf_t penalty_tx;
@@ -158,7 +158,7 @@ int test_penalty_tx_has_anchor(void) {
     TEST_ASSERT(channel_build_penalty_tx(&client_ch, &penalty_tx,
                                            commit_txid, 0,
                                            70000, to_local_spk, 34,
-                                           0, anchor_spk, 34),
+                                           0, anchor_spk, P2A_SPK_LEN),
                 "build penalty tx with anchor");
 
     /* Verify penalty tx is non-empty */
@@ -175,23 +175,23 @@ int test_penalty_tx_has_anchor(void) {
     /* Output 0 (sweep) starts at offset 49: amount(8) + spk_varint(1) + spk(34) = 43 bytes
        Output 1 (anchor) starts at offset 49+43 = 92 */
     size_t anchor_out_offset = 49 + 43;
-    TEST_ASSERT(penalty_tx.len > anchor_out_offset + 43, "room for anchor output");
+    TEST_ASSERT(penalty_tx.len > anchor_out_offset + 13, "room for anchor output");
 
     /* Parse anchor amount (little-endian 8 bytes) */
     uint64_t anchor_amt = 0;
     for (int b = 0; b < 8; b++)
         anchor_amt |= ((uint64_t)penalty_tx.data[anchor_out_offset + b]) << (b * 8);
-    TEST_ASSERT_EQ(anchor_amt, 330, "anchor amount = 330 sats");
+    TEST_ASSERT_EQ(anchor_amt, 240, "anchor amount = 240 sats");
 
-    /* Verify anchor SPK matches */
+    /* Verify anchor SPK matches P2A */
     uint8_t anchor_spk_len_val = penalty_tx.data[anchor_out_offset + 8];
-    TEST_ASSERT_EQ(anchor_spk_len_val, 34, "anchor spk len = 34");
-    TEST_ASSERT(memcmp(penalty_tx.data + anchor_out_offset + 9, anchor_spk, 34) == 0,
-                "anchor SPK matches");
+    TEST_ASSERT_EQ(anchor_spk_len_val, P2A_SPK_LEN, "anchor spk len = 4");
+    TEST_ASSERT(memcmp(penalty_tx.data + anchor_out_offset + 9, P2A_SPK, P2A_SPK_LEN) == 0,
+                "anchor SPK matches P2A");
 
-    /* Verify sweep amount = to_local - fee - 330 */
-    uint64_t penalty_fee = (client_ch.fee_rate_sat_per_kvb * 195 + 999) / 1000;
-    uint64_t expected_sweep = 70000 - penalty_fee - 330;
+    /* Verify sweep amount = to_local - fee - 240 */
+    uint64_t penalty_fee = (client_ch.fee_rate_sat_per_kvb * 165 + 999) / 1000;
+    uint64_t expected_sweep = 70000 - penalty_fee - 240;
     uint64_t sweep_amt = 0;
     size_t sweep_offset = 49;  /* first output starts right after vout_count */
     for (int b = 0; b < 8; b++)
@@ -216,7 +216,7 @@ int test_penalty_tx_has_anchor(void) {
     return 1;
 }
 
-/* Test 2: HTLC penalty tx with anchor has 2 outputs */
+/* Test 2: HTLC penalty tx with P2A anchor has 2 outputs */
 int test_htlc_penalty_tx_has_anchor(void) {
     secp256k1_context *ctx = secp256k1_context_create(
         SECP256K1_CONTEXT_SIGN | SECP256K1_CONTEXT_VERIFY);
@@ -255,8 +255,8 @@ int test_htlc_penalty_tx_has_anchor(void) {
     memset(commit_txid, 0xEE, 32);
     unsigned char htlc_spk[34] = {0x51, 0x20};
     memset(htlc_spk + 2, 0xFF, 32);
-    unsigned char anchor_spk[34] = {0x51, 0x20};
-    memset(anchor_spk + 2, 0xCC, 32);
+    unsigned char anchor_spk[P2A_SPK_LEN];
+    memcpy(anchor_spk, P2A_SPK, P2A_SPK_LEN);
 
     /* Need to set htlc state for the builder */
     client_ch.n_htlcs = 1;
@@ -271,17 +271,17 @@ int test_htlc_penalty_tx_has_anchor(void) {
     tx_buf_init(&htlc_penalty, 512);
     int ok = channel_build_htlc_penalty_tx(&client_ch, &htlc_penalty,
                 commit_txid, 2, 5000, htlc_spk, 34,
-                0, 0, anchor_spk, 34);
+                0, 0, anchor_spk, P2A_SPK_LEN);
     TEST_ASSERT(ok, "build htlc penalty tx with anchor");
     TEST_ASSERT(htlc_penalty.len > 48, "htlc penalty tx long enough");
     TEST_ASSERT_EQ(htlc_penalty.data[48], 2, "2 outputs (sweep + anchor)");
 
-    /* Verify anchor amount = 330 */
+    /* Verify anchor amount = 240 */
     size_t anchor_out_offset = 49 + 43;
     uint64_t anchor_amt = 0;
     for (int b = 0; b < 8; b++)
         anchor_amt |= ((uint64_t)htlc_penalty.data[anchor_out_offset + b]) << (b * 8);
-    TEST_ASSERT_EQ(anchor_amt, 330, "anchor amount = 330");
+    TEST_ASSERT_EQ(anchor_amt, 240, "anchor amount = 240");
 
     tx_buf_free(&htlc_penalty);
     secp256k1_context_destroy(ctx);
@@ -304,7 +304,7 @@ int test_watchtower_pending_tracking(void) {
     strncpy(p->txid, "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 64);
     p->txid[64] = '\0';
     p->anchor_vout = 1;
-    p->anchor_amount = 330;
+    p->anchor_amount = 240;
     p->cycles_in_mempool = 0;
     p->bump_count = 0;
     p->cycles_since_bump = 0;
@@ -325,53 +325,47 @@ int test_watchtower_pending_tracking(void) {
     return 1;
 }
 
-/* Test 4: fee_for_penalty_tx returns 195 vB-based fee */
+/* Test 4: fee_for_penalty_tx returns 165 vB-based fee (P2A) */
 int test_penalty_fee_updated(void) {
     fee_estimator_t fe;
     fee_init(&fe, 1000);  /* 1000 sat/kvB = 1 sat/vB */
 
     uint64_t penalty_fee = fee_for_penalty_tx(&fe);
-    /* 1000 * 195 + 999 / 1000 = 195 (rounded) */
-    uint64_t expected = (1000 * 195 + 999) / 1000;
-    TEST_ASSERT_EQ(penalty_fee, expected, "penalty fee at 195 vB");
+    /* 1000 * 165 + 999 / 1000 = 165 (rounded) */
+    uint64_t expected = (1000 * 165 + 999) / 1000;
+    TEST_ASSERT_EQ(penalty_fee, expected, "penalty fee at 165 vB");
 
     /* Also check CPFP child fee */
     uint64_t cpfp_fee = fee_for_cpfp_child(&fe);
-    uint64_t expected_cpfp = (1000 * 264 + 999) / 1000;
-    TEST_ASSERT_EQ(cpfp_fee, expected_cpfp, "cpfp child fee at 264 vB");
+    uint64_t expected_cpfp = (1000 * 200 + 999) / 1000;
+    TEST_ASSERT_EQ(cpfp_fee, expected_cpfp, "cpfp child fee at 200 vB");
 
     /* Check with higher fee rate */
     fee_init(&fe, 5000);  /* 5 sat/vB */
     penalty_fee = fee_for_penalty_tx(&fe);
-    expected = (5000 * 195 + 999) / 1000;
+    expected = (5000 * 165 + 999) / 1000;
     TEST_ASSERT_EQ(penalty_fee, expected, "penalty fee at 5 sat/vB");
 
     return 1;
 }
 
-/* Test 5: watchtower init generates valid anchor keypair and SPK */
+/* Test 5: watchtower init sets static P2A SPK (no keypair needed) */
 int test_watchtower_anchor_init(void) {
     watchtower_t wt;
     fee_estimator_t fee;
     fee_init(&fee, 1000);
     watchtower_init(&wt, 1, NULL, &fee, NULL);
 
-    /* Anchor SPK should be set (34 bytes, starts with 0x51 0x20) */
-    TEST_ASSERT_EQ(wt.anchor_spk_len, 34, "anchor SPK len = 34");
-    TEST_ASSERT_EQ(wt.anchor_spk[0], 0x51, "anchor SPK starts with OP_1");
-    TEST_ASSERT_EQ(wt.anchor_spk[1], 0x20, "anchor SPK has PUSHBYTES_32");
+    /* Anchor SPK should be P2A (4 bytes: 0x51 0x02 0x4e 0x73) */
+    TEST_ASSERT_EQ(wt.anchor_spk_len, P2A_SPK_LEN, "anchor SPK len = 4");
+    TEST_ASSERT_EQ(wt.anchor_spk[0], 0x51, "P2A SPK byte 0 = OP_1");
+    TEST_ASSERT_EQ(wt.anchor_spk[1], 0x02, "P2A SPK byte 1 = OP_PUSHBYTES_2");
+    TEST_ASSERT_EQ(wt.anchor_spk[2], 0x4e, "P2A SPK byte 2 = 0x4e");
+    TEST_ASSERT_EQ(wt.anchor_spk[3], 0x73, "P2A SPK byte 3 = 0x73");
 
-    /* Verify the secp context was created */
-    TEST_ASSERT(wt.ctx != NULL, "secp context created");
-
-    /* Verify the anchor key is non-zero */
-    unsigned char zero[32] = {0};
-    TEST_ASSERT(memcmp(wt.anchor_seckey, zero, 32) != 0, "anchor key non-zero");
-
-    /* Verify anchor xonly pubkey is parseable */
-    unsigned char xonly_ser[32];
-    secp256k1_xonly_pubkey_serialize(wt.ctx, xonly_ser, &wt.anchor_xonly);
-    TEST_ASSERT(memcmp(xonly_ser, zero, 32) != 0, "anchor xonly non-zero");
+    /* Verify matches the static constant */
+    TEST_ASSERT(memcmp(wt.anchor_spk, P2A_SPK, P2A_SPK_LEN) == 0,
+                "anchor SPK matches P2A constant");
 
     watchtower_cleanup(&wt);
     return 1;
@@ -406,46 +400,13 @@ int test_cpfp_sign_complete_check(void) {
     return 1;
 }
 
-/* Test 7: witness offset parsing works regardless of change SPK length.
-   This verifies the dynamic output parsing in watchtower_build_cpfp_tx
-   by checking the offset calculation logic directly. */
+/* Test 7: witness offset parsing — kept for regression but P2A no longer
+   needs witness splicing. This tests the generic parsing logic. */
 int test_cpfp_witness_offset_p2wpkh(void) {
-    /* Simulate a signed segwit tx with P2WPKH change (22-byte SPK).
-       Layout: version(4) + marker(1) + flag(1) + vin_count(1) +
-       input0(41) + input1(41) + vout_count(1) + output0(8+1+22) = 120 bytes
-       Witness for input 0 should start at offset 120. */
+    /* Simulate a signed segwit tx and verify output parsing logic.
+       This is a pure unit test of layout parsing. */
 
-    /* Build a fake signed tx binary */
     unsigned char fake_tx[256];
-    memset(fake_tx, 0, sizeof(fake_tx));
-
-    /* nVersion = 2 */
-    fake_tx[0] = 0x02;
-    /* marker = 0x00, flag = 0x01 */
-    fake_tx[4] = 0x00; fake_tx[5] = 0x01;
-    /* vin_count = 2 */
-    fake_tx[6] = 0x02;
-    /* Input 0: 32-byte prevhash + 4-byte vout + 1-byte scriptSig(0) + 4-byte sequence = 41 */
-    fake_tx[6 + 41 - 4] = 0xFE; /* sequence */
-    /* Input 1: starts at 6+41=47, another 41 bytes */
-    /* vout_count = 1 (at offset 6+41+41 = 88) */
-    fake_tx[88] = 0x01;
-    /* Output 0 starts at 89: amount(8) + spk_len(1=22) + spk(22) */
-    fake_tx[89 + 8] = 22;  /* P2WPKH SPK length */
-    /* Witness section starts at 89 + 8 + 1 + 22 = 120 */
-    /* Empty witness for input 0: 0x00 */
-    fake_tx[120] = 0x00;
-    /* Witness for input 1 would follow */
-
-    /* Now verify our parsing logic:
-       witness_offset = 4 + 2 + 1 + 41*2 + 1 = 90 (start of outputs)
-       then parse output: 8 + 1 + 22 = 31 bytes
-       result = 90 + 31 = 121... wait, wrong. */
-
-    /* Actually recalculate:
-       Start = 4(ver) + 2(marker+flag) + 1(vin_count) + 41*2(inputs) + 1(vout_count) = 90
-       Output 0: amount=8, spk_len byte = fake_tx[90+8] = fake_tx[98]
-       So set fake_tx[98] = 22 for P2WPKH. */
     memset(fake_tx, 0, sizeof(fake_tx));
     fake_tx[0] = 0x02;
     fake_tx[4] = 0x00; fake_tx[5] = 0x01;
@@ -455,10 +416,10 @@ int test_cpfp_witness_offset_p2wpkh(void) {
     /* Output at offset 90: amount(8 bytes) then spk_len */
     fake_tx[90 + 8] = 22;  /* P2WPKH: 22-byte SPK */
     /* Witness starts at 90 + 8 + 1 + 22 = 121 */
-    size_t total_to_witness = 256;  /* fake total length */
+    size_t total_to_witness = 256;
     fake_tx[121] = 0x00;  /* empty witness for input 0 */
 
-    /* Parse using the same logic as in watchtower_build_cpfp_tx */
+    /* Parse using output-walking logic */
     size_t witness_offset = 4 + 2 + 1 + 41 * 2 + 1;  /* = 90 */
     uint8_t n_vout = fake_tx[4 + 2 + 1 + 41 * 2];  /* = fake_tx[89] = 1 */
     for (uint8_t v = 0; v < n_vout && witness_offset + 9 <= total_to_witness; v++) {
@@ -498,7 +459,7 @@ int test_cpfp_retry_bump(void) {
     strncpy(p.txid, "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", 64);
     p.txid[64] = '\0';
     p.anchor_vout = 1;
-    p.anchor_amount = 330;
+    p.anchor_amount = 240;
     p.cycles_in_mempool = 0;
     p.bump_count = 0;
     p.cycles_since_bump = 0;
@@ -552,44 +513,7 @@ int test_cpfp_retry_bump(void) {
     return 1;
 }
 
-/* Test 9: anchor key persistence — save and reload */
-int test_anchor_key_persistence(void) {
-    persist_t db;
-    TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
-
-    /* Save a known anchor key */
-    unsigned char key[32];
-    memset(key, 0x42, 32);
-    TEST_ASSERT(persist_save_anchor_key(&db, key), "save anchor key");
-
-    /* Load it back */
-    unsigned char loaded[32];
-    memset(loaded, 0, 32);
-    TEST_ASSERT(persist_load_anchor_key(&db, loaded), "load anchor key");
-    TEST_ASSERT(memcmp(key, loaded, 32) == 0, "anchor key round-trips");
-
-    /* Overwrite with a different key */
-    unsigned char key2[32];
-    memset(key2, 0x99, 32);
-    TEST_ASSERT(persist_save_anchor_key(&db, key2), "save new anchor key");
-    TEST_ASSERT(persist_load_anchor_key(&db, loaded), "load new anchor key");
-    TEST_ASSERT(memcmp(key2, loaded, 32) == 0, "new key round-trips");
-
-    /* Verify watchtower_init loads the persisted key */
-    watchtower_t wt;
-    fee_estimator_t fee;
-    fee_init(&fee, 1000);
-    watchtower_init(&wt, 1, NULL, &fee, &db);
-    TEST_ASSERT(memcmp(wt.anchor_seckey, key2, 32) == 0,
-                "watchtower_init loads persisted anchor key");
-    TEST_ASSERT_EQ(wt.anchor_spk_len, 34, "SPK derived from loaded key");
-
-    watchtower_cleanup(&wt);
-    persist_close(&db);
-    return 1;
-}
-
-/* Test 10: pending entry persistence — save, load, delete */
+/* Test 9: pending entry persistence — save, load, delete */
 int test_pending_persistence(void) {
     persist_t db;
     TEST_ASSERT(persist_open(&db, ":memory:"), "open in-memory DB");
@@ -597,10 +521,10 @@ int test_pending_persistence(void) {
     /* Save 2 pending entries */
     TEST_ASSERT(persist_save_pending(&db,
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        1, 330, 0, 0), "save pending 1");
+        1, 240, 0, 0), "save pending 1");
     TEST_ASSERT(persist_save_pending(&db,
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        1, 330, 5, 2), "save pending 2");
+        1, 240, 5, 2), "save pending 2");
 
     /* Load them back */
     char txids[16][65];
@@ -613,7 +537,7 @@ int test_pending_persistence(void) {
     /* Verify first entry */
     TEST_ASSERT(strncmp(txids[0], "aaaa", 4) == 0, "first txid starts with aaaa");
     TEST_ASSERT_EQ(vouts[0], 1, "first vout = 1");
-    TEST_ASSERT_EQ(amounts[0], 330, "first amount = 330");
+    TEST_ASSERT_EQ(amounts[0], 240, "first amount = 240");
     TEST_ASSERT_EQ(cycles[0], 0, "first cycles = 0");
     TEST_ASSERT_EQ(bumps[0], 0, "first bumps = 0");
 
@@ -633,7 +557,7 @@ int test_pending_persistence(void) {
     /* Update via upsert */
     TEST_ASSERT(persist_save_pending(&db,
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-        1, 330, 10, 3), "upsert pending");
+        1, 240, 10, 3), "upsert pending");
     n = persist_load_pending(&db, txids, vouts, amounts, cycles, bumps, 16);
     TEST_ASSERT_EQ(n, 1, "still 1 entry after upsert");
     TEST_ASSERT_EQ(cycles[0], 10, "updated cycles = 10");
