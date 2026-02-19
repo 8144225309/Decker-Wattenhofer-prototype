@@ -36,7 +36,7 @@ cmake .. && make -j$(nproc)
 
 ## Tests
 
-220 unit + 21 regtest integration tests.
+233 unit + 22 regtest integration tests.
 
 ```bash
 cd build
