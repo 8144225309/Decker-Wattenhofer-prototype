@@ -13,15 +13,13 @@ A Bitcoin channel factory protocol combining:
 
 ## Quick Start
 
-```bash
-# Build (fetches secp256k1-zkp + cJSON automatically)
-mkdir -p build && cd build && cmake .. && make -j$(nproc)
+[Build the project](#build), then:
 
-# Run the basic demo (needs bitcoind -regtest running)
-cd .. && bash tools/run_demo.sh --basic
+```bash
+bash tools/run_demo.sh --basic
 ```
 
-If you don't have `bitcoind` running, `run_demo.sh` will start one for you.
+Creates a 5-of-5 factory, opens 4 channels, runs payments, and cooperative-closes in ~30 seconds. If `bitcoind` isn't running, the script starts one for you.
 
 ## Build
 
