@@ -25,16 +25,21 @@ If you don't have `bitcoind` running, `run_demo.sh` will start one for you.
 
 ## Build
 
+**System prerequisites**: a C compiler (gcc/clang), CMake 3.14+, SQLite3 dev headers, Python 3 (for tooling)
+
 ```bash
-cd superscalar && mkdir -p build && cd build
+# Ubuntu / Debian
+sudo apt install build-essential cmake libsqlite3-dev python3
+```
+
+```bash
+mkdir -p build && cd build
 cmake .. && make -j$(nproc)
 ```
 
 **Auto-fetched** (CMake FetchContent):
 - [secp256k1-zkp](https://github.com/BlockstreamResearch/secp256k1-zkp) — MuSig2, Schnorr, adaptor signatures
 - [cJSON](https://github.com/DaveGamble/cJSON) — JSON parsing
-
-**System dependency**: SQLite3
 
 ## Tests
 
