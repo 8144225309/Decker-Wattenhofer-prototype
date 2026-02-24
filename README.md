@@ -1,5 +1,7 @@
 # SuperScalar
 
+> **Status: Functional Prototype** — builds, passes 255 tests on regtest. Not production-ready.
+
 First implementation of [ZmnSCPxj's SuperScalar design](https://delvingbitcoin.org/t/superscalar-laddered-timeout-tree-structured-decker-wattenhofer-factories/1143) — laddered timeout-tree-structured Decker-Wattenhofer channel factories for Bitcoin.
 
 A Bitcoin channel factory protocol combining:
