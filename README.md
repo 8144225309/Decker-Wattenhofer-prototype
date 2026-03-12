@@ -1,3 +1,5 @@
+> ⚠️ **Development has moved.** This is an archived prototype. Active development continues at [github.com/8144225309/SuperScalar](https://github.com/8144225309/SuperScalar).
+
 # SuperScalar
 
 > **Status: Functional Prototype** — builds, passes 255 tests on regtest. Not production-ready.
